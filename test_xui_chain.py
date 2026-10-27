@@ -98,9 +98,14 @@ class ProfileTests(unittest.TestCase):
         self.assertTrue(groups[xc.G_UP]["proxies"][0].startswith("واسط 1"))
         auto = groups[xc.G_AUTO]["proxies"]
         self.assertTrue(auto[0].endswith("مستقیم") and auto[-1].endswith("زنجیره"))
-        chained = [p for p in prof["proxies"] if p.get("dialer-proxy")]
+        chained = [p for p in prof["proxies"] if p.get("dialer-proxy") == xc.G_UP]
         self.assertEqual(len(chained), 2)
-        self.assertTrue(all(p["dialer-proxy"] == xc.G_UP for p in chained))
+        single = [p for p in prof["proxies"] if p.get("dialer-proxy") not in (None, xc.G_UP)]
+        self.assertEqual(len(single), 2 * 5)
+        self.assertEqual(single[0]["name"], "user1-reality · از واسط 1")
+        self.assertTrue(single[0]["dialer-proxy"].startswith("واسط 1"))
+        self.assertEqual(len(auto), 4)
+        self.assertEqual(len(groups[xc.G_MAIN]["proxies"]), 1 + 2 + 2 + 10)
         reality = next(p for p in prof["proxies"] if p["name"] == "user1-reality · مستقیم")
         self.assertEqual(reality["reality-opts"], {"public-key": PBK, "short-id": "ab12"})
         self.assertEqual(reality["servername"], "www.speedtest.net")
@@ -119,7 +124,8 @@ class ProfileTests(unittest.TestCase):
         self.assertNotIn(xc.G_UP, [g["name"] for g in prof["proxy-groups"]])
         cfg = dict(self.cfg, direct_first=False, iran_direct=False)
         prof = yaml.safe_load(xc.build_mihomo(self.own, self.ups, cfg)[0])
-        self.assertTrue(all(p.get("dialer-proxy") for p in prof["proxies"] if not p["name"].startswith("واسط")))
+        auto = next(g for g in prof["proxy-groups"] if g["name"] == xc.G_AUTO)["proxies"]
+        self.assertTrue(auto and all(n.endswith("زنجیره") for n in auto))
         self.assertEqual(prof["rules"], ["MATCH," + xc.G_MAIN])
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
@@ -130,24 +136,42 @@ class ProfileTests(unittest.TestCase):
     def test_xray_chain(self):
         text, skipped = xc.build_xray(self.own, self.ups, self.cfg, "t")
         self.assertEqual(skipped, ["upstream 4: hysteria2 is not supported in Xray JSON"])
-        conf = json.loads(text)
-        tags = [o["tag"] for o in conf["outbounds"]]
-        self.assertEqual(len(tags), len(set(tags)))
+        confs = json.loads(text)
+        # auto + 2 own configs direct + 2 own configs x 4 upstreams
+        self.assertEqual(len(confs), 1 + 2 + 2 * 4)
+        names = [c["remarks"] for c in confs]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(names[1:3], ["user1-reality · مستقیم", "user1-ws · مستقیم"])
+        self.assertEqual(names[3], "user1-reality · از واسط 1 (friend-a)")
+        for c in confs:
+            tags = [o["tag"] for o in c["outbounds"]]
+            self.assertEqual(len(tags), len(set(tags)))
+            for o in c["outbounds"]:
+                self.assertIn(o["protocol"], ("vless", "vmess", "trojan", "shadowsocks", "freedom", "blackhole"))
+                dp = o.get("streamSettings", {}).get("sockopt", {}).get("dialerProxy")
+                if dp:
+                    self.assertIn(dp, tags)
+            final = c["routing"]["rules"][-1]
+            self.assertIn(final.get("outboundTag") or final.get("balancerTag"),
+                          tags + [b["tag"] for b in c["routing"].get("balancers", [])])
+        auto = confs[0]
+        tags = [o["tag"] for o in auto["outbounds"]]
         # 2 own configs x (direct + 4 upstreams) + 4 upstreams + direct + block
         self.assertEqual(len(tags), 2 * 5 + 4 + 2)
-        for o in conf["outbounds"]:
-            dp = o.get("streamSettings", {}).get("sockopt", {}).get("dialerProxy")
-            if dp:
-                self.assertIn(dp, tags)
-                self.assertTrue(o["tag"].startswith("me-"))
-        bal = conf["routing"]["balancers"][0]
+        bal = auto["routing"]["balancers"][0]
         self.assertEqual(bal["fallbackTag"], "me-1-direct")
         self.assertIn(bal["fallbackTag"], tags)
-        r = conf["outbounds"][0]["streamSettings"]
+        r = auto["outbounds"][0]["streamSettings"]
         self.assertEqual(r["realitySettings"]["publicKey"], PBK)
-        self.assertEqual(r["security"], "reality")
-        x = next(o for o in conf["outbounds"] if o["tag"] == "up-5")
+        x = next(o for o in auto["outbounds"] if o["tag"] == "up-5")
         self.assertEqual(x["streamSettings"]["xhttpSettings"]["path"], "/x")
+        ss = next(o for o in auto["outbounds"] if o["tag"] == "up-3")
+        self.assertEqual(ss["protocol"], "shadowsocks")
+        self.assertEqual(ss["settings"]["servers"][0]["method"], "2022-blake3-aes-128-gcm")
+
+    def test_xray_without_upstreams(self):
+        confs = json.loads(xc.build_xray(self.own, [], self.cfg, "t")[0])
+        self.assertEqual([c["remarks"] for c in confs], ["user1-reality · مستقیم", "user1-ws · مستقیم"])
 
     def test_format_detection(self):
         self.assertEqual(xc.pick_format("", "FlClash/v0.8 clash-verge"), "clash")
@@ -228,7 +252,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(h["Subscription-Userinfo"], "upload=1; download=2; total=3; expire=4")
         self.assertEqual(h["Profile-Update-Interval"], "3")
         prof = yaml.safe_load(body)
-        self.assertEqual(len([p for p in prof["proxies"] if p.get("dialer-proxy")]), 2)
+        self.assertEqual(len([p for p in prof["proxies"] if p.get("dialer-proxy") == xc.G_UP]), 2)
 
     def test_xray_subscription(self):
         status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
@@ -259,8 +283,8 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("filename*=UTF-8''%D9%85%D9%86.yaml", h["Content-Disposition"])
         if yaml:
             prof = yaml.safe_load(body)
-            mine = [p for p in prof["proxies"] if not p["name"].startswith("واسط")]
-            self.assertTrue(all(p.get("dialer-proxy") for p in mine))
+            auto = next(g for g in prof["proxy-groups"] if g["name"] == xc.G_AUTO)["proxies"]
+            self.assertTrue(auto and all(n.endswith("زنجیره") for n in auto))
         xc.save_upstreams_text("\n".join(UPS[1:3]))
         self.app.cfg["direct_first"] = True
         self.app.rt["direct_first"] = True

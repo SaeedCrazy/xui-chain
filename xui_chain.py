@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
 LOOPBACK = {"127.0.0.1", "0.0.0.0", "localhost", "::1", "::"}
@@ -450,6 +450,9 @@ def yaml_dump(obj, ind=0):
 
 # ---------------------------------------------------------------- Xray
 
+XRAY_PROTOCOL = {"ss": "shadowsocks"}
+
+
 def to_xray(node, tag):
     """Neutral node -> Xray outbound dict. Raises ValueError when not representable."""
     proto = node["proto"]
@@ -513,7 +516,7 @@ def to_xray(node, tag):
             rs["mldsa65Verify"] = node["pqv"]
         st["security"] = "reality"
         st["realitySettings"] = rs
-    return {"tag": tag, "protocol": proto, "settings": settings, "streamSettings": st}
+    return {"tag": tag, "protocol": XRAY_PROTOCOL.get(proto, proto), "settings": settings, "streamSettings": st}
 
 
 # ---------------------------------------------------------------- profiles
@@ -540,25 +543,29 @@ def build_mihomo(own, ups, cfg):
             up_proxies.append(to_mihomo(n, unique(names, "واسط %d · %s" % (i, n["name"]))))
         except ValueError as e:
             skipped.append("upstream %d: %s" % (i, e))
-    direct, chained = [], []
+    direct, chained, single = [], [], []
     for n in own:
         try:
-            if cfg.get("direct_first", True) or not up_proxies:
-                direct.append(to_mihomo(n, unique(names, "%s · مستقیم" % n["name"])))
+            direct.append(to_mihomo(n, unique(names, "%s · مستقیم" % n["name"])))
             if up_proxies:
                 p = to_mihomo(n, unique(names, "%s · زنجیره" % n["name"]))
                 p["dialer-proxy"] = G_UP
                 chained.append(p)
+                for i, u in enumerate(up_proxies, 1):
+                    p = to_mihomo(n, unique(names, "%s · از واسط %d" % (n["name"], i)))
+                    p["dialer-proxy"] = u["name"]
+                    single.append(p)
         except ValueError as e:
             skipped.append("%s: %s" % (n["name"], e))
-    mine = direct + chained
-    if not mine:
+    if not direct:
         raise ValueError("no usable config for this user")
+    auto = (direct if cfg.get("direct_first", True) or not up_proxies else []) + chained
+    mine = direct + chained + single
     test = {"url": cfg.get("test_url") or DEFAULTS["test_url"], "interval": int(cfg.get("test_interval") or 120),
             "timeout": 5000, "lazy": False}
     groups = [
         {"name": G_MAIN, "type": "select", "proxies": [G_AUTO] + [p["name"] for p in mine]},
-        dict({"name": G_AUTO, "type": "fallback", "proxies": [p["name"] for p in mine]}, **test),
+        dict({"name": G_AUTO, "type": "fallback", "proxies": [p["name"] for p in auto]}, **test),
     ]
     if up_proxies:
         groups.append(dict({"name": G_UP, "type": "fallback", "proxies": [p["name"] for p in up_proxies]}, **test))
@@ -579,33 +586,13 @@ def build_mihomo(own, ups, cfg):
     return "\n".join(yaml_dump(prof)) + "\n", skipped
 
 
-def build_xray(own, ups, cfg, remarks):
-    """Single Xray client config: balancer over direct + chained outbounds."""
-    skipped = []
-    up_out = []
-    for i, n in enumerate(ups, 1):
-        try:
-            up_out.append(to_xray(n, "up-%d" % i))
-        except ValueError as e:
-            skipped.append("upstream %d: %s" % (i, e))
-    mine = []
-    for k, n in enumerate(own, 1):
-        try:
-            if cfg.get("direct_first", True) or not up_out:
-                mine.append(to_xray(n, "me-%d-direct" % k))
-            for u in up_out:
-                o = to_xray(n, "me-%d-via-%s" % (k, u["tag"]))
-                o["streamSettings"]["sockopt"] = {"dialerProxy": u["tag"]}
-                mine.append(o)
-        except ValueError as e:
-            skipped.append("%s: %s" % (n["name"], e))
-    if not mine:
-        raise ValueError("no usable config for this user")
+def xray_config(remarks, outbounds, cfg, route):
+    """Full Xray client config around the given proxy outbounds; route = final routing rule."""
     rules = []
     if cfg.get("iran_direct", True):
         rules.append({"type": "field", "domain": ["domain:ir"], "outboundTag": "direct"})
-    rules.append({"type": "field", "network": "tcp,udp", "balancerTag": "auto"})
-    conf = {
+    rules.append(dict({"type": "field", "network": "tcp,udp"}, **route))
+    return {
         "remarks": remarks,
         "log": {"loglevel": "warning"},
         "dns": {"servers": ["8.8.8.8", "1.1.1.1"], "queryStrategy": "UseIP"},
@@ -615,25 +602,70 @@ def build_xray(own, ups, cfg, remarks):
              "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]}},
             {"tag": "http", "listen": "127.0.0.1", "port": 10809, "protocol": "http", "settings": {"userLevel": 8}},
         ],
-        "outbounds": mine + up_out + [
+        "outbounds": outbounds + [
             {"tag": "direct", "protocol": "freedom", "settings": {}},
             {"tag": "block", "protocol": "blackhole", "settings": {}},
         ],
-        "observatory": {
-            "subjectSelector": ["me-"],
-            "probeURL": cfg.get("test_url") or DEFAULTS["test_url"],
-            "probeInterval": "%ds" % int(cfg.get("test_interval") or 120),
-            "enableConcurrency": True,
-        },
-        "routing": {
-            "domainStrategy": "AsIs",
-            "balancers": [{"tag": "auto", "selector": ["me-"], "strategy": {"type": "leastPing"},
-                           "fallbackTag": mine[0]["tag"]}],
-            "rules": rules,
-        },
+        "routing": {"domainStrategy": "AsIs", "rules": rules},
         "policy": {"levels": {"8": {"connIdle": 300, "downlinkOnly": 1, "handshake": 4, "uplinkOnly": 1}}},
     }
-    return json.dumps(conf, ensure_ascii=False, indent=2), skipped
+
+
+def build_xray(own, ups, cfg, remarks):
+    """List of Xray client configs (one app entry each):
+    an automatic one (balancer over every route), then every route on its own:
+    each own config directly, then through each upstream."""
+    skipped = []
+    up_nodes = []
+    for i, n in enumerate(ups, 1):
+        try:
+            to_xray(n, "up")
+            up_nodes.append((i, n))
+        except ValueError as e:
+            skipped.append("upstream %d: %s" % (i, e))
+    own_ok = []
+    for n in own:
+        try:
+            to_xray(n, "proxy")
+            own_ok.append(n)
+        except ValueError as e:
+            skipped.append("%s: %s" % (n["name"], e))
+    if not own_ok:
+        raise ValueError("no usable config for this user")
+
+    def chained(n, i, u, tag):
+        o = to_xray(n, tag)
+        o["streamSettings"]["sockopt"] = {"dialerProxy": "up-%d" % i}
+        return o
+
+    singles = []
+    for n in own_ok:
+        singles.append(xray_config("%s · مستقیم" % n["name"], [to_xray(n, "proxy")], cfg, {"outboundTag": "proxy"}))
+    for i, u in up_nodes:
+        for n in own_ok:
+            singles.append(xray_config("%s · از واسط %d (%s)" % (n["name"], i, u["name"]),
+                                       [chained(n, i, u, "proxy"), to_xray(u, "up-%d" % i)],
+                                       cfg, {"outboundTag": "proxy"}))
+    if not up_nodes:
+        return json.dumps(singles, ensure_ascii=False, indent=2), skipped
+
+    mine = []
+    for k, n in enumerate(own_ok, 1):
+        if cfg.get("direct_first", True):
+            mine.append(to_xray(n, "me-%d-direct" % k))
+        for i, u in up_nodes:
+            mine.append(chained(n, i, u, "me-%d-via-up-%d" % (k, i)))
+    auto = xray_config("⚡ %s · خودکار" % remarks, mine + [to_xray(u, "up-%d" % i) for i, u in up_nodes], cfg,
+                       {"balancerTag": "auto"})
+    auto["observatory"] = {
+        "subjectSelector": ["me-"],
+        "probeURL": cfg.get("test_url") or DEFAULTS["test_url"],
+        "probeInterval": "%ds" % int(cfg.get("test_interval") or 120),
+        "enableConcurrency": True,
+    }
+    auto["routing"]["balancers"] = [{"tag": "auto", "selector": ["me-"], "strategy": {"type": "leastPing"},
+                                     "fallbackTag": mine[0]["tag"]}]
+    return json.dumps([auto] + singles, ensure_ascii=False, indent=2), skipped
 
 
 # ---------------------------------------------------------------- fetching
