@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
 LOOPBACK = {"127.0.0.1", "0.0.0.0", "localhost", "::1", "::"}
@@ -101,11 +101,11 @@ def save_upstreams_text(text):
 
 
 def xui_settings(db_path=XUI_DB):
-    """Subscription settings of the 3x-ui panel (read-only), or {}."""
+    """Subscription and web (panel) settings of the 3x-ui panel (read-only), or {}."""
     try:
         con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=5)
         try:
-            rows = con.execute("SELECT key, value FROM settings WHERE key LIKE 'sub%'").fetchall()
+            rows = con.execute("SELECT key, value FROM settings WHERE key LIKE 'sub%' OR key LIKE 'web%'").fetchall()
         finally:
             con.close()
         return {k: v for k, v in rows}
@@ -132,11 +132,38 @@ def resolve_runtime(cfg, db_path=XUI_DB):
         if host not in LOOPBACK and not rt.get("xui_connect"):
             rt["xui_connect"] = "127.0.0.1"
     if rt.get("cert_file") == "auto":
-        rt["cert_file"] = sub_cert if sub_cert and sub_key else ""
-        rt["key_file"] = sub_key if sub_cert and sub_key else ""
-    if not rt.get("public_host") and s.get("subDomain"):
-        rt["public_host"] = s["subDomain"]
+        # the subscription certificate, else the panel's own
+        rt["cert_file"], rt["key_file"] = "", ""
+        for cert, key in ((sub_cert, sub_key), (s.get("webCertFile", ""), s.get("webKeyFile", ""))):
+            if cert and key and os.path.isfile(cert) and os.path.isfile(key):
+                rt["cert_file"], rt["key_file"] = cert, key
+                break
+    if not rt.get("public_host"):
+        if rt.get("cert_file") and rt["cert_file"] == sub_cert and s.get("subDomain"):
+            rt["public_host"] = s["subDomain"]
+        elif rt.get("cert_file") and rt["cert_file"] == s.get("webCertFile") and s.get("webDomain"):
+            rt["public_host"] = s["webDomain"]
+        elif rt.get("cert_file"):
+            rt["public_host"] = cert_domain(rt["cert_file"])
+        else:
+            rt["public_host"] = s.get("subDomain") or s.get("webDomain") or ""
     return rt
+
+
+def cert_domain(path):
+    """First DNS name of a certificate file, or ""."""
+    try:
+        info = ssl._ssl._test_decode_cert(path)
+    except Exception:
+        return ""
+    for kind, name in info.get("subjectAltName", ()):
+        if kind == "DNS" and not name.startswith("*."):
+            return name
+    for rdn in info.get("subject", ()):
+        for k, v in rdn:
+            if k == "commonName":
+                return v.lstrip("*.")
+    return ""
 
 
 # ---------------------------------------------------------------- share links
@@ -970,6 +997,7 @@ def make_handler(app):
     class H(BaseHTTPRequestHandler):
         server_version = "nginx"
         sys_version = ""
+        timeout = 30
 
         def log_message(self, fmt, *args):
             pass
@@ -1033,14 +1061,56 @@ def make_handler(app):
     return H
 
 
+class Server(ThreadingHTTPServer):
+    """HTTP and HTTPS on the same port: TLS is chosen per connection from its first byte,
+    so links handed out before a certificate was added keep working."""
+    daemon_threads = True
+    tls = None
+
+    def finish_request(self, request, client_address):
+        conn = request
+        try:
+            if self.tls is not None:
+                request.settimeout(20)
+                if request.recv(1, socket.MSG_PEEK) == b"\x16":
+                    conn = self.tls.wrap_socket(request, server_side=True)
+            self.RequestHandlerClass(conn, client_address, self)
+        except (OSError, ssl.SSLError):
+            pass
+        finally:
+            if conn is not request:
+                conn.close()
+
+
+def watch_cert(ctx, cert, key):
+    """Reload a renewed certificate without a restart."""
+    def stamp():
+        try:
+            return (os.path.getmtime(cert), os.path.getmtime(key))
+        except OSError:
+            return None
+    last = stamp()
+    while True:
+        time.sleep(3600)
+        now = stamp()
+        if now and now != last:
+            try:
+                ctx.load_cert_chain(cert, key)
+                last = now
+                print("certificate reloaded", flush=True)
+            except (OSError, ssl.SSLError) as e:
+                print("certificate reload failed: %s" % e, flush=True)
+
+
 def serve(app):
     rt = app.rt
-    httpd = ThreadingHTTPServer((rt["listen"], int(rt["port"])), make_handler(app))
+    httpd = Server((rt["listen"], int(rt["port"])), make_handler(app))
     scheme = "http"
     if rt.get("cert_file") and rt.get("key_file"):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(rt["cert_file"], rt["key_file"])
-        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        httpd.tls = ctx
+        threading.Thread(target=watch_cert, args=(ctx, rt["cert_file"], rt["key_file"]), daemon=True).start()
         scheme = "https"
     print("xui-chain %s listening on %s://%s:%s" % (VERSION, scheme, rt["listen"], rt["port"]), flush=True)
     print("panel subscription: %s" % rt["xui_sub_url"], flush=True)

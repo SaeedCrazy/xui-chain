@@ -3,7 +3,11 @@
 import base64
 import json
 import os
+import shutil
+import socket
 import sqlite3
+import ssl
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -291,6 +295,74 @@ class EndToEnd(unittest.TestCase):
 
     def test_wrong_admin_post(self):
         self.assertEqual(self.get("/nope/save", data=b"upstreams=x")[0], 404)
+
+
+@unittest.skipIf(shutil.which("openssl") is None, "openssl not installed")
+class PanelCertificate(unittest.TestCase):
+    """Without a subscription certificate, the panel's own certificate and domain are used,
+    and plain HTTP keeps working on the same port."""
+
+    @classmethod
+    def setUpClass(cls):
+        d = tempfile.mkdtemp()
+        cls.cert, cls.key = os.path.join(d, "fullchain.pem"), os.path.join(d, "privkey.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+                        "-subj", "/CN=panel.example.com", "-addext", "subjectAltName=DNS:panel.example.com",
+                        "-keyout", cls.key, "-out", cls.cert], check=True, capture_output=True)
+        cls.db = os.path.join(d, "x-ui.db")
+        con = sqlite3.connect(cls.db)
+        con.execute("CREATE TABLE settings (id INTEGER PRIMARY KEY, key TEXT, value TEXT)")
+        con.executemany("INSERT INTO settings (key, value) VALUES (?, ?)",
+                        [("webCertFile", cls.cert), ("webKeyFile", cls.key), ("webPort", "2053")])
+        con.commit()
+        con.close()
+
+    def test_runtime_uses_panel_cert(self):
+        rt = xc.resolve_runtime(dict(xc.DEFAULTS), self.db)
+        self.assertEqual((rt["cert_file"], rt["key_file"]), (self.cert, self.key))
+        self.assertEqual(rt["public_host"], "panel.example.com")  # from the certificate
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO settings (key, value) VALUES ('webDomain', 'p.example.net')")
+        con.commit()
+        con.close()
+        try:
+            self.assertEqual(xc.resolve_runtime(dict(xc.DEFAULTS), self.db)["public_host"], "p.example.net")
+            self.assertEqual(xc.resolve_runtime(dict(xc.DEFAULTS, public_host="x.io"), self.db)["public_host"], "x.io")
+            self.assertEqual(xc.resolve_runtime(dict(xc.DEFAULTS, cert_file=""), self.db)["cert_file"], "")
+        finally:
+            con = sqlite3.connect(self.db)
+            con.execute("DELETE FROM settings WHERE key = 'webDomain'")
+            con.commit()
+            con.close()
+
+    def test_http_and_https_on_one_port(self):
+        app = xc.App(db_path=self.db)
+        app.rt["listen"], app.rt["port"] = "127.0.0.1", 0
+        srv = xc.Server(("127.0.0.1", 0), xc.make_handler(app))
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.cert, self.key)
+        srv.tls = ctx
+        start(srv)
+        port = srv.server_address[1]
+        try:
+            admin = "/%s/" % app.cfg["admin_path"]
+            with urllib.request.urlopen("http://127.0.0.1:%d%s" % (port, admin), timeout=10) as r:
+                self.assertEqual(r.status, 200)
+            client = ssl.create_default_context(cafile=self.cert)
+            client.check_hostname = False
+            with urllib.request.urlopen("https://127.0.0.1:%d%s" % (port, admin), timeout=10, context=client) as r:
+                page = r.read().decode()
+            self.assertIn("https://panel.example.com:", page)
+            # a client that never finishes the handshake does not block others
+            idle = socket.create_connection(("127.0.0.1", port))
+            idle.sendall(b"\x16")
+            with urllib.request.urlopen("http://127.0.0.1:%d/nope" % port, timeout=10) as r:
+                pass
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 404)
+        finally:
+            idle.close()
+            srv.shutdown()
 
 
 if __name__ == "__main__":
