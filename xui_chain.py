@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
 LOOPBACK = {"127.0.0.1", "0.0.0.0", "localhost", "::1", "::"}
@@ -52,6 +52,9 @@ DEFAULTS = {
     "test_url": "https://www.gstatic.com/generate_204",
     "test_interval": 120,
     "title": "",
+    "label_main": "Main",       # names of the routes in the apps
+    "label_deco": "Deco",       # Deco1, Deco2, ... (the upstreams)
+    "label_auto": "Auto",
 }
 
 
@@ -557,29 +560,46 @@ def unique(names, name):
     return name
 
 
-G_MAIN, G_AUTO, G_UP = "🎯 اتصال", "⚡ خودکار", "🔗 واسط‌ها"
+G_MAIN, G_UP = "🎯 Select", "🔗 Decos"
+
+
+def label(cfg, key):
+    return (cfg.get(key) or DEFAULTS[key]).strip() or DEFAULTS[key]
+
+
+def auto_name(cfg):
+    return "⚡ " + label(cfg, "label_auto")
+
+
+def route_name(cfg, node, single_own, text):
+    """"Main", "Deco1"; prefixed with the config's name when the user has several configs."""
+    return text if single_own else "%s · %s" % (node["name"], text)
 
 
 def build_mihomo(own, ups, cfg):
     """own, ups: lists of neutral nodes. Returns (yaml_text, skipped_messages)."""
-    names = {G_MAIN, G_AUTO, G_UP, "DIRECT", "REJECT"}
+    g_auto = auto_name(cfg)
+    main, deco = label(cfg, "label_main"), label(cfg, "label_deco")
+    names = {G_MAIN, g_auto, G_UP, "DIRECT", "REJECT"}
     skipped = []
     up_proxies = []
     for i, n in enumerate(ups, 1):
         try:
-            up_proxies.append(to_mihomo(n, unique(names, "واسط %d · %s" % (i, n["name"]))))
+            up_proxies.append(to_mihomo(n, unique(names, "%s%d · %s" % (deco, i, n["name"]))))
         except ValueError as e:
             skipped.append("upstream %d: %s" % (i, e))
     direct, chained, single = [], [], []
+    one = len(own) == 1
     for n in own:
         try:
-            direct.append(to_mihomo(n, unique(names, "%s · مستقیم" % n["name"])))
+            direct.append(to_mihomo(n, unique(names, route_name(cfg, n, one, main))))
             if up_proxies:
-                p = to_mihomo(n, unique(names, "%s · زنجیره" % n["name"]))
+                # through the Decos group: the first working Deco, in priority order
+                p = to_mihomo(n, unique(names, route_name(cfg, n, one, deco)))
                 p["dialer-proxy"] = G_UP
                 chained.append(p)
                 for i, u in enumerate(up_proxies, 1):
-                    p = to_mihomo(n, unique(names, "%s · از واسط %d" % (n["name"], i)))
+                    p = to_mihomo(n, unique(names, route_name(cfg, n, one, "%s%d" % (deco, i))))
                     p["dialer-proxy"] = u["name"]
                     single.append(p)
         except ValueError as e:
@@ -591,8 +611,8 @@ def build_mihomo(own, ups, cfg):
     test = {"url": cfg.get("test_url") or DEFAULTS["test_url"], "interval": int(cfg.get("test_interval") or 120),
             "timeout": 5000, "lazy": False}
     groups = [
-        {"name": G_MAIN, "type": "select", "proxies": [G_AUTO] + [p["name"] for p in mine]},
-        dict({"name": G_AUTO, "type": "fallback", "proxies": [p["name"] for p in auto]}, **test),
+        {"name": G_MAIN, "type": "select", "proxies": [g_auto] + [p["name"] for p in mine]},
+        dict({"name": g_auto, "type": "fallback", "proxies": [p["name"] for p in auto]}, **test),
     ]
     if up_proxies:
         groups.append(dict({"name": G_UP, "type": "fallback", "proxies": [p["name"] for p in up_proxies]}, **test))
@@ -665,12 +685,14 @@ def build_xray(own, ups, cfg, remarks):
         o["streamSettings"]["sockopt"] = {"dialerProxy": "up-%d" % i}
         return o
 
+    one = len(own_ok) == 1
+    main, deco = label(cfg, "label_main"), label(cfg, "label_deco")
     singles = []
     for n in own_ok:
-        singles.append(xray_config("%s · مستقیم" % n["name"], [to_xray(n, "proxy")], cfg, {"outboundTag": "proxy"}))
+        singles.append(xray_config(route_name(cfg, n, one, main), [to_xray(n, "proxy")], cfg, {"outboundTag": "proxy"}))
     for i, u in up_nodes:
         for n in own_ok:
-            singles.append(xray_config("%s · از واسط %d (%s)" % (n["name"], i, u["name"]),
+            singles.append(xray_config(route_name(cfg, n, one, "%s%d" % (deco, i)),
                                        [chained(n, i, u, "proxy"), to_xray(u, "up-%d" % i)],
                                        cfg, {"outboundTag": "proxy"}))
     if not up_nodes:
@@ -682,7 +704,7 @@ def build_xray(own, ups, cfg, remarks):
             mine.append(to_xray(n, "me-%d-direct" % k))
         for i, u in up_nodes:
             mine.append(chained(n, i, u, "me-%d-via-up-%d" % (k, i)))
-    auto = xray_config("⚡ %s · خودکار" % remarks, mine + [to_xray(u, "up-%d" % i) for i, u in up_nodes], cfg,
+    auto = xray_config(auto_name(cfg), mine + [to_xray(u, "up-%d" % i) for i, u in up_nodes], cfg,
                        {"balancerTag": "auto"})
     auto["observatory"] = {
         "subjectSelector": ["me-"],
@@ -903,7 +925,7 @@ ol{padding-inline-start:20px;margin:6px 0}li{margin:4px 0;word-break:break-all}
 <h1>🔗 xui-chain</h1><div class="mut">نسخه %(version)s · کاربر اول مستقیم به سرورت وصل می‌شه؛ اگه آی‌پی فیلتر بود، از واسط‌ها به ترتیب.</div>
 %(msg)s
 <form method="post" action="save">
-<div class="card"><h2>واسط‌ها (به ترتیب اولویت)</h2>
+<div class="card"><h2>Deco‌ها (واسط‌ها، به ترتیب اولویت)</h2>
 <div class="mut">هر خط یک کانفیگ (vless, vmess, trojan, ss, hysteria2) یا لینک ساب. خط بالاتر = اولویت بالاتر. خط‌هایی که با # شروع شوند نادیده گرفته می‌شوند.</div>
 <textarea name="upstreams" spellcheck="false">%(upstreams)s</textarea>
 %(upstatus)s
@@ -912,6 +934,8 @@ ol{padding-inline-start:20px;margin:6px 0}li{margin:4px 0;word-break:break-all}
 <label><input type="checkbox" name="direct_first" %(direct_first)s> اول مستقیم به آی‌پی خودم (اگه فیلتر نبود)</label>
 <label><input type="checkbox" name="iran_direct" %(iran_direct)s> سایت‌های ‎.ir بدون تونل باز شوند</label>
 <div class="mut" style="margin-top:8px">اسم پروفایل در اپ</div><input type="text" name="title" value="%(title)s">
+<div class="mut" style="margin-top:8px">اسم مسیرها در اپ: مستقیم · واسط‌ها (با شماره: Deco1، Deco2…) · خودکار</div>
+<div style="display:flex;gap:6px"><input type="text" name="label_main" value="%(label_main)s"><input type="text" name="label_deco" value="%(label_deco)s"><input type="text" name="label_auto" value="%(label_auto)s"></div>
 <div class="mut" style="margin-top:8px">آدرس ساب 3x-ui (auto = خودکار از تنظیمات پنل)</div><input type="text" name="xui_sub_url" value="%(xui_sub_url)s">
 <div class="mut" style="margin-top:8px">دامنه یا آی‌پی برای لینک کاربرها (خالی = همین آدرسی که الان باز کردی)</div><input type="text" name="public_host" value="%(public_host)s">
 </div>
@@ -939,8 +963,9 @@ def render_admin(cfg, rt, host, msg="", db_path=XUI_DB):
         ms = tcp_check(n["server"], n["port"]) if n["proto"] != "hysteria2" else None
         state = ('<span class="ok">● %dms</span>' % ms) if ms is not None else (
             '<span class="mut">UDP</span>' if n["proto"] == "hysteria2" else '<span class="bad">● بسته</span>')
-        rows.append("<li>%s · <b>%s</b> · %s:%s %s</li>" % (
-            html.escape(n["proto"]), html.escape(n["name"]), html.escape(n["server"]), n["port"], state))
+        rows.append("<li><b>%s%d</b> · %s · %s · %s:%s %s</li>" % (
+            html.escape(label(cfg, "label_deco")), i, html.escape(n["proto"]), html.escape(n["name"]),
+            html.escape(n["server"]), n["port"], state))
     up = ""
     if rows:
         up += '<div class="mut" style="margin-top:8px">از دید سرور خودت (پینگ TCP):</div><ol>%s</ol>' % "".join(rows)
@@ -973,6 +998,9 @@ def render_admin(cfg, rt, host, msg="", db_path=XUI_DB):
         "direct_first": "checked" if cfg.get("direct_first", True) else "",
         "iran_direct": "checked" if cfg.get("iran_direct", True) else "",
         "title": html.escape(cfg.get("title", "")),
+        "label_main": html.escape(label(cfg, "label_main")),
+        "label_deco": html.escape(label(cfg, "label_deco")),
+        "label_auto": html.escape(label(cfg, "label_auto")),
         "xui_sub_url": html.escape(cfg.get("xui_sub_url", "auto")),
         "public_host": html.escape(cfg.get("public_host", "")),
         "users": users_html,
@@ -1049,6 +1077,8 @@ def make_handler(app):
             cfg["direct_first"] = "direct_first" in form
             cfg["iran_direct"] = "iran_direct" in form
             cfg["title"] = _q(form, "title").strip()[:60]
+            for key in ("label_main", "label_deco", "label_auto"):
+                cfg[key] = _q(form, key).strip()[:30] or DEFAULTS[key]
             cfg["xui_sub_url"] = _q(form, "xui_sub_url").strip() or "auto"
             cfg["public_host"] = _q(form, "public_host").strip()
             save_config(cfg)

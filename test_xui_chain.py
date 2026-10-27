@@ -99,21 +99,21 @@ class ProfileTests(unittest.TestCase):
         groups = {g["name"]: g for g in prof["proxy-groups"]}
         self.assertEqual(groups[xc.G_UP]["type"], "fallback")
         self.assertEqual(len(groups[xc.G_UP]["proxies"]), 5)
-        self.assertTrue(groups[xc.G_UP]["proxies"][0].startswith("واسط 1"))
-        auto = groups[xc.G_AUTO]["proxies"]
-        self.assertTrue(auto[0].endswith("مستقیم") and auto[-1].endswith("زنجیره"))
+        self.assertTrue(groups[xc.G_UP]["proxies"][0] == "Deco1 · friend-a")
+        auto = groups["⚡ Auto"]["proxies"]
+        self.assertTrue(auto == ["user1-reality · Main", "user1-ws · Main", "user1-reality · Deco", "user1-ws · Deco"])
         chained = [p for p in prof["proxies"] if p.get("dialer-proxy") == xc.G_UP]
         self.assertEqual(len(chained), 2)
         single = [p for p in prof["proxies"] if p.get("dialer-proxy") not in (None, xc.G_UP)]
         self.assertEqual(len(single), 2 * 5)
-        self.assertEqual(single[0]["name"], "user1-reality · از واسط 1")
-        self.assertTrue(single[0]["dialer-proxy"].startswith("واسط 1"))
+        self.assertEqual(single[0]["name"], "user1-reality · Deco1")
+        self.assertEqual(single[0]["dialer-proxy"], "Deco1 · friend-a")
         self.assertEqual(len(auto), 4)
         self.assertEqual(len(groups[xc.G_MAIN]["proxies"]), 1 + 2 + 2 + 10)
-        reality = next(p for p in prof["proxies"] if p["name"] == "user1-reality · مستقیم")
+        reality = next(p for p in prof["proxies"] if p["name"] == "user1-reality · Main")
         self.assertEqual(reality["reality-opts"], {"public-key": PBK, "short-id": "ab12"})
         self.assertEqual(reality["servername"], "www.speedtest.net")
-        ws = next(p for p in prof["proxies"] if p["name"] == "user1-ws · زنجیره")
+        ws = next(p for p in prof["proxies"] if p["name"] == "user1-ws · Deco")
         self.assertEqual(ws["ws-opts"], {"path": "/ws", "headers": {"Host": "cdn.example.com"}})
         self.assertEqual(ws["alpn"], ["h2", "http/1.1"])
         self.assertEqual(prof["rules"], ["DOMAIN-SUFFIX,ir,DIRECT", "MATCH," + xc.G_MAIN])
@@ -128,8 +128,8 @@ class ProfileTests(unittest.TestCase):
         self.assertNotIn(xc.G_UP, [g["name"] for g in prof["proxy-groups"]])
         cfg = dict(self.cfg, direct_first=False, iran_direct=False)
         prof = yaml.safe_load(xc.build_mihomo(self.own, self.ups, cfg)[0])
-        auto = next(g for g in prof["proxy-groups"] if g["name"] == xc.G_AUTO)["proxies"]
-        self.assertTrue(auto and all(n.endswith("زنجیره") for n in auto))
+        auto = next(g for g in prof["proxy-groups"] if g["name"] == "⚡ Auto")["proxies"]
+        self.assertTrue(auto and all(n.endswith("Deco") for n in auto))
         self.assertEqual(prof["rules"], ["MATCH," + xc.G_MAIN])
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
@@ -145,8 +145,8 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(len(confs), 1 + 2 + 2 * 4)
         names = [c["remarks"] for c in confs]
         self.assertEqual(len(names), len(set(names)))
-        self.assertEqual(names[1:3], ["user1-reality · مستقیم", "user1-ws · مستقیم"])
-        self.assertEqual(names[3], "user1-reality · از واسط 1 (friend-a)")
+        self.assertEqual(names[:3], ["⚡ Auto", "user1-reality · Main", "user1-ws · Main"])
+        self.assertEqual(names[3:5], ["user1-reality · Deco1", "user1-ws · Deco1"])
         for c in confs:
             tags = [o["tag"] for o in c["outbounds"]]
             self.assertEqual(len(tags), len(set(tags)))
@@ -175,7 +175,17 @@ class ProfileTests(unittest.TestCase):
 
     def test_xray_without_upstreams(self):
         confs = json.loads(xc.build_xray(self.own, [], self.cfg, "t")[0])
-        self.assertEqual([c["remarks"] for c in confs], ["user1-reality · مستقیم", "user1-ws · مستقیم"])
+        self.assertEqual([c["remarks"] for c in confs], ["user1-reality · Main", "user1-ws · Main"])
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_single_config_names(self):
+        own = self.own[:1]
+        cfg = dict(self.cfg, label_main="اصلی", label_deco="D", label_auto="")
+        confs = json.loads(xc.build_xray(own, self.ups, cfg, "t")[0])
+        self.assertEqual([c["remarks"] for c in confs], ["⚡ Auto", "اصلی", "D1", "D2", "D3", "D5"])
+        prof = yaml.safe_load(xc.build_mihomo(own, self.ups, cfg)[0])
+        select = next(g for g in prof["proxy-groups"] if g["name"] == xc.G_MAIN)["proxies"]
+        self.assertEqual(select, ["⚡ Auto", "اصلی", "D", "D1", "D2", "D3", "D4", "D5"])
 
     def test_format_detection(self):
         self.assertEqual(xc.pick_format("", "FlClash/v0.8 clash-verge"), "clash")
@@ -287,8 +297,8 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("filename*=UTF-8''%D9%85%D9%86.yaml", h["Content-Disposition"])
         if yaml:
             prof = yaml.safe_load(body)
-            auto = next(g for g in prof["proxy-groups"] if g["name"] == xc.G_AUTO)["proxies"]
-            self.assertTrue(auto and all(n.endswith("زنجیره") for n in auto))
+            auto = next(g for g in prof["proxy-groups"] if g["name"] == "⚡ Auto")["proxies"]
+            self.assertTrue(auto and all(n.endswith("Deco") for n in auto))
         xc.save_upstreams_text("\n".join(UPS[1:3]))
         self.app.cfg["direct_first"] = True
         self.app.rt["direct_first"] = True
