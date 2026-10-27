@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -528,6 +529,181 @@ class MonitorTests(unittest.TestCase):
     def test_userinfo(self):
         self.assertEqual(xc.parse_userinfo("upload=1; download=2;total=3; expire=0; x=y"),
                          {"upload": 1, "download": 2, "total": 3, "expire": 0})
+
+
+class FakeXUI(BaseHTTPRequestHandler):
+    """3x-ui panel API: mode "v3" (CSRF, /clients/add) or "v2" (/inbounds/addClient)."""
+    mode = "v3"
+    added = []
+    logins = 0
+
+    def log_message(self, *a):
+        pass
+
+    def reply(self, status, obj=None, cookie=None):
+        body = json.dumps(obj).encode() if obj is not None else b""
+        self.send_response(status)
+        if cookie:
+            self.send_header("Set-Cookie", "3x-ui=%s; Path=/; HttpOnly" % cookie)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def session(self):
+        return "logged" in (self.headers.get("Cookie") or "") or self.headers.get("Authorization") == "Bearer tok"
+
+    def read(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+        if self.headers.get("Content-Type", "").startswith("application/json"):
+            return json.loads(raw)
+        return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
+
+    def do_GET(self):
+        if self.path == "/base/csrf-token" and FakeXUI.mode == "v3":
+            return self.reply(200, {"success": True, "obj": "csrf1"}, cookie=None if self.session() else "anon")
+        if not self.path.startswith("/base/panel/api/") or not self.session():
+            return self.reply(404)
+        if self.path == "/base/panel/api/inbounds/list":
+            return self.reply(200, {"success": True, "obj": [
+                {"id": 1, "remark": "reality", "protocol": "vless", "port": 443, "enable": True,
+                 "settings": json.dumps({"clients": [{"email": "old", "flow": "xtls-rprx-vision"}]})},
+                {"id": 2, "remark": "ss22", "protocol": "shadowsocks", "port": 1080, "enable": True,
+                 "settings": json.dumps({"method": "2022-blake3-aes-128-gcm", "clients": []})},
+                {"id": 3, "remark": "wg", "protocol": "wireguard", "port": 51820, "enable": True, "settings": "{}"}]})
+        self.reply(404)
+
+    def do_POST(self):
+        v3 = FakeXUI.mode == "v3"
+        if v3 and self.headers.get("Authorization") != "Bearer tok" and self.headers.get("X-CSRF-Token") != "csrf1":
+            return self.reply(403)
+        data = self.read()
+        if self.path == "/base/login":
+            ok = data.get("username") == "admin" and data.get("password") == "pw"
+            FakeXUI.logins += ok
+            return self.reply(200, {"success": ok, "msg": "" if ok else "wrong password"}, cookie="logged" if ok else None)
+        if not self.session():
+            return self.reply(404)
+        if v3 and self.path == "/base/panel/api/clients/add":
+            FakeXUI.added.append(data)
+            return self.reply(200, {"success": True, "msg": "Client added"})
+        if not v3 and self.path == "/base/panel/api/inbounds/addClient":
+            FakeXUI.added.append({"id": int(data["id"]), "settings": json.loads(data["settings"])})
+            return self.reply(200, {"success": True, "msg": "ok"})
+        self.reply(404)
+
+
+class PanelTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = start(ThreadingHTTPServer(("127.0.0.1", 0), FakeXUI))
+        d = tempfile.mkdtemp()
+        cls.db = os.path.join(d, "x-ui.db")
+        con = sqlite3.connect(cls.db)
+        con.execute("CREATE TABLE settings (id INTEGER PRIMARY KEY, key TEXT, value TEXT)")
+        con.executemany("INSERT INTO settings (key, value) VALUES (?, ?)",
+                        [("webPort", str(cls.srv.server_address[1])), ("webBasePath", "base")])
+        con.execute("CREATE TABLE client_traffics (id INTEGER PRIMARY KEY, email TEXT, up INT, down INT, total INT, expiry_time INT)")
+        con.execute("INSERT INTO client_traffics (email, up, down, total, expiry_time) VALUES ('old', ?, ?, ?, ?)",
+                    (GB, GB, 10 * GB, int((time.time() + 5.5 * 86400) * 1000)))
+        con.commit()
+        con.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def setUp(self):
+        FakeXUI.added.clear()
+        FakeXUI.logins = 0
+
+    def app(self, **cfg):
+        a = type("A", (), {})()
+        a.db_path = self.db
+        a.rt = xc.resolve_runtime(dict(xc.DEFAULTS, **cfg), self.db)
+        return a, xc.PanelAPI(a)
+
+    def test_panel_url_from_settings(self):
+        a, _ = self.app()
+        self.assertEqual(a.rt["panel_url"], "http://127.0.0.1:%d/base/" % self.srv.server_address[1])
+
+    def test_v3_login_csrf_and_add(self):
+        FakeXUI.mode = "v3"
+        a, api = self.app(panel_user="admin", panel_pass="pw")
+        self.assertEqual([ib["protocol"] for ib in api.inbounds()], ["vless", "shadowsocks", "wireguard"])
+        before = time.time()
+        sub = api.add_client("ali", 25, 30, 2, False, [1, 2])
+        self.assertRegex(sub, r"^[a-z0-9]{16}$")
+        body = FakeXUI.added[0]
+        c = body["client"]
+        self.assertEqual(body["inboundIds"], [1, 2])
+        self.assertEqual((c["email"], c["subId"], c["limitIp"], c["totalGB"], c["flow"]),
+                         ("ali", sub, 2, 25 * GB, "xtls-rprx-vision"))
+        self.assertAlmostEqual(c["expiryTime"] / 1000, before + 30 * 86400, delta=5)
+        uuid.UUID(c["id"])
+        self.assertEqual(FakeXUI.logins, 1)
+        api.add_client("reza", 0, 7, 0, True, [2])  # session reused
+        self.assertEqual(FakeXUI.logins, 1)
+        c = FakeXUI.added[1]["client"]
+        self.assertEqual((c["totalGB"], c["expiryTime"]), (0, -7 * 86400000))
+        self.assertEqual(len(base64.b64decode(c["password"])), 16)  # 2022-blake3-aes-128-gcm key
+
+    def test_v3_token(self):
+        FakeXUI.mode = "v3"
+        _, api = self.app(panel_token="tok")
+        api.add_client("sara", 1, 0, 0, False, [1])
+        self.assertEqual(FakeXUI.logins, 0)
+        self.assertEqual(FakeXUI.added[0]["client"]["expiryTime"], 0)
+        _, bad = self.app(panel_token="nope")
+        with self.assertRaises(xc.PanelError):
+            bad.inbounds()
+
+    def test_v2_fallback(self):
+        FakeXUI.mode = "v2"
+        _, api = self.app(panel_user="admin", panel_pass="pw")
+        sub = api.add_client("ali", 10, 0, 0, False, [1, 2])
+        self.assertEqual([x["id"] for x in FakeXUI.added], [1, 2])
+        clients = [x["settings"]["clients"][0] for x in FakeXUI.added]
+        self.assertEqual([c["email"] for c in clients], ["ali", "ali-2"])
+        self.assertEqual({c["subId"] for c in clients}, {sub})
+        FakeXUI.mode = "v3"
+
+    def test_errors(self):
+        FakeXUI.mode = "v3"
+        with self.assertRaises(xc.PanelError) as e:
+            self.app(panel_user="admin", panel_pass="bad")[1].inbounds()
+        self.assertIn("wrong password", str(e.exception))
+        with self.assertRaises(xc.PanelError):
+            self.app()[1].inbounds()
+        with self.assertRaises(xc.PanelError):
+            self.app(panel_user="admin", panel_pass="pw")[1].add_client("x", 1, 1, 0, False, [3, 99][1:])
+
+    def test_admin_add_user_flow(self):
+        FakeXUI.mode = "v3"
+        xc.save_config(dict(xc.DEFAULTS, admin_path="adm2", panel_user="admin", panel_pass="pw"))
+        app = xc.App(db_path=self.db)
+        srv = start(ThreadingHTTPServer(("127.0.0.1", 0), xc.make_handler(app)))
+        base = "http://127.0.0.1:%d/adm2/" % srv.server_address[1]
+        try:
+            page = urllib.request.urlopen(base, timeout=10).read().decode()
+            self.assertIn('name="inbound" value="1" checked', page)
+            self.assertIn('value="2"', page)
+            self.assertNotIn('value="3"', page)  # wireguard is not offered
+            form = urllib.parse.urlencode([("name", "mina"), ("gb", "5"), ("days", "10"), ("devices", "1"),
+                                           ("inbound", "1")]).encode()
+            page = urllib.request.urlopen(base + "adduser", data=form, timeout=10).read().decode()
+            sub = FakeXUI.added[-1]["client"]["subId"]
+            self.assertIn("کاربر mina ساخته شد", page)
+            self.assertIn('data-qr="http://127.0.0.1:%d/chain/%s"' % (srv.server_address[1], sub), page)
+            bad = urllib.parse.urlencode([("name", "علی"), ("inbound", "1")]).encode()
+            page = urllib.request.urlopen(base + "adduser", data=bad, timeout=10).read().decode()
+            self.assertIn("اسم فقط حروف انگلیسی", page)
+            self.assertEqual(len(FakeXUI.added), 1)
+        finally:
+            srv.shutdown()
+
+    def test_usage_in_user_list(self):
+        self.assertEqual(xc.client_usage(self.db)["old"][:2], (2 * GB, 10 * GB))
+        self.assertEqual(xc.client_usage("/nonexistent"), {})
 
 
 if __name__ == "__main__":

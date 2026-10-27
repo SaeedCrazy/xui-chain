@@ -14,6 +14,7 @@ Standard library only. Python 3.8+.
 """
 
 import base64
+import http.cookies
 import glob
 import hmac
 import html
@@ -31,11 +32,12 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
 LOOPBACK = {"127.0.0.1", "0.0.0.0", "localhost", "::1", "::"}
@@ -64,6 +66,10 @@ DEFAULTS = {
     "tg_token": "",             # empty = the 3x-ui panel's own Telegram bot
     "tg_chat": "",              # empty = the panel bot's admin chat ids
     "test_sub_id": "",          # user whose config is used for the real test; empty = first enabled user
+    "panel_url": "auto",        # 3x-ui panel address for creating users; auto = from the panel settings
+    "panel_token": "",          # 3x-ui API token (Settings > Security), or:
+    "panel_user": "",
+    "panel_pass": "",
 }
 
 
@@ -159,6 +165,16 @@ def resolve_runtime(cfg, db_path=XUI_DB):
             rt["public_host"] = cert_domain(rt["cert_file"])
         else:
             rt["public_host"] = s.get("subDomain") or s.get("webDomain") or ""
+    # the panel itself, for creating users through its API
+    if rt.get("panel_url", "auto") in ("", "auto"):
+        base = s.get("webBasePath") or "/"
+        base = "/" + base.strip("/") + "/" if base.strip("/") else "/"
+        web_cert = s.get("webCertFile") and s.get("webKeyFile")
+        host = s.get("webDomain") or "127.0.0.1"
+        rt["panel_url"] = "%s://%s:%s%s" % ("https" if web_cert else "http", host, s.get("webPort") or "2053", base)
+        listen = s.get("webListen", "")
+        rt["panel_connect"] = listen if listen and listen not in LOOPBACK else (
+            "127.0.0.1" if host not in LOOPBACK else "")
     # Telegram: our own bot settings, else the panel's bot
     rt["tg_source"] = "own" if rt.get("tg_token") else ("panel" if s.get("tgBotToken") else "")
     rt["tg_token_rt"] = rt.get("tg_token") or s.get("tgBotToken", "")
@@ -929,6 +945,19 @@ def list_clients(db_path=XUI_DB):
     return out
 
 
+def client_usage(db_path=XUI_DB):
+    """{email: (used_bytes, total_bytes, expiry_ms)} from the panel DB; {} if unknown."""
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=5)
+        try:
+            rows = con.execute("SELECT email, up, down, total, expiry_time FROM client_traffics").fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return {}
+    return {e: ((up or 0) + (down or 0), total or 0, exp or 0) for e, up, down, total, exp in rows}
+
+
 def tcp_check(server, port, timeout=3):
     t = time.time()
     try:
@@ -1215,6 +1244,151 @@ class Monitor:
                 time.sleep(5)
 
 
+# ---------------------------------------------------------------- 3x-ui API (creating users)
+
+class PanelError(Exception):
+    pass
+
+
+class PanelAPI:
+    """Minimal client for the 3x-ui panel API: API token (Bearer) or a login session
+    (cookie + CSRF token on newer panels). Works with v2 and v3 panels."""
+
+    def __init__(self, app):
+        self.app = app
+        self.cookies = {}
+        self.csrf = ""
+        self.lock = threading.Lock()
+
+    def request(self, method, path, form=None, body=None):
+        rt = self.app.rt
+        u = urllib.parse.urlsplit(rt["panel_url"])
+        host = rt.get("panel_connect") or u.hostname
+        port = u.port or (443 if u.scheme == "https" else 80)
+        if u.scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=20, context=ssl._create_unverified_context())
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=20)
+        headers = {"Host": u.netloc, "Accept": "application/json", "X-Requested-With": "XMLHttpRequest",
+                   "User-Agent": "xui-chain/" + VERSION}
+        if rt.get("panel_token"):
+            headers["Authorization"] = "Bearer " + rt["panel_token"]
+        if self.cookies:
+            headers["Cookie"] = "; ".join("%s=%s" % kv for kv in self.cookies.items())
+        if self.csrf and method != "GET":
+            headers["X-CSRF-Token"] = self.csrf
+        data = None
+        if form is not None:
+            data = urllib.parse.urlencode(form).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        elif body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        try:
+            conn.request(method, u.path.rstrip("/") + path, body=data, headers=headers)
+            r = conn.getresponse()
+            raw = r.read(4 * 1024 * 1024).decode("utf-8", "replace")
+            for value in r.headers.get_all("Set-Cookie") or []:
+                c = http.cookies.SimpleCookie()
+                c.load(value)
+                for k, m in c.items():
+                    self.cookies[k] = m.value
+        except OSError as e:
+            raise PanelError("پنل در دسترس نیست (%s)" % e)
+        finally:
+            conn.close()
+        try:
+            return r.status, json.loads(raw)
+        except ValueError:
+            return r.status, None
+
+    def login(self):
+        rt = self.app.rt
+        if rt.get("panel_token"):
+            return
+        if not rt.get("panel_user") or not rt.get("panel_pass"):
+            raise PanelError("نام کاربری و رمز پنل یا توکن API را در تنظیمات وارد کن")
+        self.cookies, self.csrf = {}, ""
+        status, j = self.request("GET", "/csrf-token")  # newer panels only
+        if status == 200 and isinstance(j, dict):
+            self.csrf = j.get("obj") or ""
+        status, j = self.request("POST", "/login", form={"username": rt["panel_user"], "password": rt["panel_pass"]})
+        if not (isinstance(j, dict) and j.get("success")):
+            raise PanelError("ورود به پنل ناموفق: %s" % ((j or {}).get("msg") or "HTTP %d" % status))
+        status, j = self.request("GET", "/csrf-token")
+        if status == 200 and isinstance(j, dict):
+            self.csrf = j.get("obj") or ""
+
+    def call(self, method, path, **kw):
+        with self.lock:
+            if not self.cookies and not self.app.rt.get("panel_token"):
+                self.login()
+            status, j = self.request(method, path, **kw)
+            # the panel hides its API behind 404 when the session has expired
+            if status in (401, 403, 404) or (status == 200 and j is None):
+                if self.app.rt.get("panel_token"):
+                    if status in (401, 403):
+                        raise PanelError("توکن API پنل پذیرفته نشد")
+                    return status, j
+                self.login()
+                status, j = self.request(method, path, **kw)
+            return status, j
+
+    def inbounds(self):
+        status, j = self.call("GET", "/panel/api/inbounds/list")
+        if not (isinstance(j, dict) and j.get("success")):
+            raise PanelError("فهرست inboundها خوانده نشد (HTTP %d)" % status)
+        out = []
+        for ib in j.get("obj") or []:
+            try:
+                settings = json.loads(ib.get("settings") or "{}") if isinstance(ib.get("settings"), str) else (ib.get("settings") or {})
+            except ValueError:
+                settings = {}
+            out.append({"id": ib["id"], "remark": ib.get("remark") or "", "protocol": ib.get("protocol", ""),
+                        "port": ib.get("port"), "enable": ib.get("enable", True), "settings": settings})
+        return out
+
+    def add_client(self, name, gb, days, devices, first_use, inbound_ids):
+        """Create one client on the chosen inbounds -> its subId."""
+        inbounds = {ib["id"]: ib for ib in self.inbounds()}
+        chosen = [inbounds[i] for i in inbound_ids if i in inbounds]
+        if not chosen:
+            raise PanelError("حداقل یک inbound انتخاب کن")
+        sub_id = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(16))
+        base = {"email": name, "enable": True, "subId": sub_id, "limitIp": int(devices),
+                "totalGB": int(float(gb) * 1024 ** 3), "comment": "xui-chain",
+                "expiryTime": 0 if not days else (-int(days) * 86400000 if first_use else
+                                                   int((time.time() + int(days) * 86400) * 1000))}
+        uid, pw = str(uuid.uuid4()), secrets.token_urlsafe(12)
+
+        def for_inbound(ib, email):
+            c = dict(base, email=email, id=uid, password=pw)
+            st = ib["settings"]
+            if ib["protocol"] == "vless":
+                flows = [x.get("flow") for x in st.get("clients") or [] if x.get("flow")]
+                if flows:
+                    c["flow"] = flows[0]
+            elif ib["protocol"] == "shadowsocks":
+                method = st.get("method", "")
+                if method.startswith("2022-"):
+                    c["password"] = base64.b64encode(os.urandom(16 if "128" in method else 32)).decode()
+            return c
+
+        status, j = self.call("POST", "/panel/api/clients/add",
+                              body={"client": for_inbound(chosen[0], name), "inboundIds": [ib["id"] for ib in chosen]})
+        if status == 404:  # v2 panels: one client per inbound, emails must be unique
+            for k, ib in enumerate(chosen):
+                email = name if k == 0 else "%s-%d" % (name, k + 1)
+                status, j = self.call("POST", "/panel/api/inbounds/addClient", form={
+                    "id": ib["id"], "settings": json.dumps({"clients": [for_inbound(ib, email)]})})
+                if not (isinstance(j, dict) and j.get("success")):
+                    raise PanelError("ساخت کاربر ناموفق: %s" % ((j or {}).get("msg") or "HTTP %d" % status))
+            return sub_id
+        if not (isinstance(j, dict) and j.get("success")):
+            raise PanelError("ساخت کاربر ناموفق: %s" % ((j or {}).get("msg") or "HTTP %d" % status))
+        return sub_id
+
+
 # ---------------------------------------------------------------- admin page
 
 PAGE = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
@@ -1261,16 +1435,39 @@ ol{padding-inline-start:20px;margin:6px 0}li{margin:4px 0;word-break:break-all}
 <div class="mut" style="margin-top:8px">آدرس ساب 3x-ui (auto = خودکار از تنظیمات پنل)</div><input type="text" name="xui_sub_url" value="%(xui_sub_url)s">
 <div class="mut" style="margin-top:8px">دامنه یا آی‌پی برای لینک کاربرها (خالی = همین آدرسی که الان باز کردی)</div><input type="text" name="public_host" value="%(public_host)s">
 </div>
+<div class="card"><h2>اتصال به پنل 3x-ui (برای ساخت کاربر)</h2>
+<div class="mut">یا توکن API (در پنل: Settings ← Security ← API Token)، یا نام کاربری و رمز ورود پنل. اگه ورود دومرحله‌ای (2FA) روشن است، توکن بگذار. خالی = همان که ذخیره شده؛ برای پاک کردن - بنویس.</div>
+<div class="mut" style="margin-top:8px">توکن API</div><input type="text" name="panel_token" value="" placeholder="%(panel_token_ph)s" autocomplete="off">
+<div style="display:flex;gap:6px;margin-top:8px"><input type="text" name="panel_user" value="%(panel_user)s" placeholder="نام کاربری" autocomplete="off"><input type="password" name="panel_pass" value="" placeholder="%(panel_pass_ph)s" autocomplete="new-password"></div>
+<div class="mut" style="margin-top:8px">آدرس پنل (auto = خودکار)</div><input type="text" name="panel_url" value="%(panel_url)s">
+<div class="mut" style="margin-top:4px;direction:ltr;text-align:left">%(panel_rt)s</div>
+</div>
 <button type="submit">💾 ذخیره</button>
 </form>
+%(newuser)s
+<div class="card"><h2>➕ ساخت کاربر</h2>
+<form method="post" action="adduser">
+<div class="mut">اسم (یکتا، انگلیسی)</div><input type="text" name="name" required pattern="[A-Za-z0-9_.@-]+" autocomplete="off">
+<div style="display:flex;gap:6px;margin-top:8px">
+<div style="flex:1"><div class="mut">حجم GB</div><input type="text" name="gb" value="30" inputmode="decimal"></div>
+<div style="flex:1"><div class="mut">روز</div><input type="text" name="days" value="30" inputmode="numeric"></div>
+<div style="flex:1"><div class="mut">دستگاه</div><input type="text" name="devices" value="0" inputmode="numeric"></div>
+</div>
+<div class="mut">0 یعنی نامحدود</div>
+<label><input type="checkbox" name="first_use"> روزها از اولین اتصال شروع شود</label>
+<div class="mut">روی کدام inboundها</div>%(inbound_boxes)s
+<div style="margin-top:10px"><button type="submit">➕ ساخت و گرفتن لینک</button></div>
+</form>
+</div>
 <div class="card"><h2>لینک کاربرها</h2>
 <div class="mut">این لینک را به‌جای لینک ساب قبلی به کاربر بده. برای FlClash / Clash Meta / Clash Verge خودکار YAML می‌دهد و برای v2rayNG / Streisand / V2Box / Happ کانفیگ JSON.</div>
 <div style="margin:8px 0"><div class="mut">تبدیل: لینک ساب قبلی کاربر (یا فقط subId) را اینجا بگذار</div><input type="text" id="conv" placeholder="https://…/sub/abcd1234"><div id="convout" class="mut" style="direction:ltr;word-break:break-all;margin-top:6px"></div></div>
 %(users)s
 </div>
 <div class="mut">پنل 3x-ui: <code>%(xui_rt)s</code></div>
-</main><script>
+</main><script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script><script>
 var base=%(base)s;
+document.querySelectorAll('[data-qr]').forEach(function(el){try{new QRCode(el,{text:el.getAttribute('data-qr'),width:220,height:220})}catch(e){}});
 function cp(t,b){navigator.clipboard&&navigator.clipboard.writeText(t);b.textContent='کپی شد ✓';setTimeout(function(){b.textContent='کپی'},1500)}
 document.getElementById('conv').addEventListener('input',function(){var v=this.value.trim().split('?')[0].replace(/\\/+$/,'');var id=v.split('/').pop();
 document.getElementById('convout').innerHTML=id?'<b>'+base+encodeURIComponent(id)+'</b> <button class="sec" onclick="cp(\\''+base+encodeURIComponent(id)+'\\',this)">کپی</button>':''});
@@ -1326,8 +1523,19 @@ def deco_status(monitor, cfg):
     return up
 
 
-def render_admin(cfg, rt, host, msg="", db_path=XUI_DB, monitor=None):
+def render_admin(cfg, rt, host, msg="", db_path=XUI_DB, monitor=None, panel=None, new_sub=""):
     up = deco_status(monitor, cfg)
+    boxes = ""
+    if panel and (rt.get("panel_token") or (rt.get("panel_user") and rt.get("panel_pass"))):
+        try:
+            ibs = [ib for ib in panel.inbounds() if ib["protocol"] in ("vless", "vmess", "trojan", "shadowsocks")]
+            boxes = "".join('<label><input type="checkbox" name="inbound" value="%d"%s> %s · %s · %s</label>' % (
+                ib["id"], " checked" if k == 0 else "", html.escape(ib["remark"] or "#%d" % ib["id"]),
+                ib["protocol"], ib["port"]) for k, ib in enumerate(ibs)) or '<div class="bad">inboundی پیدا نشد</div>'
+        except PanelError as e:
+            boxes = '<div class="bad">⚠ %s</div>' % html.escape(str(e))
+    else:
+        boxes = '<div class="bad">اول در بخش «اتصال به پنل 3x-ui» توکن یا نام کاربری و رمز پنل را بگذار و ذخیره کن.</div>'
 
     scheme = "https" if rt.get("cert_file") else "http"
     if rt.get("public_host"):
@@ -1339,10 +1547,26 @@ def render_admin(cfg, rt, host, msg="", db_path=XUI_DB, monitor=None):
         authority = host  # as the admin page was opened, port included
     base = "%s://%s/%s/" % (scheme, authority, rt["sub_path"])
     users = []
+    usage = client_usage(db_path)
     for email, sub, en in list_clients(db_path):
         link = base + urllib.parse.quote(sub)
-        users.append('<div class="u"><div><b>%s</b>%s<code>%s</code></div><button class="sec" onclick="cp(\'%s\',this)">کپی</button></div>' % (
-            html.escape(email or sub), "" if en else ' <span class="bad">(غیرفعال)</span>', html.escape(link), html.escape(link)))
+        used, total, exp = usage.get(email, (0, 0, 0))
+        info = "%s / %s GB" % (fmt_gb(used), fmt_gb(total) if total else "∞")
+        if exp > 0:
+            days = (exp / 1000 - time.time()) / 86400
+            info += " · " + ("%d روز" % days if days > 0 else "منقضی")
+        elif exp < 0:
+            info += " · %d روز از اولین اتصال" % (-exp // 86400000)
+        users.append('<div class="u"><div><b>%s</b>%s <span class="mut">%s</span><code>%s</code></div><button class="sec" onclick="cp(\'%s\',this)">کپی</button></div>' % (
+            html.escape(email or sub), "" if en else ' <span class="bad">(غیرفعال)</span>', info, html.escape(link), html.escape(link)))
+    newuser = ""
+    if new_sub:
+        link = base + urllib.parse.quote(new_sub)
+        newuser = ('<div class="card" style="border-color:var(--ok)"><h2>✅ کاربر ساخته شد</h2>'
+                   '<code style="direction:ltr;display:block;word-break:break-all">%s</code>'
+                   '<div style="margin:8px 0"><button class="sec" onclick="cp(\'%s\',this)">کپی</button></div>'
+                   '<div data-qr="%s" style="background:#fff;padding:10px;width:240px"></div></div>'
+                   % (html.escape(link), html.escape(link), html.escape(link)))
     users_html = "".join(users) or '<div class="mut">فهرست کاربرها از دیتابیس پنل خوانده نشد؛ از کادر بالا استفاده کن.</div>'
 
     return PAGE % {
@@ -1359,6 +1583,13 @@ def render_admin(cfg, rt, host, msg="", db_path=XUI_DB, monitor=None):
         "xui_sub_url": html.escape(cfg.get("xui_sub_url", "auto")),
         "public_host": html.escape(cfg.get("public_host", "")),
         "users": users_html,
+        "newuser": newuser,
+        "inbound_boxes": boxes,
+        "panel_token_ph": html.escape("ذخیره شده ••••" + cfg["panel_token"][-4:] if cfg.get("panel_token") else "اختیاری"),
+        "panel_user": html.escape(cfg.get("panel_user", "")),
+        "panel_pass_ph": "رمز (ذخیره شده)" if cfg.get("panel_pass") else "رمز",
+        "panel_url": html.escape(cfg.get("panel_url", "auto")),
+        "panel_rt": html.escape(rt.get("panel_url", "")),
         "tg_enable": "checked" if cfg.get("tg_enable", True) else "",
         "tg_token_ph": html.escape("ذخیره شده ••••" + cfg["tg_token"][-4:] if cfg.get("tg_token") else (
             "ربات پنل 3x-ui (خودکار)" if rt.get("tg_source") == "panel" else "123456:ABC…")),
@@ -1377,6 +1608,7 @@ class App:
         self.db_path = db_path
         self.reload()
         self.monitor = Monitor(self)
+        self.panel = PanelAPI(self)
 
     def reload(self):
         self.cfg = load_config()
@@ -1425,16 +1657,18 @@ def make_handler(app):
                 q = urllib.parse.parse_qs(u.query)
                 msg = _q(q, "msg")[:300] or ("ذخیره شد ✓" if _q(q, "saved") else "")
                 page = render_admin(app.cfg, app.rt, self.headers.get("Host", "localhost"), msg, app.db_path,
-                                    app.monitor)
+                                    app.monitor, app.panel, _q(q, "new"))
                 return self.send(200, page, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"})
             self.send(404, "404 page not found\n")
 
         def do_POST(self):
             u, parts = self.route()
-            if not (self.is_admin(parts) and len(parts) == 2 and parts[1] in ("save", "test", "tgtest")):
+            if not (self.is_admin(parts) and len(parts) == 2 and parts[1] in ("save", "test", "tgtest", "adduser")):
                 return self.send(404, "404 page not found\n")
             length = min(int(self.headers.get("Content-Length") or 0), 1024 * 1024)
             form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
+            if parts[1] == "adduser":
+                return self.add_user(parts[0], form)
             save_upstreams_text(_q(form, "upstreams"))
             cfg = load_config()
             cfg["direct_first"] = "direct_first" in form
@@ -1451,6 +1685,15 @@ def make_handler(app):
             elif token:
                 cfg["tg_token"] = token
             cfg["tg_chat"] = _q(form, "tg_chat").strip()
+            for key in ("panel_token", "panel_pass"):
+                value = _q(form, key).strip()
+                if value == "-":
+                    cfg[key] = ""
+                elif value:
+                    cfg[key] = value
+            cfg["panel_user"] = _q(form, "panel_user").strip()
+            cfg["panel_url"] = _q(form, "panel_url").strip() or "auto"
+            app.panel.cookies = {}
             try:
                 cfg["monitor_minutes"] = min(1440, max(2, int(_q(form, "monitor_minutes") or 10)))
             except ValueError:
@@ -1466,9 +1709,32 @@ def make_handler(app):
                 err = tg_send(app.rt, "🔗 xui-chain · %s\n\n✅ پیام آزمایشی. هشدارهای Deco اینجا میاد."
                               % (app.rt.get("public_host") or "server"))
                 msg = ("⚠ " + err) if err else "پیام آزمایشی فرستاده شد ✓"
+            self.redirect(parts[0], msg)
+
+        def redirect(self, admin, msg, new=""):
             self.send_response(303)
-            self.send_header("Location", "/%s/?msg=%s" % (parts[0], urllib.parse.quote(msg)))
+            self.send_header("Location", "/%s/?msg=%s%s" % (admin, urllib.parse.quote(msg),
+                                                           "&new=" + urllib.parse.quote(new) if new else ""))
             self.end_headers()
+
+        def add_user(self, admin, form):
+            name = _q(form, "name").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", name):
+                return self.redirect(admin, "⚠ اسم فقط حروف انگلیسی، عدد و - _ . @")
+            try:
+                gb = max(0.0, float(_q(form, "gb") or 0))
+                days = max(0, int(_q(form, "days") or 0))
+                devices = max(0, int(_q(form, "devices") or 0))
+                ids = [int(i) for i in form.get("inbound", [])]
+            except ValueError:
+                return self.redirect(admin, "⚠ عددها را درست وارد کن")
+            if name in {e for e, _, _ in list_clients(app.db_path)}:
+                return self.redirect(admin, "⚠ کاربری با این اسم هست")
+            try:
+                sub = app.panel.add_client(name, gb, days, devices, "first_use" in form, ids)
+            except PanelError as e:
+                return self.redirect(admin, "⚠ " + str(e))
+            self.redirect(admin, "کاربر %s ساخته شد ✓" % name, sub)
 
     return H
 
