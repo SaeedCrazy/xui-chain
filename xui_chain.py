@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -64,6 +64,10 @@ DEFAULTS = {
     "test_interval": 120,
     "title": "",
     "main_location": "",       # display name of this server, e.g. "🇫🇮 فنلاند"
+    "show_auto": True,         # which entries the users' apps list
+    "show_main": True,
+    "show_deco_any": True,     # Clash: "Deco" = your server through the first working Deco
+    "deco_opts": {},           # per Deco (by node key): chain, own, chain_name, own_name
     "user_page": True,         # subscription link opened in a browser shows the user's account page
     "support_url": "",         # support / renewal link on the user page (e.g. https://t.me/...)
     "announce": "",            # message shown on every user page
@@ -629,18 +633,36 @@ def route_name(cfg, node, single_own, text):
     return text if single_own else "%s · %s" % (node["name"], text)
 
 
+def deco_options(cfg, ups):
+    """[(index, node, options)] for the Decos: whether the user's server is offered through it
+    ("chain"), whether the Deco's own config is offered as it is ("own"), and both names."""
+    stored = cfg.get("deco_opts") or {}
+    deco = label(cfg, "label_deco")
+    out = []
+    for i, n in enumerate(ups, 1):
+        o = stored.get(node_key(n)) or {}
+        out.append((i, n, {"chain": o.get("chain", True), "own": o.get("own", False),
+                           "chain_name": (o.get("chain_name") or "").strip() or "%s%d" % (deco, i),
+                           "own_name": (o.get("own_name") or "").strip() or n["name"]}))
+    return out
+
+
 def build_mihomo(own, ups, cfg):
     """own, ups: lists of neutral nodes. Returns (yaml_text, skipped_messages)."""
     g_auto = auto_name(cfg)
     main, deco = label(cfg, "label_main"), label(cfg, "label_deco")
     names = {G_MAIN, g_auto, G_UP, "DIRECT", "REJECT"}
     skipped = []
-    up_proxies = []
-    for i, n in enumerate(ups, 1):
+    hops, owns = [], []
+    for i, n, o in deco_options(cfg, ups):
         try:
-            up_proxies.append(to_mihomo(n, unique(names, "%s%d · %s" % (deco, i, n["name"]))))
+            if o["chain"]:
+                hops.append((o, to_mihomo(n, unique(names, "%s%d · %s" % (deco, i, n["name"])))))
+            if o["own"]:
+                owns.append(to_mihomo(n, unique(names, o["own_name"])))
         except ValueError as e:
             skipped.append("upstream %d: %s" % (i, e))
+    up_proxies = [p for _, p in hops]
     direct, chained, single = [], [], []
     one = len(own) == 1
     for n in own:
@@ -651,21 +673,24 @@ def build_mihomo(own, ups, cfg):
                 p = to_mihomo(n, unique(names, route_name(cfg, n, one, deco)))
                 p["dialer-proxy"] = G_UP
                 chained.append(p)
-                for i, u in enumerate(up_proxies, 1):
-                    p = to_mihomo(n, unique(names, route_name(cfg, n, one, "%s%d" % (deco, i))))
+                for o, u in hops:
+                    p = to_mihomo(n, unique(names, route_name(cfg, n, one, o["chain_name"])))
                     p["dialer-proxy"] = u["name"]
                     single.append(p)
         except ValueError as e:
             skipped.append("%s: %s" % (n["name"], e))
-    if not direct:
+    if not direct and not owns:
         raise ValueError("no usable config for this user")
-    auto = (direct if cfg.get("direct_first", True) or not up_proxies else []) + chained
-    mine = direct + chained + single
+    auto = [p["name"] for p in (direct if cfg.get("direct_first", True) or not up_proxies else []) + chained]
+    auto = auto or [p["name"] for p in owns]
+    visible = ([g_auto] if cfg.get("show_auto", True) else []) + [p["name"] for p in (
+        (direct if cfg.get("show_main", True) else []) + (chained if cfg.get("show_deco_any", True) else [])
+        + single + owns)]
     test = {"url": cfg.get("test_url") or DEFAULTS["test_url"], "interval": int(cfg.get("test_interval") or 120),
             "timeout": 5000, "lazy": False}
     groups = [
-        {"name": G_MAIN, "type": "select", "proxies": [g_auto] + [p["name"] for p in mine]},
-        dict({"name": g_auto, "type": "fallback", "proxies": [p["name"] for p in auto]}, **test),
+        {"name": G_MAIN, "type": "select", "proxies": visible or [g_auto]},
+        dict({"name": g_auto, "type": "fallback", "proxies": auto}, **test),
     ]
     if up_proxies:
         groups.append(dict({"name": G_UP, "type": "fallback", "proxies": [p["name"] for p in up_proxies]}, **test))
@@ -679,7 +704,7 @@ def build_mihomo(own, ups, cfg):
         "mode": "rule",
         "log-level": "warning",
         "unified-delay": True,
-        "proxies": mine + up_proxies,
+        "proxies": direct + chained + single + up_proxies + owns,
         "proxy-groups": groups,
         "rules": rules,
     }
@@ -712,17 +737,21 @@ def xray_config(remarks, outbounds, cfg, route):
 
 
 def build_xray(own, ups, cfg, remarks):
-    """List of Xray client configs (one app entry each):
-    an automatic one (balancer over every route), then every route on its own:
-    each own config directly, then through each upstream."""
+    """List of Xray client configs (one app entry each): an automatic one (balancer over
+    every route), then each own config directly, through each chosen Deco, and the
+    Decos' own configs that were chosen to be offered as they are."""
     skipped = []
-    up_nodes = []
-    for i, n in enumerate(ups, 1):
+    chain_ups, own_decos = [], []
+    for i, n, o in deco_options(cfg, ups):
         try:
             to_xray(n, "up")
-            up_nodes.append((i, n))
         except ValueError as e:
             skipped.append("upstream %d: %s" % (i, e))
+            continue
+        if o["chain"]:
+            chain_ups.append((i, n, o))
+        if o["own"]:
+            own_decos.append((n, o))
     own_ok = []
     for n in own:
         try:
@@ -730,34 +759,37 @@ def build_xray(own, ups, cfg, remarks):
             own_ok.append(n)
         except ValueError as e:
             skipped.append("%s: %s" % (n["name"], e))
-    if not own_ok:
+    if not own_ok and not own_decos:
         raise ValueError("no usable config for this user")
 
-    def chained(n, i, u, tag):
+    def chained(n, i, tag):
         o = to_xray(n, tag)
         o["streamSettings"]["sockopt"] = {"dialerProxy": "up-%d" % i}
         return o
 
     one = len(own_ok) == 1
-    main, deco = label(cfg, "label_main"), label(cfg, "label_deco")
-    singles = []
-    for n in own_ok:
-        singles.append(xray_config(route_name(cfg, n, one, main), [to_xray(n, "proxy")], cfg, {"outboundTag": "proxy"}))
-    for i, u in up_nodes:
+    main = label(cfg, "label_main")
+    direct = [xray_config(route_name(cfg, n, one, main), [to_xray(n, "proxy")], cfg, {"outboundTag": "proxy"})
+              for n in own_ok]
+    singles = list(direct) if cfg.get("show_main", True) else []
+    for i, u, o in chain_ups:
         for n in own_ok:
-            singles.append(xray_config(route_name(cfg, n, one, "%s%d" % (deco, i)),
-                                       [chained(n, i, u, "proxy"), to_xray(u, "up-%d" % i)],
+            singles.append(xray_config(route_name(cfg, n, one, o["chain_name"]),
+                                       [chained(n, i, "proxy"), to_xray(u, "up-%d" % i)],
                                        cfg, {"outboundTag": "proxy"}))
-    if not up_nodes:
+    for u, o in own_decos:
+        singles.append(xray_config(o["own_name"], [to_xray(u, "proxy")], cfg, {"outboundTag": "proxy"}))
+    singles = singles or direct
+    if not chain_ups or not own_ok or not cfg.get("show_auto", True):
         return json.dumps(singles, ensure_ascii=False, indent=2), skipped
 
     mine = []
     for k, n in enumerate(own_ok, 1):
         if cfg.get("direct_first", True):
             mine.append(to_xray(n, "me-%d-direct" % k))
-        for i, u in up_nodes:
-            mine.append(chained(n, i, u, "me-%d-via-up-%d" % (k, i)))
-    auto = xray_config(auto_name(cfg), mine + [to_xray(u, "up-%d" % i) for i, u in up_nodes], cfg,
+        for i, u, o in chain_ups:
+            mine.append(chained(n, i, "me-%d-via-up-%d" % (k, i)))
+    auto = xray_config(auto_name(cfg), mine + [to_xray(u, "up-%d" % i) for i, u, o in chain_ups], cfg,
                        {"balancerTag": "auto"})
     auto["observatory"] = {
         "subjectSelector": ["me-"],
@@ -915,6 +947,20 @@ def location_label(node, rt):
     return rt.get("main_location") or clean_remark(node["name"])
 
 
+def label_configs(own, rt):
+    """Name the user's configs by location; configs that share a location (two inbounds on one
+    server) keep their own remark after it so every entry stays distinct."""
+    labels = [location_label(n, rt) for n in own]
+    seen = {}
+    for n, lab in zip(own, labels):
+        if labels.count(lab) > 1:
+            extra = clean_remark(n["name"])
+            lab = "%s %s" % (lab, extra) if extra and extra != lab else lab
+        seen[lab] = seen.get(lab, 0) + 1
+        n["name"] = lab if seen[lab] == 1 else "%s %d" % (lab, seen[lab])
+    return own
+
+
 def build_subscription(sub_id, fmt, rt):
     """-> (status, headers, body)."""
     url = rt["xui_sub_url"] + urllib.parse.quote(sub_id)
@@ -928,8 +974,7 @@ def build_subscription(sub_id, fmt, rt):
     if not own:
         return 404, {}, "no configs for this subscription\n"
     ups = UPSTREAMS.nodes()
-    for n in own:
-        n["name"] = location_label(n, rt)
+    label_configs(own, rt)
     title = rt.get("title") or NAME
     try:
         if fmt == "xray":
@@ -1967,7 +2012,7 @@ def deco_lines(app):
         for node in nodes:
             n += 1
             items.append({"n": n, "name": node["name"], "proto": node["proto"], "server": node["server"],
-                          "port": node["port"], "status": results.get(node_key(node))})
+                          "port": node["port"], "status": results.get(node_key(node)), "key": node_key(node)})
         title = urllib.parse.urlsplit(line).hostname if is_sub else (nodes[0]["name"] if nodes else line[:40])
         out.append({"line": line, "kind": "sub" if is_sub else "link", "title": title or line[:40], "nodes": items,
                     "error": "؛ ".join(e for e in errors), "quota": UPSTREAMS.info.get(line) if is_sub else None})
@@ -1987,6 +2032,7 @@ def inbound_security(ib):
 def admin_state(app, host):
     panel = app.panel.overview()  # may connect automatically and reload the settings
     cfg, rt = app.cfg, app.rt
+    opts = {node_key(n): o for _, n, o in deco_options(cfg, UPSTREAMS.nodes())}
     clients = read_clients(app.db_path)
     source = "db"
     if not clients and panel["ok"]:
@@ -2004,6 +2050,8 @@ def admin_state(app, host):
             "direct_first": cfg.get("direct_first", True), "iran_direct": cfg.get("iran_direct", True),
             "title": cfg.get("title", ""), "label_main": label(cfg, "label_main"),
             "main_location": cfg.get("main_location", ""),
+            "show_auto": cfg.get("show_auto", True), "show_main": cfg.get("show_main", True),
+            "show_deco_any": cfg.get("show_deco_any", True),
             "user_page": cfg.get("user_page", True), "support_url": cfg.get("support_url", ""),
             "announce": cfg.get("announce", ""),
             "label_deco": label(cfg, "label_deco"), "label_auto": label(cfg, "label_auto"),
@@ -2018,7 +2066,7 @@ def admin_state(app, host):
             "panel_token_set": bool(cfg.get("panel_token")), "panel_pass_set": bool(cfg.get("panel_pass")),
             "panel_rt": rt.get("panel_url", ""), "xui_rt": rt.get("xui_sub_url", ""),
         },
-        "decos": deco_lines(app),
+        "decos": [dict(d, nodes=[dict(x, opt=opts.get(x["key"])) for x in d["nodes"]]) for d in deco_lines(app)],
         "monitor": {"last_run": int(app.monitor.last_run * 1000), "note": app.monitor.note,
                     "xray": bool(find_xray())},
         "panel": {k: panel[k] for k in ("configured", "ok", "error", "version")},
@@ -2041,7 +2089,8 @@ def admin_state(app, host):
     }
 
 
-SETTING_BOOLS = ("direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page")
+SETTING_BOOLS = ("direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "show_main",
+                 "show_deco_any")
 SETTING_TEXTS = {"title": 60, "main_location": 40, "support_url": 300, "announce": 500, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("tg_token", "panel_token", "panel_pass")
@@ -2105,6 +2154,28 @@ def do_action(app, action, body, host):
             if ok and p["ok"]:
                 return done("%s؛ %d inbound پیدا شد" % (note, len(p["inbounds"])))
             return fail(p["error"] or note)
+
+        if action == "sub_layout":
+            cfg = load_config()
+            for k in ("show_auto", "show_main", "show_deco_any"):
+                if k in body:
+                    cfg[k] = bool(body[k])
+            for k in ("label_main", "label_deco", "label_auto"):
+                if k in body:
+                    cfg[k] = str(body[k] or "").strip()[:30] or DEFAULTS[k]
+            stored = dict(cfg.get("deco_opts") or {})
+            for d in body.get("decos") or []:
+                key = str(d.get("key", ""))
+                if not key:
+                    continue
+                stored[key] = {"chain": bool(d.get("chain", True)), "own": bool(d.get("own", False)),
+                               "chain_name": str(d.get("chain_name") or "").strip()[:40],
+                               "own_name": str(d.get("own_name") or "").strip()[:60]}
+            current = {node_key(n) for n in UPSTREAMS.nodes()}
+            cfg["deco_opts"] = {k: v for k, v in stored.items() if k in current}  # forget removed Decos
+            save_config(cfg)
+            app.reload()
+            return done("محتوای ساب ذخیره شد")
 
         if action == "password":
             if not check_password(str(body.get("old", "")), Auth.stored()):
@@ -2331,6 +2402,13 @@ textarea.in{min-height:120px;font:14px/1.6 ui-monospace,Menlo,Consolas,monospace
 .sw .t::after{content:"";position:absolute;top:3px;right:3px;width:20px;height:20px;border-radius:50%;background:var(--mut);transition:.2s}
 .sw input:checked+.t{background:var(--acc);border-color:var(--acc)}
 .sw input:checked+.t::after{right:21px;background:#fff}
+.tg{flex:none;cursor:pointer;margin-top:9px}.tg input{display:none}
+.tg .t{display:block;width:46px;height:28px;border-radius:99px;background:var(--card2);border:1px solid var(--line);position:relative;transition:.2s}
+.tg .t::after{content:"";position:absolute;top:3px;right:3px;width:20px;height:20px;border-radius:50%;background:var(--mut);transition:.2s}
+.tg input:checked+.t{background:var(--acc);border-color:var(--acc)}.tg input:checked+.t::after{right:21px;background:#fff}
+.lrow{display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px dashed var(--line)}.lrow:last-child{border:0}
+.lrow .b{flex:1;min-width:0}.lrow .in{padding:9px 11px}.lrow.off .b{opacity:.55}
+.lgroup{margin:14px 0 2px;font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px}.lgroup .tag{font-size:11.5px;padding:1px 7px;border-radius:7px;background:var(--card2);border:1px solid var(--line);direction:ltr}
 .chips{display:flex;gap:8px;overflow-x:auto;padding:4px 0 8px;scrollbar-width:none}.chips::-webkit-scrollbar{display:none}
 .chip{border:1px solid var(--line);background:var(--card);border-radius:99px;padding:6px 12px;white-space:nowrap;cursor:pointer;font-size:13px;color:var(--fg)}
 .chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
@@ -2739,7 +2817,7 @@ function locRenameSheet(){
 VIEWS.decos=()=>{
   const st=S.state,ds=st.decos,lab=st.settings.label_deco;
   return `<div class="card"><h2>${ic("link")} Decoها</h2><p class="mut small">کانفیگ‌های بقیه که کاربر از راه اون‌ها به سرورت می‌رسه. ترتیب = اولویت: اول ${esc(lab)}۱ امتحان می‌شه، اگه قطع بود بعدی. لینک ساب بذاری، حجم و انقضاش هم دیده می‌شه.</p>
-  <div class="row-btns"><button class="btn" data-act="deco-add">${ic("plus")} افزودن</button><button class="btn ghost" data-act="test">${ic("refresh")} تست</button><button class="btn ghost icon" data-act="deco-raw" title="ویرایش متنی" aria-label="ویرایش متنی">${ic("text")}</button></div>
+  <div class="row-btns"><button class="btn" data-act="deco-add">${ic("plus")} افزودن</button><button class="btn ghost" data-act="layout">${ic("text")} محتوای ساب</button><button class="btn ghost icon" data-act="test" title="تست" aria-label="تست">${ic("refresh")}</button><button class="btn ghost icon" data-act="deco-raw" title="ویرایش متنی" aria-label="ویرایش متنی">${ic("edit")}</button></div>
   <div class="hint">آخرین تست: ${ago(st.monitor.last_run)}${st.monitor.xray?"، تست واقعی با هسته‌ی Xray پنل":""}</div>${st.monitor.note?`<div class="hint">${ic("info")} ${esc(st.monitor.note)}</div>`:""}</div>
   ${ds.length?ds.map((d,i)=>{
     const q=d.quota;let qh="";
@@ -2751,7 +2829,8 @@ VIEWS.decos=()=>{
     ${d.nodes.map(n=>{const s=n.status;let sh;
       if(!s)sh=`<span class="st-mut small">تست‌نشده</span>`;else if(s.ok===null)sh=`<span class="st-mut small">UDP</span>`;
       else sh=s.ok?`<span class="st-ok small">${ic("check")} ${fa(s.ms)}ms</span>`:`<span class="st-bad small">${ic("x")} قطع</span>`;
-      return `<div class="node"><span class="tag">${esc(lab)}${n.n}</span><span class="nn">${esc(n.name)}</span>${sh}${s&&!s.ok&&s.error?`<div class="err" style="width:100%;margin:0">${esc(s.error)}</div>`:""}</div>`}).join("")}
+      const o=n.opt||{chain:true,own:false};
+      return `<div class="node"><span class="tag">${esc(lab)}${n.n}</span><span class="nn">${esc(n.name)}</span>${sh}<div class="hint" style="width:100%;margin:0">${o.chain?"سرور تو از این مسیر":"بدون سرور تو"}${o.own?"، خود کانفیگ هم توی ساب":""}</div>${s&&!s.ok&&s.error?`<div class="err" style="width:100%;margin:0">${esc(s.error)}</div>`:""}</div>`}).join("")}
     ${d.error?`<div class="err">${esc(d.error)}</div>`:""}${qh}</div>`}).join(""):`<div class="empty">${ic("link")}<p>هنوز Decoای نیست.<br>کانفیگ یا لینک ساب یکی دیگه رو اضافه کن.</p><button class="btn" data-act="deco-add">${ic("plus")} افزودن Deco</button></div>`}`;
 };
 const decoLines=()=>S.state.decos.map(d=>d.line);
@@ -2765,6 +2844,32 @@ function decoAddSheet(){
     f.onsubmit=async e=>{e.preventDefault();const add=f.t.value.split("\n").map(x=>x.trim()).filter(Boolean);if(!add.length)return;
       const lines=f.first.checked?[...add,...decoLines()]:[...decoLines(),...add];
       const j=await saveDecos(lines,$("button",f));if(j.ok){closeSheet();api("test",{},true).then(()=>render()).catch(()=>{})}};
+  });
+}
+const lrow=(name,on,input,value,ph,title,hint)=>`<div class="lrow ${on?"":"off"}"><label class="tg"><input type="checkbox" ${name} ${on?"checked":""}><span class="t"></span></label>
+  <div class="b"><div style="font-weight:600;margin-bottom:4px">${title}</div><input class="in" ${input} value="${esc(value)}" placeholder="${esc(ph)}" autocomplete="off"><div class="hint">${hint}</div></div></div>`;
+function layoutSheet(){
+  const s=S.state.settings,ds=S.state.decos,lab=s.label_deco;
+  const nodes=ds.flatMap(d=>d.nodes);
+  sheet(`<h3>${ic("text")} محتوای ساب کاربرها</h3><p class="mut small">هر چیزی که کاربر توی اپش می‌بینه. خاموشش کنی توی ساب نمیاد. اسم هر کدوم رو هم می‌تونی عوض کنی.</p>
+  <form id="lof">
+  ${lrow('name="show_auto"',s.show_auto,'name="label_auto"',s.label_auto,"Auto","⚡ خودکار","بهترین مسیر سالم رو خودش انتخاب می‌کنه")}
+  ${lrow('name="show_main"',s.show_main,'name="label_main"',s.label_main,"Main","مستقیم به سرور خودت","تا آی‌پی سرورت فیلتر نیست، سریع‌ترین مسیره")}
+  ${nodes.length?lrow('name="show_deco_any"',s.show_deco_any,'name="label_deco"',s.label_deco,"Deco","سرور خودت از اولین واسط سالم","فقط در FlClash و Clash. شماره‌ی واسط‌ها هم با همین اسم ساخته می‌شه (Deco1، Deco2…)"):""}
+  ${nodes.map(n=>{const o=n.opt||{chain:true,own:false,chain_name:lab+n.n,own_name:n.name};return `<div class="lgroup"><span class="tag">${esc(lab)}${n.n}</span>${esc(n.name)}</div>
+   ${lrow(`data-key="${esc(n.key)}" data-k="chain"`,o.chain,`data-key="${esc(n.key)}" data-k="chain_name"`,o.chain_name,lab+n.n,"سرور خودت از راه این واسط","اگه آی‌پی سرورت فیلتر بشه، کاربر از این راه به سرورت می‌رسه")}
+   ${lrow(`data-key="${esc(n.key)}" data-k="own"`,o.own,`data-key="${esc(n.key)}" data-k="own_name"`,o.own_name,n.name,"خود این کانفیگ، همون‌طور که هست","بدون سرور تو؛ ترافیک کاربرها مستقیم از حجم این کانفیگ کم می‌شه")}`}).join("")}
+  <div class="hint">برای کاربرهایی که چند لوکیشن دارن، اول اسم لوکیشن میاد، مثلاً «🇩🇪 آلمان · Main».</div>
+  <button class="btn block" style="margin-top:12px">${ic("check")} ذخیره</button></form>`,el=>{
+    const f=$("#lof",el);
+    $$(".tg input",el).forEach(x=>x.onchange=()=>x.closest(".lrow").classList.toggle("off",!x.checked));
+    f.onsubmit=async e=>{e.preventDefault();
+      const g=n=>f.elements.namedItem(n);const body={};
+      ["show_auto","show_main","show_deco_any"].forEach(k=>{if(g(k))body[k]=g(k).checked});
+      ["label_auto","label_main","label_deco"].forEach(k=>{if(g(k))body[k]=g(k).value.trim()});
+      const decos={};$$("[data-key]",f).forEach(x=>{const k=x.dataset.key;decos[k]=decos[k]||{key:k};decos[k][x.dataset.k]=x.type==="checkbox"?x.checked:x.value.trim()});
+      body.decos=Object.values(decos);
+      const j=await act($("button.btn",f),"sub_layout",body);if(j.ok)closeSheet()};
   });
 }
 function decoRawSheet(){
@@ -2782,8 +2887,7 @@ VIEWS.settings=()=>{
   <form class="card" data-sec="conn"><h2>${ic("zap")} رفتار اتصال</h2>
    ${sw("direct_first",s.direct_first,"اول مستقیم به سرور خودم","تا آی‌پی سرور فیلتر نیست، کاربر مستقیم و سریع‌تر وصل می‌شه")}
    ${sw("iran_direct",s.iran_direct,"سایت‌های ‎.ir بدون تونل","سایت‌های ایرانی مستقیم باز می‌شن")}
-   <div class="mut small" style="margin-top:10px">اسم مسیرها در اپ کاربر</div>
-   <div class="cols">${field("label_main","مستقیم",s.label_main,'class="in ltr"')}${field("label_deco","واسط‌ها",s.label_deco,'class="in ltr"')}${field("label_auto","خودکار",s.label_auto,'class="in ltr"')}</div>
+   <div class="hint" style="margin-top:10px">${ic("info")} اینکه چه چیزهایی توی ساب کاربرها باشه و اسم هر کدوم: Decoها ← محتوای ساب</div>
    ${field("title","اسم پروفایل در اپ",s.title,'placeholder="EZ-XUI"')}
    <button class="btn block">${ic("check")} ذخیره</button></form>
 
@@ -2859,6 +2963,7 @@ const ACTS={
   "u-del":async b=>{const u=userBy(b.dataset.sub);if(await confirmSheet("حذف کاربر","<b class=\"ltr\">"+esc(u.name)+"</b> از پنل 3x-ui هم حذف می‌شه و قابل برگشت نیست.","حذف کن",true))act(null,"user_delete",{sub:u.sub})},
   "deco-add":()=>decoAddSheet(),
   "deco-raw":()=>decoRawSheet(),
+  layout:()=>layoutSheet(),
   "deco-move":b=>{const l=decoLines(),i=+b.dataset.i,j=i+(+b.dataset.d);[l[i],l[j]]=[l[j],l[i]];saveDecos(l,null)},
   "deco-del":async b=>{const i=+b.dataset.i,d=S.state.decos[i];if(await confirmSheet("حذف Deco","<span class=\"ltr\">"+esc(d.title)+"</span> از فهرست حذف بشه؟","حذف کن",true)){const l=decoLines();l.splice(i,1);saveDecos(l,null)}},
   "panel-test":b=>act(b,"panel_test",{}),

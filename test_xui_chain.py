@@ -192,6 +192,36 @@ class ProfileTests(unittest.TestCase):
         select = next(g for g in prof["proxy-groups"] if g["name"] == xc.G_MAIN)["proxies"]
         self.assertEqual(select, ["⚡ Auto", "اصلی", "D", "D1", "D2", "D3", "D4", "D5"])
 
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_subscription_layout(self):
+        own, ups = self.own[:1], self.ups[:2]   # friend-a (vmess), friend-b (trojan)
+        ka, kb = xc.node_key(ups[0]), xc.node_key(ups[1])
+        cfg = dict(self.cfg, show_main=False, label_auto="Best",
+                   deco_opts={ka: {"chain": False, "own": True, "own_name": "Friend A"},
+                              kb: {"chain": True, "own": True, "chain_name": "Via B"}})
+        confs = json.loads(xc.build_xray(own, ups, cfg, "t")[0])
+        self.assertEqual([c["remarks"] for c in confs], ["⚡ Best", "Via B", "Friend A", "friend-b"])
+        own_a = confs[2]["outbounds"][0]
+        self.assertEqual((own_a["protocol"], own_a["settings"]["vnext"][0]["address"]), ("vmess", "198.51.100.5"))
+        self.assertNotIn("sockopt", own_a["streamSettings"])
+        auto_tags = [o["tag"] for o in confs[0]["outbounds"]]
+        self.assertNotIn("up-1", auto_tags)  # A is not used to reach the server
+        self.assertIn("up-2", auto_tags)
+        prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])
+        groups = {g["name"]: g for g in prof["proxy-groups"]}
+        self.assertEqual(groups[xc.G_MAIN]["proxies"], ["⚡ Best", "Deco", "Via B", "Friend A", "friend-b"])
+        self.assertEqual(groups[xc.G_UP]["proxies"], ["Deco2 · friend-b"])
+        self.assertEqual(groups["⚡ Best"]["proxies"], ["Main", "Deco"])  # hidden Main still backs Auto
+        friend_a = next(p for p in prof["proxies"] if p["name"] == "Friend A")
+        self.assertNotIn("dialer-proxy", friend_a)
+        # nothing chained and Auto hidden: only the chosen entries
+        cfg = dict(self.cfg, show_auto=False, show_deco_any=False,
+                   deco_opts={ka: {"chain": False, "own": True}, kb: {"chain": False}})
+        self.assertEqual([c["remarks"] for c in json.loads(xc.build_xray(own, ups, cfg, "t")[0])], ["Main", "friend-a"])
+        prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])
+        self.assertEqual(next(g for g in prof["proxy-groups"] if g["name"] == xc.G_MAIN)["proxies"], ["Main", "friend-a"])
+        self.assertNotIn(xc.G_UP, [g["name"] for g in prof["proxy-groups"]])
+
     def test_format_detection(self):
         self.assertEqual(xc.pick_format("", "FlClash/v0.8 clash-verge"), "clash")
         self.assertEqual(xc.pick_format("", "v2rayNG/1.9.30"), "xray")
@@ -337,6 +367,25 @@ class EndToEnd(unittest.TestCase):
             cfg["user_page"] = True
             xc.save_config(cfg)
             self.app.reload()
+
+    def test_sub_layout_action(self):
+        self.login()
+        st = self.admin("state")[1]["state"]
+        keys = [n["key"] for d in st["decos"] for n in d["nodes"]]
+        self.assertEqual([n["opt"]["chain_name"] for d in st["decos"] for n in d["nodes"]], ["Deco1", "Deco2"])
+        out = self.admin("sub_layout", {"show_main": False, "label_main": "  ", "decos": [
+            {"key": keys[0], "chain": False, "own": True, "own_name": " Mine "}, {"key": "gone|x|1|y", "own": True}]})[1]
+        self.assertTrue(out["ok"], out)
+        self.assertFalse(out["state"]["settings"]["show_main"])
+        self.assertEqual(out["state"]["settings"]["label_main"], "Main")
+        self.assertEqual(list(xc.load_config()["deco_opts"]), [keys[0]])  # unknown Decos are dropped
+        opt = out["state"]["decos"][0]["nodes"][0]["opt"]
+        self.assertEqual((opt["chain"], opt["own"], opt["own_name"]), (False, True, "Mine"))
+        status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
+        names = [c["remarks"] for c in json.loads(body)]
+        self.assertIn("Mine", names)
+        self.assertNotIn("user1-reality · Main", names)
+        self.admin("sub_layout", {"show_main": True, "decos": [{"key": keys[0], "chain": True, "own": False}]})
 
     def test_admin_page_is_static_and_hardened(self):
         status, h, page = self.get("/adm1n/")
@@ -971,6 +1020,14 @@ class PanelTests(unittest.TestCase):
         app.panel.forget()
         self.assertIn("نسخه‌ی ۳", xc.do_action(app, "loc_attach", {"node": 1}, "h")[1]["error"])
         xc.save_config(dict(xc.load_config(), locations={}))
+
+    def test_same_location_names_stay_distinct(self):
+        rt = dict(xc.DEFAULTS, main_location="🇫🇮 فنلاند", locations={"de.example.com": "DE"})
+        own = xc.parse_nodes(OWN[:2] + [OWN[0].replace("#user1-reality", "#user1-reality|📊2GB")])
+        self.assertEqual([n["name"] for n in xc.label_configs(own, rt)],
+                         ["🇫🇮 فنلاند user1-reality", "🇫🇮 فنلاند user1-ws", "🇫🇮 فنلاند user1-reality 2"])
+        one = xc.label_configs(xc.parse_nodes(OWN[:1]), rt)
+        self.assertEqual(one[0]["name"], "🇫🇮 فنلاند")
 
     def test_location_labels(self):
         rt = dict(xc.DEFAULTS)
