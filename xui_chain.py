@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -64,6 +64,9 @@ DEFAULTS = {
     "test_interval": 120,
     "title": "",
     "main_location": "",       # display name of this server, e.g. "🇫🇮 فنلاند"
+    "user_page": True,         # subscription link opened in a browser shows the user's account page
+    "support_url": "",         # support / renewal link on the user page (e.g. https://t.me/...)
+    "announce": "",            # message shown on every user page
     "locations": {},           # node address -> display name, refreshed from the panel
     "label_main": "Main",       # names of the routes in the apps
     "label_deco": "Deco",       # Deco1, Deco2, ... (the upstreams)
@@ -2001,6 +2004,8 @@ def admin_state(app, host):
             "direct_first": cfg.get("direct_first", True), "iran_direct": cfg.get("iran_direct", True),
             "title": cfg.get("title", ""), "label_main": label(cfg, "label_main"),
             "main_location": cfg.get("main_location", ""),
+            "user_page": cfg.get("user_page", True), "support_url": cfg.get("support_url", ""),
+            "announce": cfg.get("announce", ""),
             "label_deco": label(cfg, "label_deco"), "label_auto": label(cfg, "label_auto"),
             "xui_sub_url": cfg.get("xui_sub_url", "auto"), "public_host": cfg.get("public_host", ""),
             "monitor_minutes": int(cfg.get("monitor_minutes") or 10), "test_sub_id": cfg.get("test_sub_id", ""),
@@ -2036,8 +2041,8 @@ def admin_state(app, host):
     }
 
 
-SETTING_BOOLS = ("direct_first", "iran_direct", "tg_enable", "panel_auto")
-SETTING_TEXTS = {"title": 60, "main_location": 40, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
+SETTING_BOOLS = ("direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page")
+SETTING_TEXTS = {"title": 60, "main_location": 40, "support_url": 300, "announce": 500, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("tg_token", "panel_token", "panel_pass")
 
@@ -2612,7 +2617,7 @@ function shareSheet(u){
   sheet(`<h3>${ic("share")} لینک <span class="ltr">${esc(u.name)}</span></h3>
   <div class="mut small">این لینک رو در اپ کاربر به‌عنوان Subscription اضافه کن. FlClash و Clash Meta و v2rayNG و Streisand و V2Box و Happ خودکار تشخیص داده می‌شن.</div>
   <div class="linkbox">${esc(link)}</div>
-  <div class="row-btns"><button class="btn" data-act="copy" data-text="${esc(link)}">${ic("copy")} کپی</button>${navigator.share?`<button class="btn ghost" data-act="nshare" data-text="${esc(link)}">${ic("share")} اشتراک</button>`:""}</div>
+  <div class="row-btns"><button class="btn" data-act="copy" data-text="${esc(link)}">${ic("copy")} کپی</button><a class="btn ghost" href="${esc(link)}?page=1" target="_blank" rel="noopener">${ic("users")} صفحه</a>${navigator.share?`<button class="btn ghost" data-act="nshare" data-text="${esc(link)}">${ic("share")} اشتراک</button>`:""}</div>
   <div class="qr" id="qrbox"></div>`,el=>{
     const box=$("#qrbox",el);
     const draw=()=>{if(window.QRCode){new QRCode(box,{text:link,width:220,height:220,correctLevel:QRCode.CorrectLevel.M})}else box.innerHTML=`<div class="mut small" style="color:#555">QR بارگذاری نشد</div>`};
@@ -2797,6 +2802,13 @@ VIEWS.settings=()=>{
    <div class="row-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="panel-test">${ic("refresh")} تست</button>${s.panel_token_set||s.panel_pass_set?`<button type="button" class="btn ghost icon" data-act="clear" data-keys="panel_token,panel_pass" title="پاک کردن" aria-label="پاک کردن">${ic("trash")}</button>`:""}</div>
    </details></form>
 
+  <form class="card" data-sec="page"><h2>${ic("users")} صفحه‌ی کاربر</h2>
+   <p class="mut small">وقتی کاربر لینک ساب رو توی مرورگر باز کنه، یه صفحه با حجم، روزهای مانده، نمودار مصرف روزانه، لوکیشن‌ها و دکمه‌ی افزودن به اپ می‌بینه. اپ‌ها مثل قبل کانفیگ می‌گیرن.</p>
+   ${sw("user_page",s.user_page,"صفحه‌ی کاربر روشن باشد")}
+   ${field("support_url","لینک پشتیبانی و تمدید",s.support_url,'class="in ltr" placeholder="https://t.me/your_id"',"دکمه‌ی «پشتیبانی و تمدید» توی صفحه‌ی کاربر")}
+   <label class="f"><span>پیام برای همه‌ی کاربرها</span><textarea class="in" name="announce" style="min-height:70px;direction:rtl;font-family:inherit" placeholder="مثلاً: سرورها امشب ساعت ۲ چند دقیقه قطع می‌شن.">${esc(s.announce)}</textarea></label>
+   <button class="btn block">${ic("check")} ذخیره</button></form>
+
   <form class="card" data-sec="tg"><h2>${ic("bell")} هشدار تلگرام</h2>
    <p class="mut small">قطع و وصل شدن Decoها، قطع شدن همه، و تموم شدن حجم یا زمان Deco. ${s.tg_source==="panel"?"الان از ربات خود پنل 3x-ui استفاده می‌شه.":""}</p>
    ${sw("tg_enable",s.tg_enable,"هشدار روشن باشد")}
@@ -2825,7 +2837,7 @@ document.addEventListener("submit",async e=>{
   if(!f.dataset.sec)return;
   e.preventDefault();
   const body={};
-  $$("input",f).forEach(x=>{if(!x.name)return;if(x.type==="checkbox")body[x.name]=x.checked;else if(x.type==="password"){if(x.value)body[x.name]=x.value}else body[x.name]=x.value});
+  $$("input,textarea",f).forEach(x=>{if(!x.name)return;if(x.type==="checkbox")body[x.name]=x.checked;else if(x.type==="password"){if(x.value)body[x.name]=x.value}else body[x.name]=x.value});
   await act($("button:not([type=button])",f),"settings",body);
 });
 
@@ -2882,6 +2894,7 @@ class App:
         self.monitor = Monitor(self)
         self.panel = PanelAPI(self)
         self.auth = Auth()
+        self.usage = UsageStore()
 
     def reload(self):
         self.cfg = load_config()
@@ -2899,6 +2912,362 @@ ADMIN_HEADERS = {
                                "font-src 'self' data: https://cdn.jsdelivr.net; img-src 'self' data:; "
                                "connect-src 'self'; frame-ancestors 'none'",
 }
+
+
+# ---------------------------------------------------------------- user page: usage history and account info
+
+TEHRAN = 12600  # UTC+03:30, Iran has no daylight saving time
+
+
+def tehran_day(ts):
+    return time.strftime("%Y-%m-%d", time.gmtime(ts + TEHRAN))
+
+
+class UsageStore:
+    """Daily traffic per subscription, from periodic samples of the panel's counters.
+    A counter that goes down (traffic reset) starts a new count instead of going negative."""
+
+    KEEP_DAYS = 90
+
+    def __init__(self, path=None):
+        self.path = path or conf_path("usage.db")
+        self.lock = threading.Lock()
+
+    def _con(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        con = sqlite3.connect(self.path, timeout=10)
+        con.execute("CREATE TABLE IF NOT EXISTS daily (sub TEXT, day TEXT, bytes INTEGER, PRIMARY KEY (sub, day))")
+        con.execute("CREATE TABLE IF NOT EXISTS last (sub TEXT PRIMARY KEY, used INTEGER, ts INTEGER)")
+        return con
+
+    def record(self, used_by_sub, now=None):
+        now = now or time.time()
+        day = tehran_day(now)
+        with self.lock:
+            con = self._con()
+            try:
+                last = dict(con.execute("SELECT sub, used FROM last").fetchall())
+                for sub, used in used_by_sub.items():
+                    if not sub:
+                        continue
+                    prev = last.get(sub)
+                    delta = 0 if prev is None else (used - prev if used >= prev else used)
+                    if delta:
+                        con.execute("INSERT INTO daily (sub, day, bytes) VALUES (?, ?, ?) ON CONFLICT (sub, day) "
+                                    "DO UPDATE SET bytes = bytes + excluded.bytes", (sub, day, delta))
+                    con.execute("INSERT OR REPLACE INTO last (sub, used, ts) VALUES (?, ?, ?)", (sub, used, int(now)))
+                con.execute("DELETE FROM daily WHERE day < ?", (tehran_day(now - self.KEEP_DAYS * 86400),))
+                con.commit()
+            finally:
+                con.close()
+
+    def history(self, sub, days=30, now=None):
+        """[(day, bytes)] for the last `days` days, oldest first, zero-filled; and whether sampling has started."""
+        now = now or time.time()
+        with self.lock:
+            con = self._con()
+            try:
+                rows = dict(con.execute("SELECT day, bytes FROM daily WHERE sub = ? AND day >= ?",
+                                        (sub, tehran_day(now - (days - 1) * 86400))).fetchall())
+                started = con.execute("SELECT ts FROM last WHERE sub = ?", (sub,)).fetchone()
+            finally:
+                con.close()
+        out = [(tehran_day(now - i * 86400), 0) for i in range(days - 1, -1, -1)]
+        return [(d, rows.get(d, 0)) for d, _ in out], (started[0] if started else 0)
+
+
+def usage_loop(app, every=600):
+    time.sleep(20)
+    while True:
+        try:
+            clients = read_clients(app.db_path) or clients_from_panel(app.panel.overview()["inbounds"])
+            used = {}
+            for c in clients:
+                if c["sub"]:
+                    used[c["sub"]] = used.get(c["sub"], 0) + c["used"]
+            app.usage.record(used)
+        except Exception as e:
+            print("usage sampler error: %s" % e, flush=True)
+        time.sleep(every)
+
+
+def wants_page(headers):
+    """A person in a browser rather than a VPN app fetching its configs."""
+    ua = headers.get("User-Agent", "")
+    if CLASH_UA.search(ua) or XRAY_UA.search(ua) or re.search(r"hiddify|sing-?box|nekobox|shadowrocket|quantumult|surge", ua, re.I):
+        return False
+    return "text/html" in (headers.get("Accept") or "") and "Mozilla" in ua
+
+
+def user_info(app, sub):
+    """Everything the user page shows. None when the subscription does not exist."""
+    rt = app.rt
+    try:
+        status, hdrs, body = http_get(rt["xui_sub_url"] + urllib.parse.quote(sub), connect=rt.get("xui_connect", ""))
+    except Exception:
+        return None
+    if status != 200:
+        return None
+    own = parse_nodes(split_lines(body))
+    if not own:
+        return None
+    info = parse_userinfo(hdrs.get("subscription-userinfo"))
+    clients = [c for c in read_clients(app.db_path) if c["sub"] == sub]
+    users = group_users(clients) if clients else []
+    u = users[0] if users else {}
+    expiry = u.get("expiry") if u else (info.get("expire", 0) * 1000)
+    panel = app.panel.overview() if app.panel.configured() else {"onlines": None}
+    onlines = panel.get("onlines")
+    online = None if onlines is None or not u else any(e in onlines for e in u["emails"])
+    locations = []
+    for n in own:
+        name = location_label(n, rt)
+        if name not in locations:
+            locations.append(name)
+    hist, started = app.usage.history(sub, 30)
+    cfg = app.cfg
+    return {
+        "name": u.get("name") or clean_remark(own[0]["name"]),
+        "title": cfg.get("title") or NAME,
+        "enable": u.get("enable", True),
+        "upload": info.get("upload", 0), "download": info.get("download", 0),
+        "used": info.get("upload", 0) + info.get("download", 0) if info else u.get("used", 0),
+        "total": info.get("total", 0) if info else u.get("total", 0),
+        "expiry": expiry or 0,
+        "devices": u.get("devices", 0),
+        "online": online,
+        "locations": locations,
+        "decos": len(UPSTREAMS.nodes()),
+        "history": [{"day": d, "bytes": b} for d, b in hist],
+        "history_since": int(started * 1000),
+        "support": cfg.get("support_url", ""),
+        "announce": cfg.get("announce", ""),
+        "now": int(time.time() * 1000),
+    }
+
+
+USER_HTML = r"""<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#0a0f1d">
+<title>اشتراک من</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css">
+<style>
+:root{--bg:#0a0f1d;--bg2:#0d1426;--card:#111a2e;--card2:#16213b;--line:#22304f;--fg:#e8edf7;--mut:#8b98b4;--acc:#5b8cff;--acc2:#8b5cff;--ok:#22c55e;--warn:#f5a524;--bad:#f43f5e;--okbg:rgba(34,197,94,.13);--warnbg:rgba(245,165,36,.14);--badbg:rgba(244,63,94,.13);--accbg:rgba(91,140,255,.14);--shadow:0 12px 32px rgba(0,0,0,.35);color-scheme:dark}
+:root[data-theme=light]{--bg:#f2f5fb;--bg2:#e9eef8;--card:#fff;--card2:#f5f7fc;--line:#e1e7f2;--fg:#131a2c;--mut:#62708c;--acc:#3a6df0;--acc2:#7044f0;--accbg:rgba(58,109,240,.1);--shadow:0 8px 24px rgba(20,35,70,.08);color-scheme:light}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--fg)}
+body{font:15px/1.65 Vazirmatn,Tahoma,system-ui,sans-serif;min-height:100vh;background:radial-gradient(1000px 480px at 90% -10%,rgba(91,140,255,.18),transparent 60%),radial-gradient(800px 400px at -10% 0%,rgba(139,92,255,.14),transparent 60%),var(--bg);background-attachment:fixed}
+button{font:inherit;color:inherit;touch-action:manipulation}
+a{color:inherit;text-decoration:none}
+.i{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.wrap{max-width:560px;margin:0 auto;padding:16px 16px calc(28px + env(safe-area-inset-bottom))}
+.top{display:flex;align-items:center;justify-content:space-between;margin:4px 2px 14px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800}
+.logo{width:36px;height:36px;border-radius:12px;display:grid;place-items:center;color:#fff;background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:0 6px 18px rgba(91,140,255,.35);font:800 14px/1 Vazirmatn,system-ui;direction:ltr}
+.ibtn{width:38px;height:38px;border-radius:12px;border:1px solid var(--line);background:var(--card);display:grid;place-items:center;cursor:pointer}
+.card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:16px;margin:12px 0;box-shadow:var(--shadow);animation:in .3s ease-out both}
+.card h2{font-size:15.5px;margin:0 0 10px;display:flex;align-items:center;gap:8px}.card h2 .i{color:var(--acc)}
+@keyframes in{from{opacity:0;transform:translateY(8px)}}
+.mut{color:var(--mut)}.small{font-size:12.5px}.ltr{direction:ltr;unicode-bidi:plaintext}
+.hero{position:relative;overflow:hidden;background:linear-gradient(140deg,color-mix(in srgb,var(--acc) 20%,var(--card)),color-mix(in srgb,var(--acc2) 16%,var(--card)))}
+.hello{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.hello b{font-size:19px;display:block;line-height:1.3}
+.badge{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;padding:3px 11px;border-radius:99px;font-weight:700;white-space:nowrap}
+.b-on{background:var(--okbg);color:var(--ok)}.b-off{background:var(--card2);color:var(--mut)}.b-bad{background:var(--badbg);color:var(--bad)}.b-warn{background:var(--warnbg);color:var(--warn)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+.ringrow{display:flex;align-items:center;gap:18px;margin-top:14px}
+.ring{position:relative;width:132px;height:132px;flex:none}
+.ring svg{width:100%;height:100%;transform:rotate(-90deg)}
+.ring .c{position:absolute;inset:0;display:grid;place-items:center;text-align:center}
+.ring .c b{font-size:22px;display:block;line-height:1.2}.ring .c span{font-size:12px;color:var(--mut)}
+.ring circle{fill:none;stroke-width:11}
+.ring .track{stroke:color-mix(in srgb,var(--line) 80%,transparent)}
+.ring .val{stroke:url(#g);stroke-linecap:round;transition:stroke-dashoffset 1s ease}
+.side{flex:1;min-width:0}
+.side .big{font-size:30px;font-weight:800;line-height:1.1}
+.side .lbl{color:var(--mut);font-size:13px}
+.side .row{margin-bottom:10px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:12px 14px;animation:in .3s ease-out both}
+.tile .k{color:var(--mut);font-size:12.5px;display:flex;gap:6px;align-items:center}.tile .k .i{width:16px;height:16px}
+.tile .v{font-size:20px;font-weight:800;margin-top:2px}.tile .v small{font-size:12px;color:var(--mut);font-weight:500}
+.seg{display:inline-flex;background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:3px;gap:3px}
+.seg button{border:0;background:none;padding:5px 12px;border-radius:9px;cursor:pointer;font-size:13px;color:var(--mut)}
+.seg button.on{background:var(--acc);color:#fff}
+.chart{position:relative;margin-top:12px;height:170px;display:flex;align-items:flex-end;gap:3px;direction:ltr;padding-bottom:20px}
+.chart .b{flex:1;position:relative;height:100%;display:flex;align-items:flex-end;cursor:pointer}
+.chart .b i{display:block;width:100%;border-radius:6px 6px 3px 3px;background:linear-gradient(180deg,var(--acc),var(--acc2));min-height:2px;transition:height .6s ease,opacity .2s;opacity:.85}
+.chart .b.zero i{background:var(--line);opacity:.6}
+.chart .b.sel i,.chart .b:hover i{opacity:1;box-shadow:0 0 0 2px var(--accbg)}
+.chart .b span{position:absolute;bottom:-20px;left:50%;transform:translateX(-50%);font-size:10.5px;color:var(--mut);white-space:nowrap}
+.tip{display:flex;justify-content:space-between;gap:8px;margin-top:10px;font-size:13px;color:var(--mut);min-height:22px}
+.tip b{color:var(--fg)}
+.empty{padding:28px 8px;text-align:center;color:var(--mut);font-size:13.5px}
+.tabs{display:flex;gap:6px;margin-bottom:10px}
+.tabs button{flex:1;border:1px solid var(--line);background:var(--card2);border-radius:12px;padding:8px 6px;cursor:pointer;font-size:13.5px;display:flex;gap:6px;justify-content:center;align-items:center}
+.tabs button.on{border-color:var(--acc);color:var(--acc);background:var(--accbg)}
+.app{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px dashed var(--line)}.app:last-child{border:0}
+.app .n{flex:1;min-width:0}.app .n b{display:block}.app .n small{color:var(--mut);font-size:12px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:0;border-radius:13px;padding:10px 15px;cursor:pointer;font-weight:700;background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;box-shadow:0 8px 20px rgba(91,140,255,.25);white-space:nowrap}
+.btn:active{transform:scale(.98)}
+.btn.ghost{background:var(--card2);color:var(--fg);border:1px solid var(--line);box-shadow:none}
+.btn.sm{padding:7px 12px;font-size:13.5px;border-radius:11px}
+.btn.block{width:100%}
+.row-btns{display:flex;gap:8px;margin-top:12px}.row-btns .btn{flex:1}
+.linkbox{direction:ltr;text-align:left;background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:10px 12px;font:12.5px/1.5 ui-monospace,Menlo,monospace;word-break:break-all;margin:10px 0 0}
+.qr{background:#fff;border-radius:16px;padding:12px;width:max-content;margin:12px auto 0}
+.chips{display:flex;gap:8px;flex-wrap:wrap}.chip{padding:5px 12px;border-radius:99px;background:var(--card2);border:1px solid var(--line);font-size:13.5px}
+.note{display:flex;gap:10px;align-items:flex-start;font-size:13.5px}.note .i{color:var(--acc);margin-top:3px}
+details{border-top:1px dashed var(--line);padding:10px 0}details:first-of-type{border:0}
+summary{cursor:pointer;font-weight:700;list-style:none;display:flex;justify-content:space-between;align-items:center}summary::-webkit-details-marker{display:none}
+summary::after{content:"+";color:var(--mut);font-size:18px}details[open] summary::after{content:"−"}
+details p,details ol{margin:8px 0 0;color:var(--mut);font-size:13.5px}details ol{padding-inline-start:18px}
+.announce{background:linear-gradient(135deg,var(--warnbg),transparent);border-color:color-mix(in srgb,var(--warn) 40%,var(--line))}
+.foot{text-align:center;color:var(--mut);font-size:12px;margin-top:18px}
+.skel{height:120px;border-radius:20px;background:linear-gradient(90deg,var(--card),var(--card2),var(--card));background-size:200% 100%;animation:sk 1.2s infinite;margin:12px 0}
+@keyframes sk{to{background-position:-200% 0}}
+#toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom));transform:translateX(-50%) translateY(20px);opacity:0;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 16px;box-shadow:var(--shadow);transition:.25s;pointer-events:none;z-index:9}
+#toast.show{opacity:1;transform:translateX(-50%)}
+</style>
+</head>
+<body>
+<div class="wrap" id="app"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>
+<div id="toast"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
+<script>
+"use strict";
+const I={user:"M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z",down:"M12 5v14M19 12l-7 7-7-7",up:"M12 19V5M5 12l7-7 7 7",
+chart:"M3 3v18h18M7 15v3M12 10v8M17 6v12",link:"M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71",
+copy:"M9 9h11v11H9zM5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1",qr:"M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h3v3h-3zM20 14v.01M14 20h.01M17 20h4v-3",
+globe:"M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20",shield:"M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z",
+help:"M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01",chat:"M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z",
+refresh:"M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5",phone:"M7 2h10a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zM12 18h.01",
+monitor:"M3 4h18v12H3zM8 20h8M12 16v4",bell:"M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0",
+moon:"M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z",sun:"M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10zM12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4",
+plus:"M12 5v14M5 12h14",dl:"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3",clock:"M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2"};
+const ic=n=>`<svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="${I[n]}"/></svg>`;
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fa=n=>String(n).replace(/\d/g,d=>"۰۱۲۳۴۵۶۷۸۹"[d]);
+const GB=1024**3;
+const num=(v,d)=>fa((+v).toFixed(d).replace(/\.0+$/,"").replace(/(\.\d*?)0+$/,"$1"));
+const size=b=>b>=GB?num(b/GB,b/GB<10?2:1)+" GB":b>=1048576?num(b/1048576,0)+" MB":fa(Math.round(b/1024))+" KB";
+const jdate=(ms,o={year:"numeric",month:"long",day:"numeric"})=>{try{return new Intl.DateTimeFormat("fa-IR-u-ca-persian",o).format(new Date(ms))}catch(e){return new Date(ms).toLocaleDateString()}};
+const LINK=location.origin+location.pathname;
+let D=null,range=7,platform=/iphone|ipad|ipod/i.test(navigator.userAgent)?"ios":/android/i.test(navigator.userAgent)?"android":"desktop";
+let theme="auto";try{theme=localStorage.getItem("ez_theme")||"auto"}catch(e){}
+function applyTheme(){const dark=theme==="dark"||(theme==="auto"&&!matchMedia("(prefers-color-scheme: light)").matches);document.documentElement.dataset.theme=dark?"dark":"light";$('meta[name=theme-color]').content=dark?"#0a0f1d":"#f2f5fb";return dark}
+applyTheme();
+function toast(t){const e=$("#toast");e.textContent=t;e.classList.add("show");clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove("show"),2200)}
+function copy(t){const ok=()=>toast("کپی شد ✓");if(navigator.clipboard&&window.isSecureContext)navigator.clipboard.writeText(t).then(ok,legacy);else legacy();
+  function legacy(){const a=document.createElement("textarea");a.value=t;a.style.position="fixed";a.style.opacity="0";document.body.append(a);a.select();try{document.execCommand("copy");ok()}catch(e){toast("کپی نشد")}a.remove()}}
+
+const enc=encodeURIComponent;
+const APPS={
+ android:[["v2rayNG","ساده و محبوب",u=>`v2rayng://install-sub?url=${enc(u)}&name=${enc(D.title)}`,"https://github.com/2dust/v2rayNG/releases/latest"],
+          ["FlClash","اولویت‌بندی دقیق مسیرها",u=>`clash://install-config?url=${enc(u)}&name=${enc(D.title)}`,"https://github.com/chen08209/FlClash/releases/latest"]],
+ ios:[["Streisand","رایگان، از App Store",u=>`streisand://import/${u}#${enc(D.title)}`,"itms-apps://search.itunes.apple.com/WebObjects/MZSearch.woa/wa/search?media=software&term=Streisand"],
+      ["V2Box","رایگان، از App Store",u=>`v2box://install-sub?url=${enc(u)}&name=${enc(D.title)}`,"itms-apps://search.itunes.apple.com/WebObjects/MZSearch.woa/wa/search?media=software&term=V2Box"],
+      ["Happ","رایگان، از App Store",u=>`happ://add/${u}`,"itms-apps://search.itunes.apple.com/WebObjects/MZSearch.woa/wa/search?media=software&term=Happ%20Proxy"]],
+ desktop:[["Clash Verge Rev","ویندوز و مک",u=>`clash://install-config?url=${enc(u)}&name=${enc(D.title)}`,"https://github.com/clash-verge-rev/clash-verge-rev/releases/latest"],
+          ["FlClash","ویندوز، مک و لینوکس",u=>`clash://install-config?url=${enc(u)}&name=${enc(D.title)}`,"https://github.com/chen08209/FlClash/releases/latest"],
+          ["v2rayN","ویندوز",null,"https://github.com/2dust/v2rayN/releases/latest"]]
+};
+
+function status(){
+  if(!D.enable)return["b-off","غیرفعال"];
+  if(D.expiry>0&&D.expiry<D.now)return["b-bad","منقضی شده"];
+  if(D.total>0&&D.used>=D.total)return["b-bad","حجم تمام شده"];
+  if(D.expiry<0)return["b-warn","شروع با اولین اتصال"];
+  if((D.expiry>0&&D.expiry-D.now<3*864e5)||(D.total>0&&D.used/D.total>=.9))return["b-warn","رو به پایان"];
+  return["b-on","فعال"];
+}
+function daysLeft(){if(D.expiry===0)return null;if(D.expiry<0)return Math.round(-D.expiry/864e5);return Math.max(0,Math.ceil((D.expiry-D.now)/864e5))}
+
+function render(){
+  const st=status(),left=D.total?Math.max(0,D.total-D.used):0,pct=D.total?Math.min(100,D.used*100/D.total):0;
+  const R=58,C=2*Math.PI*R,dl=daysLeft(),dark=document.documentElement.dataset.theme==="dark";
+  $("#app").innerHTML=`
+  <div class="top"><div class="brand"><div class="logo">EZ</div><span>${esc(D.title)}</span></div>
+   <div style="display:flex;gap:6px"><button class="ibtn" id="rf" aria-label="به‌روزرسانی">${ic("refresh")}</button><button class="ibtn" id="th" aria-label="تم">${ic(dark?"sun":"moon")}</button></div></div>
+  <div class="card hero">
+   <div class="hello"><div><span class="mut small">سلام 👋</span><b class="ltr" style="text-align:right">${esc(D.name)}</b></div>
+    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px"><span class="badge ${st[0]}"><span class="dot"></span>${st[1]}</span>${D.online===null?"":`<span class="badge ${D.online?"b-on":"b-off"}">${D.online?"الان وصلی":"الان وصل نیستی"}</span>`}</div></div>
+   <div class="ringrow">
+    <div class="ring"><svg viewBox="0 0 132 132"><defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="var(--acc)"/><stop offset="1" stop-color="var(--acc2)"/></linearGradient></defs>
+     <circle class="track" cx="66" cy="66" r="${R}"/><circle class="val" cx="66" cy="66" r="${R}" stroke-dasharray="${C}" stroke-dashoffset="${C}" id="ringv"/></svg>
+     <div class="c"><div>${D.total?`<b>${size(left)}</b><span>باقی‌مانده</span>`:`<b>∞</b><span>حجم نامحدود</span>`}</div></div></div>
+    <div class="side">
+     <div class="row"><div class="big">${dl===null?"∞":fa(dl)}</div><div class="lbl">${dl===null?"بدون محدودیت زمان":D.expiry<0?"روز، از اولین اتصال":"روز مانده"}</div></div>
+     ${D.expiry>0?`<div class="row"><div class="lbl">تاریخ پایان</div><div><b>${jdate(D.expiry)}</b></div></div>`:""}
+     ${D.total?`<div class="lbl">${fa(Math.round(pct))}٪ از ${size(D.total)} مصرف شده</div>`:""}
+    </div></div></div>
+  ${D.announce?`<div class="card announce"><div class="note">${ic("bell")}<div>${esc(D.announce).replace(/\n/g,"<br>")}</div></div></div>`:""}
+  <div class="grid">
+   <div class="tile"><div class="k">${ic("chart")} مصرف شده</div><div class="v">${size(D.used)}</div></div>
+   <div class="tile"><div class="k">${ic("shield")} باقی‌مانده</div><div class="v">${D.total?size(left):"نامحدود"}</div></div>
+   <div class="tile"><div class="k">${ic("down")} دانلود</div><div class="v">${size(D.download)}</div></div>
+   <div class="tile"><div class="k">${ic("up")} آپلود</div><div class="v">${size(D.upload)}</div></div>
+  </div>
+  <div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><h2 style="margin:0">${ic("chart")} مصرف روزانه</h2>
+   <div class="seg"><button data-r="7" class="${range===7?"on":""}">۷ روز</button><button data-r="30" class="${range===30?"on":""}">۳۰ روز</button></div></div>
+   <div id="chart"></div></div>
+  <div class="card"><h2>${ic("plus")} اتصال</h2>
+   <div class="tabs">${[["android","phone","اندروید"],["ios","phone","آیفون"],["desktop","monitor","کامپیوتر"]].map(([k,i,l])=>`<button data-p="${k}" class="${platform===k?"on":""}">${ic(i)}${l}</button>`).join("")}</div>
+   <div id="apps"></div>
+   <div class="linkbox">${esc(LINK)}</div>
+   <div class="row-btns"><button class="btn" id="cp">${ic("copy")} کپی لینک</button><button class="btn ghost" id="qrb">${ic("qr")} QR کد</button></div>
+   <div id="qrbox"></div></div>
+  <div class="card"><h2>${ic("globe")} لوکیشن‌ها</h2>
+   <div class="chips">${D.locations.map(l=>`<span class="chip">${esc(l)}</span>`).join("")}</div>
+   ${D.decos?`<div class="note" style="margin-top:12px">${ic("shield")}<div class="mut">${fa(D.decos)} مسیر پشتیبان هم داری. اگه یه مسیر بسته بشه، با گزینه‌ی <b>⚡ Auto</b> اپ خودش می‌ره روی بعدی.</div></div>`:""}</div>
+  <div class="card"><h2>${ic("help")} راهنما</h2>
+   <details open><summary>چطور وصل شم؟</summary><ol><li>یکی از اپ‌های بالا رو نصب کن.</li><li>دکمه‌ی «افزودن» رو بزن؛ اگه باز نشد، لینک رو کپی کن و در اپ به‌عنوان Subscription اضافه کن.</li><li>گزینه‌ی <b>⚡ Auto</b> رو انتخاب کن و وصل شو.</li></ol></details>
+   <details><summary>وصل نمی‌شه؟</summary><ol><li>توی اپ، اشتراک رو آپدیت کن (Update subscription).</li><li>گزینه‌ی Auto یا یکی از Decoها رو امتحان کن.</li><li>اگه حجم یا زمانت تموم شده، برای تمدید پیام بده.</li></ol></details>
+   <details><summary>تمدید کنم چی می‌شه؟</summary><p>لینکت عوض نمی‌شه. بعد از تمدید فقط اشتراک رو توی اپ آپدیت کن.</p></details>
+   ${D.support?`<a class="btn block" style="margin-top:10px" href="${esc(D.support)}" target="_blank" rel="noopener">${ic("chat")} پشتیبانی و تمدید</a>`:""}</div>
+  <div class="foot">آخرین به‌روزرسانی: ${jdate(D.now,{hour:"2-digit",minute:"2-digit"})}</div>`;
+  requestAnimationFrame(()=>{const v=$("#ringv");if(v)v.style.strokeDashoffset=D.total?C*(1-Math.max(0,100-pct)/100):0});
+  renderApps();renderChart();
+  $("#rf").onclick=load;$("#th").onclick=()=>{theme=document.documentElement.dataset.theme==="dark"?"light":"dark";try{localStorage.setItem("ez_theme",theme)}catch(e){}applyTheme();render()};
+  $("#cp").onclick=()=>copy(LINK);
+  $("#qrb").onclick=()=>{const b=$("#qrbox");if(b.innerHTML){b.innerHTML="";return}b.innerHTML='<div class="qr" id="qr"></div>';
+    if(window.QRCode)new QRCode($("#qr"),{text:LINK,width:220,height:220,correctLevel:QRCode.CorrectLevel.M});else $("#qr").textContent="QR بارگذاری نشد"};
+  document.querySelectorAll("[data-r]").forEach(b=>b.onclick=()=>{range=+b.dataset.r;document.querySelectorAll("[data-r]").forEach(x=>x.classList.toggle("on",x===b));renderChart()});
+  document.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{platform=b.dataset.p;document.querySelectorAll("[data-p]").forEach(x=>x.classList.toggle("on",x===b));renderApps()});
+}
+function renderApps(){
+  $("#apps").innerHTML=APPS[platform].map(([n,d,deep,get])=>`<div class="app"><div class="n"><b>${n}</b><small>${d}</small></div>
+   <a class="btn ghost sm" href="${esc(get)}" target="_blank" rel="noopener" aria-label="دانلود ${n}">${ic("dl")}</a>
+   ${deep?`<a class="btn sm" href="${esc(deep(LINK))}">${ic("plus")} افزودن</a>`:`<button class="btn sm" data-copy>${ic("copy")} کپی</button>`}</div>`).join("");
+  document.querySelectorAll("[data-copy]").forEach(b=>b.onclick=()=>copy(LINK));
+}
+function renderChart(){
+  const h=D.history.slice(-range),max=Math.max(...h.map(x=>x.bytes),1),total=h.reduce((a,x)=>a+x.bytes,0);
+  const el=$("#chart");
+  if(!total){el.innerHTML=`<div class="empty">${ic("clock")}<div>${D.history_since&&D.now-D.history_since<2*864e5?"آمار مصرف روزانه از الان جمع می‌شه و از فردا اینجا نمایش داده می‌شه.":"توی این بازه مصرفی ثبت نشده."}</div></div>`;return}
+  const step=range>7?5:1;
+  el.innerHTML=`<div class="chart">${h.map((x,i)=>{const d=new Date(x.day+"T12:00:00+03:30");return `<div class="b ${x.bytes?"":"zero"} ${i===h.length-1?"sel":""}" data-i="${i}"><i style="height:${Math.max(1.5,x.bytes*100/max)}%"></i>${(h.length-1-i)%step===0?`<span>${jdate(d,{day:"numeric"})}</span>`:""}</div>`}).join("")}</div>
+  <div class="tip" id="tip"></div>`;
+  const tip=i=>{const x=h[i];$("#tip").innerHTML=`<span>${jdate(new Date(x.day+"T12:00:00+03:30"),{weekday:"long",month:"long",day:"numeric"})}</span><b>${size(x.bytes)}</b>`};
+  tip(h.length-1);
+  el.querySelectorAll(".b").forEach(b=>b.onclick=()=>{el.querySelectorAll(".b").forEach(x=>x.classList.toggle("sel",x===b));tip(+b.dataset.i)});
+  el.insertAdjacentHTML("beforeend",`<div class="tip"><span>مجموع ${fa(range)} روز اخیر</span><b>${size(total)}</b></div><div class="tip" style="margin-top:2px"><span>میانگین روزانه</span><b>${size(total/range)}</b></div>`);
+}
+async function load(){
+  try{const r=await fetch(location.pathname+"?format=info",{cache:"no-store"});if(!r.ok)throw 0;D=await r.json();render()}
+  catch(e){$("#app").innerHTML=`<div class="card"><div class="empty">${ic("help")}<div>اطلاعات اشتراک خونده نشد. چند لحظه‌ی دیگه دوباره امتحان کن.</div><button class="btn sm" style="margin-top:12px" onclick="load()">${ic("refresh")} تلاش دوباره</button></div></div>`}
+}
+load();
+</script>
+</body>
+</html>
+"""
 
 
 def make_handler(app):
@@ -2955,6 +3324,11 @@ def make_handler(app):
             u, parts = self.route()
             if len(parts) == 2 and parts[0] == app.cfg["sub_path"]:
                 q = urllib.parse.parse_qs(u.query)
+                if _q(q, "format") == "info":
+                    info = user_info(app, parts[1])
+                    return self.json(200, info) if info else self.json(404, {"error": "not found"})
+                if app.cfg.get("user_page", True) and not _q(q, "format") and (_q(q, "page") or wants_page(self.headers)):
+                    return self.send(200, USER_HTML, ADMIN_HEADERS)
                 fmt = pick_format(_q(q, "format"), self.headers.get("User-Agent", ""))
                 status, hdrs, body = build_subscription(parts[1], fmt, app.rt)
                 return self.send(status, body, hdrs or None)
@@ -3068,6 +3442,7 @@ def serve(app):
     print("xui-chain %s listening on %s://%s:%s" % (VERSION, scheme, rt["listen"], rt["port"]), flush=True)
     print("panel subscription: %s" % rt["xui_sub_url"], flush=True)
     threading.Thread(target=app.monitor.loop, daemon=True).start()
+    threading.Thread(target=usage_loop, args=(app,), daemon=True).start()
     threading.Thread(target=app.panel.overview, daemon=True).start()  # automatic panel connection
     httpd.serve_forever()
 

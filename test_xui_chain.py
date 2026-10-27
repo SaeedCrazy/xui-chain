@@ -303,6 +303,41 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(out["ok"], out)
         return out
 
+    def test_user_page(self):
+        browser = {"User-Agent": "Mozilla/5.0 (Linux; Android 14) Chrome/130", "Accept": "text/html,application/xhtml+xml"}
+        req = urllib.request.Request(self.base + "/chain/abc", headers=browser)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            page = r.read().decode()
+            self.assertIn("text/html", r.headers["Content-Type"])
+        self.assertIn("<title>اشتراک من</title>", page)
+        self.assertIn("?format=info", page)
+        # apps keep getting their configs, even ones that look like browsers
+        status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9 Mozilla")
+        self.assertIn("dialerProxy", body)
+        self.assertIn("proxies:", self.get("/chain/abc", ua="clash.meta")[2])
+        self.assertIn("<title>اشتراک من</title>", self.get("/chain/abc?page=1", ua="x")[2])
+        self.app.usage.record({"abc": 0}, now=time.time() - 3600)
+        self.app.usage.record({"abc": 5 * 1024 ** 2})
+        status, h, body = self.get("/chain/abc?format=info")
+        self.assertEqual(status, 200)
+        info = json.loads(body)
+        self.assertEqual((info["name"], info["upload"], info["download"], info["used"], info["total"]), ("ali", 1, 2, 3, 3))
+        self.assertEqual(len(info["history"]), 30)
+        self.assertEqual(info["history"][-1]["bytes"], 5 * 1024 ** 2)
+        self.assertEqual(info["locations"], ["user1-reality", "user1-ws"])
+        self.assertEqual(info["decos"], 2)
+        self.assertEqual(self.get("/chain/nope?format=info")[0], 404)
+        cfg = xc.load_config()
+        cfg["user_page"] = False
+        xc.save_config(cfg)
+        self.app.reload()
+        try:
+            self.assertNotIn("<html", self.get("/chain/abc?page=1", ua="x")[2])
+        finally:
+            cfg["user_page"] = True
+            xc.save_config(cfg)
+            self.app.reload()
+
     def test_admin_page_is_static_and_hardened(self):
         status, h, page = self.get("/adm1n/")
         self.assertEqual(status, 200)
@@ -1045,6 +1080,32 @@ class ReadClientsTests(unittest.TestCase):
         xc.set_password("hello999")
         self.assertFalse(auth.valid(token))
         xc.set_password("secret1")
+
+
+class UsageTests(unittest.TestCase):
+    def test_daily_usage_with_reset(self):
+        store = xc.UsageStore(os.path.join(tempfile.mkdtemp(), "u.db"))
+        day = 86400
+        t0 = 1_700_000_000 - (1_700_000_000 + xc.TEHRAN) % day + 3600  # 01:00 Tehran time
+        store.record({"s": 100}, now=t0)                 # first sample: no history yet
+        store.record({"s": 300}, now=t0 + 3600)          # +200
+        store.record({"s": 50}, now=t0 + day)            # traffic was reset: +50
+        store.record({"s": 80, "": 9}, now=t0 + day + 60)  # +30, empty sub ignored
+        hist, since = store.history("s", 3, now=t0 + day + 120)
+        self.assertEqual([b for _, b in hist], [0, 200, 80])
+        self.assertEqual(since, int(t0 + day + 60))
+        self.assertEqual(hist[-1][0], xc.tehran_day(t0 + day))
+        self.assertEqual(store.history("other", 2, now=t0)[1], 0)
+        store.record({"s": 90}, now=t0 + 100 * day)      # old days are pruned
+        hist, _ = store.history("s", 120, now=t0 + 100 * day)
+        self.assertEqual(sum(b for _, b in hist), 10)
+
+    def test_wants_page(self):
+        chrome = {"User-Agent": "Mozilla/5.0 (iPhone) Safari/604.1", "Accept": "text/html,*/*"}
+        self.assertTrue(xc.wants_page(chrome))
+        for ua in ("v2rayNG/1.9", "FlClash/0.8 Mozilla", "Streisand Mozilla", "HiddifyNext/2 Mozilla", "clash-verge/v2"):
+            self.assertFalse(xc.wants_page({"User-Agent": ua, "Accept": "text/html"}), ua)
+        self.assertFalse(xc.wants_page({"User-Agent": "Mozilla/5.0", "Accept": "*/*"}))
 
 
 if __name__ == "__main__":
