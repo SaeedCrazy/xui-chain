@@ -10,6 +10,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 import urllib.request
@@ -25,6 +26,7 @@ try:
 except ImportError:
     yaml = None
 
+GB = 1024 ** 3
 PBK = "SbVKOEMjK0sIlbwg4akyBg5mL5KZwwB-ed4eEE7YnRc"
 OWN = [
     "vless://11111111-2222-3333-4444-555555555555@203.0.113.10:443?type=tcp&security=reality&pbk=%s"
@@ -207,6 +209,8 @@ class FakePanel(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path == "/friendsub":
             self.send_response(200)
+            self.send_header("Subscription-Userinfo", "upload=%d; download=%d; total=%d; expire=%d"
+                             % (2 * GB, 3 * GB, 50 * GB, int(time.time()) + 10 * 86400))
             self.end_headers()
             self.wfile.write(base64.b64encode("\n".join(UPS[:2]).encode()))
         else:
@@ -292,6 +296,9 @@ class EndToEnd(unittest.TestCase):
         self.assertFalse(self.app.cfg["direct_first"])
         nodes = xc.UPSTREAMS.nodes()
         self.assertEqual([n["name"] for n in nodes], ["friend-a", "friend-b", "friend-d"])
+        self.assertEqual(nodes[0]["src"], self.friend)
+        self.assertIn("45.0 از 50.0 GB مانده", page)
+        self.assertIn("⏳ 9 روز", page)
         status, h, body = self.get("/chain/abc", ua="clash.meta")
         self.assertEqual(status, 200)
         self.assertIn("filename*=UTF-8''%D9%85%D9%86.yaml", h["Content-Disposition"])
@@ -373,6 +380,154 @@ class PanelCertificate(unittest.TestCase):
         finally:
             idle.close()
             srv.shutdown()
+
+
+FAKE_XRAY = r"""#!/usr/bin/env python3
+# Stand-in for xray: checks the chained config, then answers SOCKS5 + HTTP like a working chain.
+import json, os, socket, sys, threading
+conf = json.load(open(sys.argv[3]))
+outs = {o["tag"]: o for o in conf["outbounds"]}
+if outs["proxy"]["streamSettings"].get("sockopt", {}).get("dialerProxy") != "up" or "up" not in outs:
+    print("Failed to start: bad chain"); sys.exit(1)
+dead = os.environ.get("FAKE_DEAD", "")
+server = outs["up"]["settings"].get("servers", outs["up"]["settings"].get("vnext", [{}]))[0].get("address")
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", conf["inbounds"][0]["port"])); srv.listen(8)
+def handle(c):
+    c.recv(3); c.sendall(b"\x05\x00"); c.recv(512)
+    c.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"); c.recv(1024)
+    if server not in dead.split(","):
+        c.sendall(b"HTTP/1.1 204 No Content\r\n\r\n")
+    c.close()
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+"""
+
+
+class Telegram(BaseHTTPRequestHandler):
+    sent = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+        Telegram.sent.append((self.path, urllib.parse.parse_qs(body)))
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
+
+
+class MonitorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        d = tempfile.mkdtemp()
+        cls.xray = os.path.join(d, "xray")
+        with open(cls.xray, "w") as f:
+            f.write(FAKE_XRAY)
+        os.chmod(cls.xray, 0o755)
+        cls.tg = start(ThreadingHTTPServer(("127.0.0.1", 0), Telegram))
+        xc.TG_API = "http://127.0.0.1:%d" % cls.tg.server_address[1]
+        cls.db = os.path.join(d, "x-ui.db")
+        con = sqlite3.connect(cls.db)
+        con.execute("CREATE TABLE settings (id INTEGER PRIMARY KEY, key TEXT, value TEXT)")
+        con.executemany("INSERT INTO settings (key, value) VALUES (?, ?)",
+                        [("tgBotToken", "111:panel"), ("tgBotChatId", "42, 43"), ("tgBotEnable", "true")])
+        con.commit()
+        con.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tg.shutdown()
+
+    def setUp(self):
+        os.environ["XRAY_BIN"] = self.xray
+        os.environ.pop("FAKE_DEAD", None)
+        Telegram.sent.clear()
+
+    def tearDown(self):
+        os.environ.pop("XRAY_BIN", None)
+        os.environ.pop("FAKE_DEAD", None)
+
+    def test_panel_bot_is_used(self):
+        rt = xc.resolve_runtime(dict(xc.DEFAULTS), self.db)
+        self.assertEqual((rt["tg_source"], rt["tg_token_rt"], rt["tg_chat_rt"]), ("panel", "111:panel", "42, 43"))
+        self.assertEqual(xc.tg_send(rt, "hi"), "")
+        self.assertEqual([(p, q["chat_id"][0]) for p, q in Telegram.sent],
+                         [("/bot111:panel/sendMessage", "42"), ("/bot111:panel/sendMessage", "43")])
+        own = xc.resolve_runtime(dict(xc.DEFAULTS, tg_token="222:own", tg_chat="7"), self.db)
+        self.assertEqual((own["tg_source"], own["tg_token_rt"], own["tg_chat_rt"]), ("own", "222:own", "7"))
+        self.assertIn("خاموش", xc.tg_send(dict(rt, tg_enable=False), "x"))
+        self.assertIn("تنظیم نشده", xc.tg_send({"tg_enable": True}, "x"))
+
+    def test_real_test_through_deco(self):
+        own, deco = xc.parse_link(OWN[0]), xc.parse_link(UPS[1])
+        self.assertTrue(xc.find_xray())
+        r = xc.real_test(own, deco, self.xray, "http://test.invalid/generate_204", timeout=5)
+        self.assertTrue(r["ok"], r)
+        self.assertIsInstance(r["ms"], int)
+        os.environ["FAKE_DEAD"] = deco["server"]
+        r = xc.real_test(own, deco, self.xray, "http://test.invalid/generate_204", timeout=5)
+        self.assertFalse(r["ok"])
+        r = xc.real_test(own, xc.parse_link(UPS[1].replace("trojan://", "vless://")), "/bin/false",
+                         "http://test.invalid/", timeout=5)
+        self.assertFalse(r["ok"])
+
+    def test_alerts(self):
+        app = type("A", (), {})()
+        app.db_path = self.db
+        app.rt = xc.resolve_runtime(dict(xc.DEFAULTS, test_url="http://test.invalid/generate_204", public_host="vpn.example"),
+                                    self.db)
+        mon = xc.Monitor(app)
+        mon._own = (time.time(), xc.parse_link(OWN[0]))
+        xc.save_upstreams_text("\n".join(UPS[1:3]))
+        xc.UPSTREAMS.info.clear()
+        items = mon.run_once()
+        self.assertEqual([it["result"]["ok"] for it in items], [True, True])
+        self.assertEqual([it["result"]["mode"] for it in items], ["real", "real"])
+        self.assertEqual(Telegram.sent, [])
+        os.environ["FAKE_DEAD"] = "198.51.100.6,198.51.100.7"
+        mon.run_once()
+        self.assertEqual(Telegram.sent, [])  # one failure is not enough
+        mon.run_once()
+        text = Telegram.sent[0][1]["text"][0]
+        self.assertIn("vpn.example", text)
+        self.assertIn("🔴 Deco1 (friend-b) قطع شد", text)
+        self.assertIn("🔴 Deco2 (friend-c) قطع شد", text)
+        self.assertIn("🚨", text)
+        mon.run_once()
+        self.assertEqual(len(Telegram.sent), 2)  # no repeats (two chats)
+        os.environ.pop("FAKE_DEAD")
+        mon.run_once()
+        text = Telegram.sent[-1][1]["text"][0]
+        self.assertIn("🟢 Deco1 (friend-b) دوباره وصل شد", text)
+        self.assertNotIn("🚨", text)
+
+    def test_quota_alerts(self):
+        app = type("A", (), {})()
+        app.db_path = self.db
+        app.rt = xc.resolve_runtime(dict(xc.DEFAULTS), self.db)
+        mon = xc.Monitor(app)
+        src = "https://seller.example/sub/x"
+        node = dict(xc.parse_link(UPS[1]), src=src)
+        items = [{"index": 1, "label": "Deco1 (friend-b)", "node": node, "result": {"ok": None}}]
+        xc.UPSTREAMS.info[src] = {"upload": 0, "download": 46 * GB, "total": 50 * GB,
+                                  "expire": int(time.time()) + 86400}
+        msgs = mon.alerts(items, app.rt)
+        self.assertEqual(len(msgs), 2)
+        self.assertIn("4.0 GB از 50.0 GB مانده", msgs[0])
+        self.assertIn("تا 0 روز دیگه", msgs[1])
+        self.assertEqual(mon.alerts(items, app.rt), [])
+        xc.UPSTREAMS.info[src] = {"upload": 0, "download": 1 * GB, "total": 50 * GB, "expire": 0}
+        self.assertEqual(mon.alerts(items, app.rt), [])
+        xc.UPSTREAMS.info[src]["download"] = 49.5 * GB
+        self.assertEqual(len(mon.alerts(items, app.rt)), 1)
+        del xc.UPSTREAMS.info[src]
+
+    def test_userinfo(self):
+        self.assertEqual(xc.parse_userinfo("upload=1; download=2;total=3; expire=0; x=y"),
+                         {"upload": 1, "download": 2, "total": 3, "expire": 0})
 
 
 if __name__ == "__main__":

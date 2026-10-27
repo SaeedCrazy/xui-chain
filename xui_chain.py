@@ -14,6 +14,7 @@ Standard library only. Python 3.8+.
 """
 
 import base64
+import glob
 import hmac
 import html
 import http.client
@@ -21,17 +22,20 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import sqlite3
 import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
 LOOPBACK = {"127.0.0.1", "0.0.0.0", "localhost", "::1", "::"}
@@ -55,6 +59,11 @@ DEFAULTS = {
     "label_main": "Main",       # names of the routes in the apps
     "label_deco": "Deco",       # Deco1, Deco2, ... (the upstreams)
     "label_auto": "Auto",
+    "monitor_minutes": 10,      # how often the Decos are tested
+    "tg_enable": True,          # Telegram alerts
+    "tg_token": "",             # empty = the 3x-ui panel's own Telegram bot
+    "tg_chat": "",              # empty = the panel bot's admin chat ids
+    "test_sub_id": "",          # user whose config is used for the real test; empty = first enabled user
 }
 
 
@@ -104,11 +113,11 @@ def save_upstreams_text(text):
 
 
 def xui_settings(db_path=XUI_DB):
-    """Subscription and web (panel) settings of the 3x-ui panel (read-only), or {}."""
+    """Subscription, web (panel) and Telegram bot settings of the 3x-ui panel (read-only), or {}."""
     try:
         con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=5)
         try:
-            rows = con.execute("SELECT key, value FROM settings WHERE key LIKE 'sub%' OR key LIKE 'web%'").fetchall()
+            rows = con.execute("SELECT key, value FROM settings WHERE key LIKE 'sub%' OR key LIKE 'web%' OR key LIKE 'tg%'").fetchall()
         finally:
             con.close()
         return {k: v for k, v in rows}
@@ -150,6 +159,10 @@ def resolve_runtime(cfg, db_path=XUI_DB):
             rt["public_host"] = cert_domain(rt["cert_file"])
         else:
             rt["public_host"] = s.get("subDomain") or s.get("webDomain") or ""
+    # Telegram: our own bot settings, else the panel's bot
+    rt["tg_source"] = "own" if rt.get("tg_token") else ("panel" if s.get("tgBotToken") else "")
+    rt["tg_token_rt"] = rt.get("tg_token") or s.get("tgBotToken", "")
+    rt["tg_chat_rt"] = rt.get("tg_chat") or s.get("tgBotChatId", "")
     return rt
 
 
@@ -759,12 +772,27 @@ def parse_nodes(links, errors=None, skip_loopback=True):
     return nodes
 
 
+def parse_userinfo(header):
+    """"upload=1; download=2; total=3; expire=4" -> dict of ints."""
+    info = {}
+    for part in (header or "").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            try:
+                info[k.strip().lower()] = int(float(v.strip()))
+            except ValueError:
+                pass
+    return info
+
+
 class Upstreams:
-    """Upstream list from upstreams.txt; subscription URLs are fetched and cached."""
+    """Upstream list from upstreams.txt; subscription URLs are fetched and cached
+    together with their usage header (volume and expiry of the Deco)."""
 
     def __init__(self, ttl=600):
         self.ttl = ttl
         self.cache = {}
+        self.info = {}
         self.lock = threading.Lock()
 
     def _fetch_sub(self, url):
@@ -773,7 +801,7 @@ class Upstreams:
         if hit and time.time() - hit[0] < self.ttl:
             return hit[1]
         try:
-            status, _, body = http_get(url, timeout=10, ua="v2rayNG/1.9.0")
+            status, hdrs, body = http_get(url, timeout=10, ua="v2rayNG/1.9.0")
             if status != 200:
                 raise ValueError("HTTP %d" % status)
             links = split_lines(body)
@@ -785,24 +813,31 @@ class Upstreams:
             raise
         with self.lock:
             self.cache[url] = (time.time(), links)
+            info = parse_userinfo(hdrs.get("subscription-userinfo"))
+            if info:
+                self.info[url] = info
         return links
 
-    def nodes(self, text=None, errors=None):
+    def lines(self, text=None):
         text = load_upstreams_text() if text is None else text
-        links = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+        return [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
+
+    def nodes(self, text=None, errors=None):
+        out = []
+        for line in self.lines(text):
             if line.lower().startswith(("http://", "https://")):
                 try:
-                    links.extend(self._fetch_sub(line))
+                    found = parse_nodes(self._fetch_sub(line), errors, skip_loopback=True)
                 except Exception as e:
                     if errors is not None:
                         errors.append("%s : %s" % (line[:60], e))
+                    continue
+                for n in found:
+                    n["src"] = line
+                out.extend(found)
             else:
-                links.append(line)
-        return parse_nodes(links, errors, skip_loopback=True)
+                out.extend(parse_nodes([line], errors, skip_loopback=True))
+        return out
 
 
 UPSTREAMS = Upstreams()
@@ -903,6 +938,283 @@ def tcp_check(server, port, timeout=3):
         return None
 
 
+# ---------------------------------------------------------------- Deco tests and alerts
+
+TG_API = os.environ.get("XUI_CHAIN_TG_API", "https://api.telegram.org")
+XRAY_PROTOCOLS = ("vless", "vmess", "trojan", "ss")
+
+
+def find_xray():
+    """The Xray binary that ships with 3x-ui, or ""."""
+    env = os.environ.get("XRAY_BIN")
+    if env:
+        return env if os.access(env, os.X_OK) else ""
+    for path in sorted(glob.glob("/usr/local/x-ui/bin/xray-linux-*")):
+        if os.access(path, os.X_OK):
+            return path
+    return shutil.which("xray") or ""
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _recv_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise OSError("connection closed")
+        data += chunk
+    return data
+
+
+def socks_http_status(port, url, timeout):
+    """GET url through the SOCKS5 proxy on 127.0.0.1:port -> HTTP status code."""
+    u = urllib.parse.urlsplit(url)
+    https = u.scheme == "https"
+    host, dport = u.hostname, u.port or (443 if https else 80)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        sock.sendall(b"\x05\x01\x00")
+        if _recv_exact(sock, 2) != b"\x05\x00":
+            raise OSError("socks handshake failed")
+        name = host.encode()
+        sock.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + dport.to_bytes(2, "big"))
+        head = _recv_exact(sock, 4)
+        if head[1] != 0:
+            raise OSError("socks connect failed (%d)" % head[1])
+        _recv_exact(sock, {1: 4, 4: 16}.get(head[3]) or _recv_exact(sock, 1)[0])
+        _recv_exact(sock, 2)
+        if https:
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        target = (u.path or "/") + ("?" + u.query if u.query else "")
+        sock.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: xui-chain\r\nConnection: close\r\n\r\n"
+                      % (target, host)).encode())
+        line = sock.recv(128).split(b"\r\n", 1)[0].split()
+        if len(line) < 2:
+            raise OSError("no answer")
+        return int(line[1])
+    finally:
+        sock.close()
+
+
+def real_test(own, deco, xray, url, timeout=15):
+    """Connect from this server through the Deco to our own config and fetch url,
+    using the panel's Xray. -> {"ok", "ms", "error"}"""
+    port = free_port()
+    chained = to_xray(own, "proxy")
+    chained["streamSettings"]["sockopt"] = {"dialerProxy": "up"}
+    conf = {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks", "settings": {"udp": False}}],
+        "outbounds": [chained, to_xray(deco, "up")],
+    }
+    fd, path = tempfile.mkstemp(prefix="xui-chain-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(conf, f)
+    proc = subprocess.Popen([xray, "run", "-c", path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        deadline = time.time() + 5
+        while True:
+            if proc.poll() is not None:
+                out = proc.stdout.read().decode("utf-8", "replace").strip().splitlines()
+                return {"ok": False, "ms": None, "error": "xray: " + (out[-1] if out else "exited")}
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                break
+            except OSError:
+                if time.time() > deadline:
+                    return {"ok": False, "ms": None, "error": "xray did not start"}
+                time.sleep(0.1)
+        t = time.time()
+        try:
+            status = socks_http_status(port, url, timeout)
+        except (OSError, ssl.SSLError, ValueError) as e:
+            return {"ok": False, "ms": None, "error": str(e) or e.__class__.__name__}
+        ms = int((time.time() - t) * 1000)
+        if status >= 400:
+            return {"ok": False, "ms": ms, "error": "HTTP %d" % status}
+        return {"ok": True, "ms": ms, "error": ""}
+    finally:
+        proc.kill()
+        proc.wait()
+        proc.stdout.close()
+        os.unlink(path)
+
+
+def tg_send(rt, text):
+    """Send text to the configured Telegram chats. -> "" or an error message."""
+    token = rt.get("tg_token_rt", "")
+    chats = [c for c in re.split(r"[,\s]+", rt.get("tg_chat_rt", "")) if c]
+    if not rt.get("tg_enable", True):
+        return "هشدار تلگرام خاموش است"
+    if not token or not chats:
+        return "توکن ربات یا Chat ID تنظیم نشده"
+    for chat in chats:
+        data = urllib.parse.urlencode({"chat_id": chat, "text": text, "disable_web_page_preview": "true"}).encode()
+        try:
+            urllib.request.urlopen(urllib.request.Request("%s/bot%s/sendMessage" % (TG_API, token), data=data),
+                                   timeout=10).read()
+        except urllib.error.HTTPError as e:
+            return "تلگرام: HTTP %d" % e.code
+        except (OSError, ValueError) as e:
+            return "تلگرام: %s" % getattr(e, "reason", e)
+    return ""
+
+
+def fmt_gb(b):
+    return "%.1f" % (b / 1024 ** 3)
+
+
+class Monitor:
+    """Tests every Deco on a schedule and sends Telegram alerts when one goes down,
+    comes back, or its volume / time runs low."""
+
+    LOW_RATIO, LOW_BYTES, EXPIRE_SOON = 0.1, 1024 ** 3, 2 * 86400
+
+    def __init__(self, app):
+        self.app = app
+        self.results = []
+        self.last_run = 0
+        self.note = ""
+        self.state = {}
+        self.flags = set()
+        self.all_down = False
+        self.run_lock = threading.Lock()
+        self._own = (0, None)
+
+    def own_node(self):
+        when, node = self._own
+        if node and time.time() - when < 3600:
+            return node
+        rt = self.app.rt
+        subs = [rt["test_sub_id"]] if rt.get("test_sub_id") else [
+            sub for _, sub, en in list_clients(self.app.db_path) if en]
+        for sub in subs[:20]:
+            try:
+                status, _, body = http_get(rt["xui_sub_url"] + urllib.parse.quote(sub), connect=rt.get("xui_connect", ""))
+            except Exception:
+                continue
+            if status != 200:
+                continue
+            for n in parse_nodes(split_lines(body)):
+                try:
+                    to_xray(n, "proxy")
+                except ValueError:
+                    continue
+                self._own = (time.time(), n)
+                return n
+        return None
+
+    def check(self, deco, own, xray, url):
+        if xray and own and deco["proto"] in XRAY_PROTOCOLS:
+            try:
+                r = real_test(own, deco, xray, url)
+            except (OSError, ValueError) as e:
+                r = {"ok": False, "ms": None, "error": str(e)}
+            r["mode"] = "real"
+        elif deco["proto"] == "hysteria2":
+            r = {"ok": None, "ms": None, "error": "", "mode": "udp"}
+        else:
+            ms = tcp_check(deco["server"], deco["port"])
+            r = {"ok": ms is not None, "ms": ms, "error": "" if ms is not None else "پورت بسته است", "mode": "tcp"}
+        r["at"] = time.time()
+        return r
+
+    def run_once(self):
+        with self.run_lock:
+            rt = self.app.rt
+            decos = UPSTREAMS.nodes(errors=[])
+            xray = find_xray()
+            own = self.own_node() if xray else None
+            if not xray:
+                self.note = "هسته‌ی Xray پنل پیدا نشد؛ فقط باز بودن پورت Deco چک می‌شود."
+            elif not own:
+                self.note = "کانفیگی از یوزرهای پنل برای تست پیدا نشد؛ فقط باز بودن پورت چک می‌شود."
+            else:
+                self.note = ""
+            url = rt.get("test_url") or DEFAULTS["test_url"]
+            results = [None] * len(decos)
+
+            def work(i):
+                results[i] = self.check(decos[i], own, xray, url)
+
+            threads = [threading.Thread(target=work, args=(i,), daemon=True) for i in range(len(decos))]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(40)
+            deco = label(rt, "label_deco")
+            items = []
+            for i, (n, r) in enumerate(zip(decos, results), 1):
+                r = r or {"ok": False, "ms": None, "error": "timeout", "mode": "real", "at": time.time()}
+                items.append({"index": i, "label": "%s%d (%s)" % (deco, i, n["name"]), "node": n, "result": r})
+            self.results = items
+            self.last_run = time.time()
+            msgs = self.alerts(items, rt)
+        if msgs:
+            err = tg_send(rt, "🔗 xui-chain · %s\n\n%s" % (rt.get("public_host") or "server", "\n\n".join(msgs)))
+            if err:
+                print("telegram: %s" % err, flush=True)
+        return items
+
+    def alerts(self, items, rt):
+        msgs = []
+        tested = [it for it in items if it["result"]["ok"] is not None]
+        for it in tested:
+            key = "%s|%s:%s|%s" % (it["node"]["proto"], it["node"]["server"], it["node"]["port"], it["node"]["name"])
+            st = self.state.setdefault(key, {"fails": 0, "down": False})
+            r = it["result"]
+            if r["ok"]:
+                if st["down"]:
+                    msgs.append("🟢 %s دوباره وصل شد (%sms)" % (it["label"], r["ms"]))
+                st["fails"], st["down"] = 0, False
+            else:
+                st["fails"] += 1
+                if st["fails"] >= 2 and not st["down"]:
+                    st["down"] = True
+                    msgs.append("🔴 %s قطع شد\n%s" % (it["label"], r["error"]))
+            it["down"] = st["down"]
+        down = bool(tested) and all(it["down"] for it in tested)
+        if down and not self.all_down:
+            msgs.append("🚨 همه‌ی Decoها قطع‌اند! اگه آی‌پی سرور فیلتر بشه کاربرها وصل نمی‌شن. یه Deco سالم اضافه کن.")
+        self.all_down = down
+
+        now = time.time()
+        for src, info in list(UPSTREAMS.info.items()):
+            labels = [it["label"] for it in items if it["node"].get("src") == src]
+            if not labels:
+                continue
+            name = "، ".join(labels)
+            total = info.get("total", 0)
+            left = total - info.get("upload", 0) - info.get("download", 0)
+            low = total > 0 and (left < total * self.LOW_RATIO or left < self.LOW_BYTES)
+            if low and ("low", src) not in self.flags:
+                msgs.append("🟡 حجم %s رو به تمومه: %s GB از %s GB مانده" % (name, fmt_gb(max(left, 0)), fmt_gb(total)))
+            self.flags.add(("low", src)) if low else self.flags.discard(("low", src))
+            exp = info.get("expire", 0)
+            soon = exp > 0 and exp - now < self.EXPIRE_SOON
+            if soon and ("exp", src) not in self.flags:
+                days = max(0, int((exp - now) // 86400))
+                msgs.append("⏳ اشتراک %s %s" % (name, "منقضی شده" if exp <= now else "تا %d روز دیگه تموم می‌شه" % days))
+            self.flags.add(("exp", src)) if soon else self.flags.discard(("exp", src))
+        return msgs
+
+    def loop(self):
+        time.sleep(15)
+        while True:
+            try:
+                self.run_once()
+            except Exception as e:
+                print("monitor error: %s" % e, flush=True)
+            nxt = time.time() + 60 * max(2, int(self.app.rt.get("monitor_minutes") or 10))
+            while time.time() < nxt:
+                time.sleep(5)
+
+
 # ---------------------------------------------------------------- admin page
 
 PAGE = """<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
@@ -928,7 +1240,17 @@ ol{padding-inline-start:20px;margin:6px 0}li{margin:4px 0;word-break:break-all}
 <div class="card"><h2>Deco‌ها (واسط‌ها، به ترتیب اولویت)</h2>
 <div class="mut">هر خط یک کانفیگ (vless, vmess, trojan, ss, hysteria2) یا لینک ساب. خط بالاتر = اولویت بالاتر. خط‌هایی که با # شروع شوند نادیده گرفته می‌شوند.</div>
 <textarea name="upstreams" spellcheck="false">%(upstreams)s</textarea>
+<div class="mut" style="margin-top:6px">برای دیدن حجم و تاریخ انقضای یک Deco، به‌جای کانفیگ تکی، لینک سابش را بگذار.</div>
 %(upstatus)s
+<div style="margin-top:10px"><button class="sec" formaction="test">🔄 ذخیره و تست الان</button></div>
+</div>
+<div class="card"><h2>هشدار تلگرام</h2>
+<div class="mut">وقتی یک Deco قطع یا وصل شد، همه قطع بودند، یا حجم یا زمانش رو به تمام بود پیام می‌دهد. Decoها هر چند دقیقه یک بار تست می‌شوند.</div>
+<label><input type="checkbox" name="tg_enable" %(tg_enable)s> هشدار روشن باشد</label>
+<div class="mut" style="margin-top:8px">توکن ربات (خالی = همان که هست؛ برای پاک کردن - بنویس)</div><input type="text" name="tg_token" value="" placeholder="%(tg_token_ph)s" autocomplete="off">
+<div class="mut" style="margin-top:8px">Chat ID (چندتا را با , جدا کن)</div><input type="text" name="tg_chat" value="%(tg_chat)s" placeholder="%(tg_chat_ph)s">
+<div class="mut" style="margin-top:8px">فاصله‌ی تست (دقیقه)</div><input type="text" name="monitor_minutes" value="%(monitor_minutes)s" inputmode="numeric">
+<div style="margin-top:10px"><button class="sec" formaction="tgtest">✉️ ذخیره و پیام آزمایشی</button></div>
 </div>
 <div class="card"><h2>تنظیمات</h2>
 <label><input type="checkbox" name="direct_first" %(direct_first)s> اول مستقیم به آی‌پی خودم (اگه فیلتر نبود)</label>
@@ -955,24 +1277,57 @@ document.getElementById('convout').innerHTML=id?'<b>'+base+encodeURIComponent(id
 </script></body></html>"""
 
 
-def render_admin(cfg, rt, host, msg="", db_path=XUI_DB):
+def ago(t):
+    m = int((time.time() - t) // 60)
+    return "همین الان" if m < 1 else ("%d دقیقه پیش" % m if m < 60 else "%d ساعت پیش" % (m // 60))
+
+
+def deco_status(monitor, cfg):
+    """HTML list of the Decos with their last test and remaining volume."""
     errors = []
-    nodes = UPSTREAMS.nodes(errors=errors)
+    decos = UPSTREAMS.nodes(errors=errors)
+    last = {it["index"]: it for it in monitor.results} if monitor else {}
     rows = []
-    for i, n in enumerate(nodes, 1):
-        ms = tcp_check(n["server"], n["port"]) if n["proto"] != "hysteria2" else None
-        state = ('<span class="ok">● %dms</span>' % ms) if ms is not None else (
-            '<span class="mut">UDP</span>' if n["proto"] == "hysteria2" else '<span class="bad">● بسته</span>')
-        rows.append("<li><b>%s%d</b> · %s · %s · %s:%s %s</li>" % (
+    for i, n in enumerate(decos, 1):
+        it = last.get(i)
+        r = it["result"] if it and it["node"]["server"] == n["server"] and it["node"]["port"] == n["port"] else None
+        if not r:
+            state = '<span class="mut">⏳ هنوز تست نشده</span>'
+        elif r["ok"] is None:
+            state = '<span class="mut">UDP، قابل تست نیست</span>'
+        else:
+            kind = "تست واقعی" if r["mode"] == "real" else "فقط پورت"
+            state = ('<span class="ok">✅ %sms</span>' % r["ms"]) if r["ok"] else (
+                '<span class="bad">❌ %s</span>' % html.escape(r["error"] or "قطع"))
+            state += ' <span class="mut">(%s · %s)</span>' % (kind, ago(r["at"]))
+        quota = ""
+        info = UPSTREAMS.info.get(n.get("src", ""))
+        if info:
+            total = info.get("total", 0)
+            left = total - info.get("upload", 0) - info.get("download", 0)
+            parts = ["📦 %s از %s GB مانده" % (fmt_gb(max(left, 0)), fmt_gb(total)) if total else
+                     "📦 %s GB مصرف شده" % fmt_gb(info.get("upload", 0) + info.get("download", 0))]
+            if info.get("expire"):
+                days = (info["expire"] - time.time()) / 86400
+                parts.append("⏳ %d روز" % days if days > 0 else '<span class="bad">منقضی شده</span>')
+            quota = '<br><span class="mut">%s</span>' % " · ".join(parts)
+        rows.append("<li><b>%s%d</b> · %s · %s · %s:%s<br>%s%s</li>" % (
             html.escape(label(cfg, "label_deco")), i, html.escape(n["proto"]), html.escape(n["name"]),
-            html.escape(n["server"]), n["port"], state))
+            html.escape(n["server"]), n["port"], state, quota))
     up = ""
     if rows:
-        up += '<div class="mut" style="margin-top:8px">از دید سرور خودت (پینگ TCP):</div><ol>%s</ol>' % "".join(rows)
+        up += '<ol style="margin-top:10px">%s</ol>' % "".join(rows)
+        if monitor and monitor.note:
+            up += '<div class="mut">ℹ️ %s</div>' % html.escape(monitor.note)
     else:
-        up += '<div class="bad" style="margin-top:8px">هنوز واسطی نیست؛ کاربرها فقط مستقیم وصل می‌شوند.</div>'
+        up += '<div class="bad" style="margin-top:8px">هنوز Decoای نیست؛ کاربرها فقط مستقیم وصل می‌شوند.</div>'
     for e in errors:
         up += '<div class="bad">⚠ %s</div>' % html.escape(e)
+    return up
+
+
+def render_admin(cfg, rt, host, msg="", db_path=XUI_DB, monitor=None):
+    up = deco_status(monitor, cfg)
 
     scheme = "https" if rt.get("cert_file") else "http"
     if rt.get("public_host"):
@@ -1004,6 +1359,12 @@ def render_admin(cfg, rt, host, msg="", db_path=XUI_DB):
         "xui_sub_url": html.escape(cfg.get("xui_sub_url", "auto")),
         "public_host": html.escape(cfg.get("public_host", "")),
         "users": users_html,
+        "tg_enable": "checked" if cfg.get("tg_enable", True) else "",
+        "tg_token_ph": html.escape("ذخیره شده ••••" + cfg["tg_token"][-4:] if cfg.get("tg_token") else (
+            "ربات پنل 3x-ui (خودکار)" if rt.get("tg_source") == "panel" else "123456:ABC…")),
+        "tg_chat": html.escape(cfg.get("tg_chat", "")),
+        "tg_chat_ph": html.escape(rt.get("tg_chat_rt") or "مثلاً 123456789"),
+        "monitor_minutes": int(cfg.get("monitor_minutes") or 10),
         "xui_rt": html.escape(rt["xui_sub_url"]),
         "base": json.dumps(base),
     }
@@ -1015,6 +1376,7 @@ class App:
     def __init__(self, db_path=XUI_DB):
         self.db_path = db_path
         self.reload()
+        self.monitor = Monitor(self)
 
     def reload(self):
         self.cfg = load_config()
@@ -1061,14 +1423,15 @@ def make_handler(app):
                     self.end_headers()
                     return
                 q = urllib.parse.parse_qs(u.query)
-                msg = "ذخیره شد ✓" if _q(q, "saved") else ""
-                page = render_admin(app.cfg, app.rt, self.headers.get("Host", "localhost"), msg, app.db_path)
+                msg = _q(q, "msg")[:300] or ("ذخیره شد ✓" if _q(q, "saved") else "")
+                page = render_admin(app.cfg, app.rt, self.headers.get("Host", "localhost"), msg, app.db_path,
+                                    app.monitor)
                 return self.send(200, page, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"})
             self.send(404, "404 page not found\n")
 
         def do_POST(self):
             u, parts = self.route()
-            if not (self.is_admin(parts) and len(parts) == 2 and parts[1] == "save"):
+            if not (self.is_admin(parts) and len(parts) == 2 and parts[1] in ("save", "test", "tgtest")):
                 return self.send(404, "404 page not found\n")
             length = min(int(self.headers.get("Content-Length") or 0), 1024 * 1024)
             form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
@@ -1081,11 +1444,30 @@ def make_handler(app):
                 cfg[key] = _q(form, key).strip()[:30] or DEFAULTS[key]
             cfg["xui_sub_url"] = _q(form, "xui_sub_url").strip() or "auto"
             cfg["public_host"] = _q(form, "public_host").strip()
+            cfg["tg_enable"] = "tg_enable" in form
+            token = _q(form, "tg_token").strip()
+            if token == "-":
+                cfg["tg_token"] = ""
+            elif token:
+                cfg["tg_token"] = token
+            cfg["tg_chat"] = _q(form, "tg_chat").strip()
+            try:
+                cfg["monitor_minutes"] = min(1440, max(2, int(_q(form, "monitor_minutes") or 10)))
+            except ValueError:
+                pass
             save_config(cfg)
             app.reload()
             UPSTREAMS.cache.clear()
+            msg = "ذخیره شد ✓"
+            if parts[1] == "test":
+                app.monitor.run_once()
+                msg = "ذخیره و تست شد ✓"
+            elif parts[1] == "tgtest":
+                err = tg_send(app.rt, "🔗 xui-chain · %s\n\n✅ پیام آزمایشی. هشدارهای Deco اینجا میاد."
+                              % (app.rt.get("public_host") or "server"))
+                msg = ("⚠ " + err) if err else "پیام آزمایشی فرستاده شد ✓"
             self.send_response(303)
-            self.send_header("Location", "/%s/?saved=1" % parts[0])
+            self.send_header("Location", "/%s/?msg=%s" % (parts[0], urllib.parse.quote(msg)))
             self.end_headers()
 
     return H
@@ -1144,6 +1526,7 @@ def serve(app):
         scheme = "https"
     print("xui-chain %s listening on %s://%s:%s" % (VERSION, scheme, rt["listen"], rt["port"]), flush=True)
     print("panel subscription: %s" % rt["xui_sub_url"], flush=True)
+    threading.Thread(target=app.monitor.loop, daemon=True).start()
     httpd.serve_forever()
 
 
