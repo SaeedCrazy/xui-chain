@@ -38,9 +38,10 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
+XUI_BIN = os.path.join(os.environ.get("XUI_MAIN_FOLDER", "/usr/local/x-ui"), "x-ui")
 LOOPBACK = {"127.0.0.1", "0.0.0.0", "localhost", "::1", "::"}
 
 DEFAULTS = {
@@ -70,6 +71,11 @@ DEFAULTS = {
     "tg_chat": "",              # empty = the panel bot's admin chat ids
     "test_sub_id": "",          # user whose config is used for the real test; empty = first enabled user
     "panel_url": "auto",        # 3x-ui panel address for creating users; auto = from the panel settings
+    "panel_auto": True,         # connect to the panel by itself from this server (no token or password typed)
+    "auto_token": "",           # credentials found by the automatic connection
+    "auto_user": "",
+    "auto_pass": "",
+    "auto_note": "",
     "panel_token": "",          # 3x-ui API token (Settings > Security), or:
     "panel_user": "",
     "panel_pass": "",
@@ -126,7 +132,7 @@ def xui_settings(db_path=XUI_DB):
     try:
         con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=5)
         try:
-            rows = con.execute("SELECT key, value FROM settings WHERE key LIKE 'sub%' OR key LIKE 'web%' OR key LIKE 'tg%'").fetchall()
+            rows = con.execute("SELECT key, value FROM settings WHERE key LIKE 'sub%' OR key LIKE 'web%' OR key LIKE 'tg%' OR key = 'twoFactorEnable'").fetchall()
         finally:
             con.close()
         return {k: v for k, v in rows}
@@ -178,6 +184,15 @@ def resolve_runtime(cfg, db_path=XUI_DB):
         listen = s.get("webListen", "")
         rt["panel_connect"] = listen if listen and listen not in LOOPBACK else (
             "127.0.0.1" if host not in LOOPBACK else "")
+    # typed-in credentials win; otherwise the ones the automatic connection found
+    if rt.get("panel_token") or (rt.get("panel_user") and rt.get("panel_pass")):
+        rt["panel_source"] = "manual"
+    elif rt.get("panel_auto", True) and (rt.get("auto_token") or rt.get("auto_pass")):
+        rt["panel_token"] = rt.get("auto_token", "")
+        rt["panel_user"], rt["panel_pass"] = rt.get("auto_user", ""), rt.get("auto_pass", "")
+        rt["panel_source"] = "auto"
+    else:
+        rt["panel_source"] = ""
     # Telegram: our own bot settings, else the panel's bot
     rt["tg_source"] = "own" if rt.get("tg_token") else ("panel" if s.get("tgBotToken") else "")
     rt["tg_token_rt"] = rt.get("tg_token") or s.get("tgBotToken", "")
@@ -1236,6 +1251,40 @@ class Monitor:
 
 # ---------------------------------------------------------------- 3x-ui API (creating users)
 
+def auto_panel_credentials(db_path=XUI_DB, xui_bin=None):
+    """Credentials for the panel API found on this server, without typing anything.
+    -> ({"auto_token"} | {"auto_user", "auto_pass"} | None, note)
+
+    1. Newer panels: the panel's own command line issues a dedicated API token named
+       "xui-chain" (it shows up under Settings > API Tokens; asking again replaces it).
+    2. Older panels without API tokens kept the admin password in plain text."""
+    xui_bin = xui_bin or XUI_BIN
+    if os.access(xui_bin, os.X_OK):
+        try:
+            out = subprocess.run([xui_bin, "setting", "-getApiToken", "-tokenName", "xui-chain", "-tokenScope", "admin"],
+                                 cwd=os.path.dirname(xui_bin), capture_output=True, text=True, timeout=60)
+            m = re.search(r"apiToken:\s*(\S+)", out.stdout)
+            if m:
+                return {"auto_token": m.group(1)}, "توکن اختصاصی xui-chain در پنل ساخته شد"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=5)
+        try:
+            row = con.execute("SELECT username, password FROM users ORDER BY id LIMIT 1").fetchone()
+        finally:
+            con.close()
+    except Exception:
+        row = None
+    if row and row[1] and not str(row[1]).startswith("$2"):
+        if xui_settings(db_path).get("twoFactorEnable") == "true":
+            return None, "ورود دومرحله‌ای پنل روشن است؛ توکن API را دستی بگذار"
+        return {"auto_user": row[0], "auto_pass": row[1]}, "با نام کاربری پنل وصل شد"
+    if not os.access(xui_bin, os.X_OK):
+        return None, "برنامه‌ی 3x-ui روی این سرور پیدا نشد؛ توکن یا رمز را دستی بگذار"
+    return None, "این نسخه‌ی پنل توکن API ندارد و رمزش قابل خواندن نیست؛ نام کاربری و رمز را دستی بگذار"
+
+
 class PanelError(Exception):
     pass
 
@@ -1470,11 +1519,38 @@ class PanelAPI:
         rt = self.app.rt
         return bool(rt.get("panel_token") or (rt.get("panel_user") and rt.get("panel_pass")))
 
+    def auto_connect(self):
+        """Find credentials on this server and keep them. -> (ok, note)"""
+        creds, note = auto_panel_credentials(self.app.db_path)
+        cfg = load_config()
+        cfg.update(auto_token="", auto_user="", auto_pass="", auto_note=note)
+        cfg.update(creds or {})
+        save_config(cfg)
+        self.app.reload()
+        self.cookies, self.version = {}, None
+        self.forget()
+        self._auto_at = time.time()
+        return bool(creds), note
+
+    def maybe_auto(self):
+        """Connect automatically when allowed and nothing works yet (at most every 10 minutes)."""
+        rt = self.app.rt
+        if not rt.get("panel_auto", True) or rt.get("panel_source") == "manual":
+            return
+        if time.time() - getattr(self, "_auto_at", 0) < 600:
+            return
+        if rt.get("panel_source") == "auto":
+            if self.overview(auto=False)["ok"]:
+                return
+        self.auto_connect()
+
     def forget(self):
         self._cache = None
 
-    def overview(self, ttl=20):
+    def overview(self, ttl=20, auto=True):
         """{"configured", "ok", "error", "inbounds", "onlines", "version"} without raising."""
+        if auto:
+            self.maybe_auto()
         if not self.configured():
             return {"configured": False, "ok": False, "error": "", "inbounds": [], "onlines": None, "version": None}
         now = time.time()
@@ -1752,8 +1828,8 @@ def deco_lines(app):
 
 
 def admin_state(app, host):
+    panel = app.panel.overview()  # may connect automatically and reload the settings
     cfg, rt = app.cfg, app.rt
-    panel = app.panel.overview()
     clients = read_clients(app.db_path)
     source = "db"
     if not clients and panel["ok"]:
@@ -1777,6 +1853,8 @@ def admin_state(app, host):
             "tg_token_set": bool(cfg.get("tg_token")), "tg_source": rt.get("tg_source", ""),
             "tg_chat_rt": rt.get("tg_chat_rt", ""),
             "panel_url": cfg.get("panel_url", "auto"), "panel_user": cfg.get("panel_user", ""),
+            "panel_auto": cfg.get("panel_auto", True), "panel_source": rt.get("panel_source", ""),
+            "auto_note": cfg.get("auto_note", ""),
             "panel_token_set": bool(cfg.get("panel_token")), "panel_pass_set": bool(cfg.get("panel_pass")),
             "panel_rt": rt.get("panel_url", ""), "xui_rt": rt.get("xui_sub_url", ""),
         },
@@ -1793,7 +1871,7 @@ def admin_state(app, host):
     }
 
 
-SETTING_BOOLS = ("direct_first", "iran_direct", "tg_enable")
+SETTING_BOOLS = ("direct_first", "iran_direct", "tg_enable", "panel_auto")
 SETTING_TEXTS = {"title": 60, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("tg_token", "panel_token", "panel_pass")
@@ -1822,6 +1900,7 @@ def do_action(app, action, body, host):
 
         if action == "settings":
             cfg = load_config()
+            was_auto = cfg.get("panel_auto", True)
             for k in SETTING_BOOLS:
                 if k in body:
                     cfg[k] = bool(body[k])
@@ -1837,10 +1916,25 @@ def do_action(app, action, body, host):
                 cfg["monitor_minutes"] = min(1440, max(2, _int(body["monitor_minutes"]) or 10))
             save_config(cfg)
             app.reload()
-            if any(k in body for k in ("panel_user", "panel_pass", "panel_token", "panel_url")):
+            if any(k in body for k in ("panel_user", "panel_pass", "panel_token", "panel_url", "panel_auto")):
                 app.panel.cookies, app.panel.version = {}, None
                 app.panel.forget()
+            if body.get("panel_auto") and app.rt.get("panel_source") != "manual" and (
+                    not was_auto or app.rt.get("panel_source") == ""):
+                ok, note = app.panel.auto_connect()
+                return done(note) if ok else fail(note)
             return done("ذخیره شد")
+
+        if action == "panel_auto":
+            cfg = load_config()
+            cfg["panel_auto"] = True
+            save_config(cfg)
+            app.reload()
+            ok, note = app.panel.auto_connect()
+            p = app.panel.overview(auto=False)
+            if ok and p["ok"]:
+                return done("%s؛ %d inbound پیدا شد" % (note, len(p["inbounds"])))
+            return fail(p["error"] or note)
 
         if action == "password":
             if not check_password(str(body.get("old", "")), Auth.stored()):
@@ -1883,7 +1977,7 @@ def do_action(app, action, body, host):
             p = app.panel.overview()
             if not p["configured"]:
                 return fail("اول توکن یا نام کاربری و رمز پنل را ذخیره کن")
-            return done("اتصال به پنل برقرار است (%d inbound)" % len(p["inbounds"])) if p["ok"] else fail(p["error"])
+            return done("اتصال به پنل برقرار است؛ %d inbound پیدا شد" % len(p["inbounds"])) if p["ok"] else fail(p["error"])
 
         if action == "user_add":
             name = str(body.get("name", "")).strip()
@@ -2067,6 +2161,7 @@ textarea.in{min-height:120px;font:13px/1.6 ui-monospace,Menlo,Consolas,monospace
 .auth form{margin-top:18px;text-align:right}
 .skel{height:90px;border-radius:18px;background:linear-gradient(90deg,var(--card),var(--card2),var(--card));background-size:200% 100%;animation:sk 1.2s infinite;margin:12px 0}
 @keyframes sk{to{background-position:-200% 0}}
+details summary{padding:6px 0;font-size:14px}details[open] summary{margin-bottom:4px}
 .kv{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px dashed var(--line);font-size:14px}.kv:last-child{border:0}
 .list-mini .it{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 0;border-bottom:1px dashed var(--line);cursor:pointer}.list-mini .it:last-child{border:0}
 </style>
@@ -2240,7 +2335,7 @@ VIEWS.home=()=>{
    <div class="stat"><div class="k">${ic("link")} Deco سالم</div><div class="v">${fa(ds.ok)} <small>از ${fa(ds.nodes.length)}</small></div></div>
    <div class="stat"><div class="k">${ic("globe")} مصرف کل</div><div class="v">${gb(used)} <small>GB</small></div></div>
   </div>
-  ${!st.panel.configured?`<div class="card"><h2>${ic("info")} پنل 3x-ui وصل نیست</h2><p class="mut">برای ساخت و مدیریت کاربر از همین‌جا، توکن API یا نام کاربری و رمز پنل رو در تنظیمات بذار.</p><button class="btn sm" data-act="tab" data-tab="settings">رفتن به تنظیمات</button></div>`:""}
+  ${!st.panel.configured?`<div class="card"><h2>${ic("info")} پنل 3x-ui وصل نیست</h2><p class="mut">${st.settings.panel_auto&&st.settings.auto_note?esc(st.settings.auto_note):"برای ساخت و مدیریت کاربر از همین‌جا، پنل رو در تنظیمات وصل کن."}</p><button class="btn sm" data-act="goto-panel">رفتن به تنظیمات پنل</button></div>`:""}
   ${attention.length?`<div class="sec-title"><h3>نیاز به تمدید</h3><button class="btn sm ghost" data-act="tab" data-tab="users">همه</button></div><div class="card list-mini">${attention.map(u=>{const s=ustat(u);return `<div class="it" data-act="edit" data-sub="${esc(u.sub)}"><span class="ltr"><b>${esc(u.name)}</b></span><span class="badge b-${s[0]}">${s[0]==="soon"?daysText(u):s[1]}</span></div>`}).join("")}</div>`:""}
   <div class="sec-title"><h3>سرور</h3><span class="mut small">${sv.uptime?"روشن از "+uptime(sv.uptime):""}</span></div>
   <div class="card">
@@ -2312,7 +2407,7 @@ function userForm(u){
    `<div class="err">${st.panel.configured?esc(st.panel.error||"inboundی پیدا نشد"):"اول پنل 3x-ui را در تنظیمات وصل کن."}</div>`):sw("zero",false,"مصرف صفر شود","برای شروع دوره‌ی جدید")}`;
 }
 function addUserSheet(){
-  if(!S.state.panel.configured){sheet(`<h3>${ic("info")} اول پنل رو وصل کن</h3><p class="mut">برای ساخت کاربر، توکن API یا نام کاربری و رمز پنل 3x-ui لازمه.</p><button class="btn block" data-act="goto-panel">رفتن به تنظیمات پنل</button>`);return}
+  if(!S.state.panel.configured){sheet(`<h3>${ic("info")} اول پنل رو وصل کن</h3><p class="mut">${S.state.settings.auto_note?esc(S.state.settings.auto_note):"برای ساخت کاربر باید پنل 3x-ui وصل باشه."}</p><button class="btn block" data-act="goto-panel">رفتن به تنظیمات پنل</button>`);return}
   sheet(`<h3>${ic("plus")} کاربر جدید</h3><form id="uf">${userForm(null)}<button class="btn block" style="margin-top:14px">${ic("check")} ساخت و گرفتن لینک</button></form>`,el=>{
     const f=$("#uf",el);
     $$("[data-preset]",el).forEach(b=>b.onclick=()=>{const[g,d]=b.dataset.preset.split(",");f.gb.value=g;f.days.value=d;$$("[data-preset]",el).forEach(x=>x.classList.toggle("on",x===b))});
@@ -2394,14 +2489,19 @@ VIEWS.settings=()=>{
    <button class="btn block">${ic("check")} ذخیره</button></form>
 
   <form class="card" data-sec="panel" id="panel-sec"><h2>${ic("server")} پنل 3x-ui</h2>
-   <div class="badge ${p.ok?"b-on":p.configured?"b-exp":"b-off"}" style="margin:4px 0 8px">${p.ok?"وصل، API نسخه‌ی "+fa(p.version||""):p.configured?"خطا":"وصل نیست"}</div>
+   <div class="badge ${p.ok?"b-on":p.configured?"b-exp":"b-off"}" style="margin:4px 0 8px">${p.ok?"وصل"+(s.panel_source==="auto"?"، خودکار":"، دستی")+"، API نسخه‌ی "+fa(p.version||""):p.configured?"خطا":"وصل نیست"}</div>
    ${p.error?`<div class="err">${esc(p.error)}</div>`:""}
-   <p class="mut small">برای ساخت و مدیریت کاربر. بهتره توکن API بذاری (در پنل: Settings ← Security ← API Token). اگه پنلت توکن نداره، نام کاربری و رمز ورود پنل رو بذار. با ورود دومرحله‌ای فقط توکن کار می‌کنه.</p>
+   <p class="mut small">برای ساخت و مدیریت کاربر از همین‌جا.</p>
+   ${sw("panel_auto",s.panel_auto,"اتصال خودکار از روی سرور","xui-chain خودش از روی همین سرور به پنل وصل می‌شه و یه توکن به اسم xui-chain در پنل می‌سازه (در Settings ← API Tokens پنل دیده می‌شه).")}
+   ${s.panel_auto&&s.auto_note?`<div class="hint">${ic("info")} ${esc(s.auto_note)}</div>`:""}
+   <div class="row-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="panel-auto">${ic("zap")} اتصال خودکار الان</button></div>
+   <details style="margin-top:12px" ${s.panel_source==="manual"||(!s.panel_auto)?"open":""}><summary class="mut" style="cursor:pointer">اتصال دستی (اختیاری)</summary>
+   <p class="mut small">اگه اتصال خودکار نشد: توکن API (در پنل: Settings ← Security ← API Token) یا نام کاربری و رمز ورود پنل. چیزی که دستی بذاری از اتصال خودکار مهم‌تره.</p>
    ${field("panel_token","توکن API","",`class="in ltr" type="password" autocomplete="off" placeholder="${ph(s.panel_token_set,"اختیاری")}"`)}
    <div class="cols2">${field("panel_user","نام کاربری",s.panel_user,'class="in ltr" autocomplete="off" autocapitalize="off"')}${field("panel_pass","رمز","",`class="in ltr" type="password" autocomplete="new-password" placeholder="${ph(s.panel_pass_set,"")}"`)}</div>
    ${field("panel_url","آدرس پنل",s.panel_url,'class="in ltr"',"auto یعنی خودکار از تنظیمات پنل: <span class=\"ltr\">"+esc(s.panel_rt)+"</span>")}
-   <div class="row-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="panel-test">${ic("refresh")} تست اتصال</button></div>
-   ${s.panel_token_set||s.panel_pass_set?`<div class="row-btns"><button type="button" class="btn sm ghost" data-act="clear" data-keys="panel_token,panel_pass">${ic("trash")} پاک کردن توکن و رمز</button></div>`:""}</form>
+   <div class="row-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="panel-test">${ic("refresh")} تست</button>${s.panel_token_set||s.panel_pass_set?`<button type="button" class="btn ghost icon" data-act="clear" data-keys="panel_token,panel_pass" title="پاک کردن" aria-label="پاک کردن">${ic("trash")}</button>`:""}</div>
+   </details></form>
 
   <form class="card" data-sec="tg"><h2>${ic("bell")} هشدار تلگرام</h2>
    <p class="mut small">قطع و وصل شدن Decoها، قطع شدن همه، و تموم شدن حجم یا زمان Deco. ${s.tg_source==="panel"?"الان از ربات خود پنل 3x-ui استفاده می‌شه.":""}</p>
@@ -2456,6 +2556,7 @@ const ACTS={
   "deco-move":b=>{const l=decoLines(),i=+b.dataset.i,j=i+(+b.dataset.d);[l[i],l[j]]=[l[j],l[i]];saveDecos(l,null)},
   "deco-del":async b=>{const i=+b.dataset.i,d=S.state.decos[i];if(await confirmSheet("حذف Deco","<span class=\"ltr\">"+esc(d.title)+"</span> از فهرست حذف بشه؟","حذف کن",true)){const l=decoLines();l.splice(i,1);saveDecos(l,null)}},
   "panel-test":b=>act(b,"panel_test",{}),
+  "panel-auto":b=>act(b,"panel_auto",{}),
   "tg-test":b=>act(b,"tgtest",{}),
   "goto-panel":()=>{closeSheet();S.tab="settings";render();setTimeout(()=>{const p=$("#panel-sec");p&&p.scrollIntoView({behavior:"smooth"})},50)},
   clear:async b=>{const body={};b.dataset.keys.split(",").forEach(k=>body[k]=null);act(b,"settings",body)},
@@ -2668,6 +2769,7 @@ def serve(app):
     print("xui-chain %s listening on %s://%s:%s" % (VERSION, scheme, rt["listen"], rt["port"]), flush=True)
     print("panel subscription: %s" % rt["xui_sub_url"], flush=True)
     threading.Thread(target=app.monitor.loop, daemon=True).start()
+    threading.Thread(target=app.panel.overview, daemon=True).start()  # automatic panel connection
     httpd.serve_forever()
 
 

@@ -701,7 +701,7 @@ class PanelTests(unittest.TestCase):
     def app(self, **cfg):
         a = type("A", (), {})()
         a.db_path = self.db
-        a.rt = xc.resolve_runtime(dict(xc.DEFAULTS, **cfg), self.db)
+        a.rt = xc.resolve_runtime(dict(xc.DEFAULTS, **dict({"panel_auto": False}, **cfg)), self.db)
         return a, xc.PanelAPI(a)
 
     def test_panel_url_from_settings(self):
@@ -783,6 +783,73 @@ class PanelTests(unittest.TestCase):
         api.overview()
         self.assertEqual(FakeXUI.logins, 1)  # the failure is cached, no second login attempt
         self.assertFalse(self.app()[1].overview()["configured"])
+
+    def fake_xui_bin(self, output):
+        path = os.path.join(tempfile.mkdtemp(), "x-ui")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n[ \"$1 $2 $4\" = \"setting -getApiToken xui-chain\" ] && echo '%s'\n" % output)
+        os.chmod(path, 0o755)
+        return path
+
+    def users_db(self, password, two_factor=False):
+        path = os.path.join(tempfile.mkdtemp(), "x-ui.db")
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT)")
+        con.execute("INSERT INTO users (username, password) VALUES ('admin', ?)", (password,))
+        con.execute("CREATE TABLE settings (id INTEGER PRIMARY KEY, key TEXT, value TEXT)")
+        con.execute("INSERT INTO settings (key, value) VALUES ('twoFactorEnable', ?)", ("true" if two_factor else "false",))
+        con.commit()
+        con.close()
+        return path
+
+    def test_auto_credentials(self):
+        creds, note = xc.auto_panel_credentials(self.db, self.fake_xui_bin("There are 2 API token(s)\\napiToken: tok"))
+        self.assertEqual(creds, {"auto_token": "tok"})
+        self.assertIn("xui-chain", note)
+        no_flag = self.fake_xui_bin("")  # an older panel binary without -getApiToken
+        self.assertEqual(xc.auto_panel_credentials(self.users_db("pw"), no_flag)[0],
+                         {"auto_user": "admin", "auto_pass": "pw"})
+        creds, note = xc.auto_panel_credentials(self.users_db("$2a$10$hash"), no_flag)
+        self.assertIsNone(creds)
+        self.assertIn("دستی", note)
+        self.assertIsNone(xc.auto_panel_credentials(self.users_db("pw", two_factor=True), no_flag)[0])
+        self.assertIsNone(xc.auto_panel_credentials("/nonexistent.db", "/nonexistent/x-ui")[0])
+
+    def test_auto_connect_end_to_end(self):
+        old_bin = xc.XUI_BIN
+        xc.XUI_BIN = self.fake_xui_bin("apiToken: tok")
+        cfg = xc.load_config()
+        for k in ("panel_user", "panel_pass", "panel_token", "auto_token", "auto_user", "auto_pass"):
+            cfg[k] = ""
+        cfg["panel_auto"] = True
+        xc.save_config(cfg)
+        try:
+            app = xc.App(db_path=self.db)
+            self.assertEqual(app.rt["panel_source"], "")
+            p = app.panel.overview()
+            self.assertTrue(p["ok"], p)
+            self.assertEqual((app.rt["panel_source"], app.rt["panel_token"]), ("auto", "tok"))
+            self.assertEqual(xc.load_config()["auto_token"], "tok")
+            # typed-in credentials win over the automatic ones
+            cfg = xc.load_config()
+            cfg.update(panel_user="admin", panel_pass="pw")
+            xc.save_config(cfg)
+            app.reload()
+            self.assertEqual((app.rt["panel_source"], app.rt["panel_token"]), ("manual", ""))
+            # switched off: nothing automatic is used
+            cfg.update(panel_user="", panel_pass="", panel_auto=False)
+            xc.save_config(cfg)
+            app.reload()
+            self.assertEqual(app.rt["panel_source"], "")
+            status, out = xc.do_action(app, "panel_auto", {}, "h:1")
+            self.assertTrue(out["ok"], out)
+            self.assertTrue(xc.load_config()["panel_auto"])
+            self.assertEqual(out["state"]["settings"]["panel_source"], "auto")
+        finally:
+            xc.XUI_BIN = old_bin
+            cfg = xc.load_config()
+            cfg.update(auto_token="", panel_auto=True)
+            xc.save_config(cfg)
 
     def test_admin_api_user_management(self):
         xc.save_config(dict(xc.load_config(), admin_path="adm2", panel_user="admin", panel_pass="pw"))
