@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""xui-chain: chained subscriptions for a 3x-ui panel.
+"""EZ-XUI (xui-chain): chained subscriptions and an easy admin panel for 3x-ui.
 
 Reads each user's normal 3x-ui subscription (raw share links), and serves a
 new subscription where the client reaches your server in two ways:
@@ -38,7 +38,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.1.0"
+VERSION = "3.0.0"
+NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
 XUI_BIN = os.path.join(os.environ.get("XUI_MAIN_FOLDER", "/usr/local/x-ui"), "x-ui")
@@ -62,6 +63,8 @@ DEFAULTS = {
     "test_url": "https://www.gstatic.com/generate_204",
     "test_interval": 120,
     "title": "",
+    "main_location": "",       # display name of this server, e.g. "🇫🇮 فنلاند"
+    "locations": {},           # node address -> display name, refreshed from the panel
     "label_main": "Main",       # names of the routes in the apps
     "label_deco": "Deco",       # Deco1, Deco2, ... (the upstreams)
     "label_auto": "Auto",
@@ -893,6 +896,22 @@ def pick_format(query_format, ua):
     return "clash"
 
 
+def clean_remark(name):
+    """3x-ui remarks often carry usage after a separator: "REZ|📊9.68GB" -> "REZ"."""
+    return re.split(r"\s*[|│]\s*", name or "")[0].strip() or name
+
+
+def location_label(node, rt):
+    """Name of the location a config belongs to: a node's name, this server's name,
+    or the config's own remark when there are no other locations."""
+    locs = rt.get("locations") or {}
+    if node["server"] in locs:
+        return locs[node["server"]]
+    if locs:
+        return rt.get("main_location") or "سرور اصلی"
+    return rt.get("main_location") or clean_remark(node["name"])
+
+
 def build_subscription(sub_id, fmt, rt):
     """-> (status, headers, body)."""
     url = rt["xui_sub_url"] + urllib.parse.quote(sub_id)
@@ -906,7 +925,9 @@ def build_subscription(sub_id, fmt, rt):
     if not own:
         return 404, {}, "no configs for this subscription\n"
     ups = UPSTREAMS.nodes()
-    title = rt.get("title") or "xui-chain"
+    for n in own:
+        n["name"] = location_label(n, rt)
+    title = rt.get("title") or NAME
     try:
         if fmt == "xray":
             text, _ = build_xray(own, ups, rt, title)
@@ -1190,7 +1211,7 @@ class Monitor:
             self.last_run = time.time()
             msgs = self.alerts(items, rt)
         if msgs:
-            err = tg_send(rt, "🔗 xui-chain · %s\n\n%s" % (rt.get("public_host") or "server", "\n\n".join(msgs)))
+            err = tg_send(rt, "🔗 %s · %s\n\n%s" % (NAME, rt.get("public_host") or "server", "\n\n".join(msgs)))
             if err:
                 print("telegram: %s" % err, flush=True)
         return items
@@ -1387,8 +1408,86 @@ class PanelAPI:
                 settings = {}
             out.append({"id": ib["id"], "remark": ib.get("remark") or "", "protocol": ib.get("protocol", ""),
                         "port": ib.get("port"), "enable": ib.get("enable", True), "settings": settings,
-                        "stats": ib.get("clientStats") or []})
+                        "stats": ib.get("clientStats") or [], "node": ib.get("nodeId"), "raw": ib})
         return out
+
+    # -- locations (3x-ui v3 nodes)
+
+    def nodes(self):
+        if not self.is_v3():
+            return []
+        status, j = self.call("GET", "/panel/api/nodes/list")
+        if not (isinstance(j, dict) and j.get("success")):
+            return []
+        return [n for n in j.get("obj") or [] if not n.get("transitive")]
+
+    def add_node(self, name, conn):
+        """Register another 3x-ui panel as a location. conn: scheme, address, port, basePath, token."""
+        slug = re.sub(r"[^a-z0-9-]+", "-", (conn["address"] or "").lower()).strip("-")[:40] or "node"
+        body = {"name": "ez-%s-%s" % (slug, secrets.token_hex(2)), "remark": name, "scheme": conn["scheme"],
+                "address": conn["address"], "port": int(conn["port"]), "basePath": conn["basePath"] or "/",
+                "apiToken": conn["token"], "enable": True, "inboundSyncMode": "all", "tlsVerifyMode": "verify"}
+        existing = next((n for n in self.nodes() if n.get("address") == conn["address"]
+                         and int(n.get("port") or 0) == int(conn["port"])), None)
+        path = "/panel/api/nodes/update/%d" % existing["id"] if existing else "/panel/api/nodes/add"
+        if existing:
+            body.update(id=existing["id"], name=existing["name"])
+        status, j = self.call("POST", path, body=body)
+        if not (isinstance(j, dict) and j.get("success")) and conn["scheme"] == "https":
+            # a self-signed or IP certificate: pin the one the node shows now
+            st, fp = self.call("POST", "/panel/api/nodes/certFingerprint",
+                               body={k: body[k] for k in ("scheme", "address", "port", "basePath")})
+            if isinstance(fp, dict) and fp.get("success") and fp.get("obj"):
+                body.update(tlsVerifyMode="pin", pinnedCertSha256=fp["obj"])
+                status, j = self.call("POST", path, body=body)
+        self._ok(status, j, "افزودن لوکیشن")
+        self.forget()
+        return existing["id"] if existing else (j.get("obj") or {}).get("id")
+
+    def delete_node(self, node_id):
+        for ib in self.inbounds():
+            if ib["node"] == node_id:
+                status, j = self.call("POST", "/panel/api/inbounds/del/%d" % ib["id"])
+                self._ok(status, j, "حذف inbound لوکیشن")
+        status, j = self.call("POST", "/panel/api/nodes/del/%d" % node_id)
+        self._ok(status, j, "حذف لوکیشن")
+        self.forget()
+
+    def clone_inbound(self, template_id, node_id, remark):
+        """Create an inbound on a location with the same protocol, port and transport as one
+        of this server's inbounds (without its clients). -> new inbound id"""
+        tpl = next((ib for ib in self.inbounds() if ib["id"] == template_id), None)
+        if not tpl:
+            raise PanelError("inbound الگو پیدا نشد")
+        raw = tpl["raw"]
+
+        def obj(v):
+            if isinstance(v, str):
+                try:
+                    return json.loads(v or "{}")
+                except ValueError:
+                    return {}
+            return v or {}
+        settings = dict(obj(raw.get("settings")), clients=[])
+        stream = obj(raw.get("streamSettings"))
+        if (stream.get("security") == "tls" and
+                any(c.get("certificateFile") for c in (stream.get("tlsSettings") or {}).get("certificates") or [])):
+            raise PanelError("این inbound با فایل گواهی TLS کار می‌کند و روی سرور دیگر جواب نمی‌دهد؛ یک inbound از نوع Reality انتخاب کن")
+        body = {"enable": True, "remark": remark, "listen": "", "port": raw.get("port"), "protocol": raw.get("protocol"),
+                "expiryTime": 0, "total": 0, "settings": settings, "streamSettings": stream,
+                "sniffing": obj(raw.get("sniffing")), "nodeId": node_id}
+        status, j = self.call("POST", "/panel/api/inbounds/add", body=body)
+        self._ok(status, j, "ساخت inbound روی لوکیشن")
+        self.forget()
+        return (j.get("obj") or {}).get("id")
+
+    def attach_all(self, emails, inbound_ids):
+        if not emails or not inbound_ids:
+            return 0
+        status, j = self.call("POST", "/panel/api/clients/bulkAttach", body={"emails": emails, "inboundIds": inbound_ids})
+        self._ok(status, j, "افزودن کاربرها به لوکیشن")
+        self.forget()
+        return len((j.get("obj") or {}).get("attached") or emails)
 
     def add_client(self, name, gb, days, devices, first_use, inbound_ids):
         """Create one client on the chosen inbounds -> its subId."""
@@ -1398,7 +1497,7 @@ class PanelAPI:
             raise PanelError("حداقل یک inbound انتخاب کن")
         sub_id = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(16))
         base = {"email": name, "enable": True, "subId": sub_id, "limitIp": int(devices),
-                "totalGB": int(float(gb) * 1024 ** 3), "comment": "xui-chain",
+                "totalGB": int(float(gb) * 1024 ** 3), "comment": "EZ-XUI",
                 "expiryTime": 0 if not days else (-int(days) * 86400000 if first_use else
                                                    int((time.time() + int(days) * 86400) * 1000))}
         uid, pw = str(uuid.uuid4()), secrets.token_urlsafe(12)
@@ -1547,16 +1646,27 @@ class PanelAPI:
     def forget(self):
         self._cache = None
 
+    def remember_locations(self, nodes):
+        """Node address -> name, kept in the settings so subscriptions can label configs by location."""
+        locs = {n["address"]: (n.get("remark") or n.get("name") or n["address"]) for n in nodes if n.get("address")}
+        cfg = load_config()
+        if cfg.get("locations") != locs:
+            cfg["locations"] = locs
+            save_config(cfg)
+            self.app.reload()
+
     def overview(self, ttl=20, auto=True):
         """{"configured", "ok", "error", "inbounds", "onlines", "version"} without raising."""
         if auto:
             self.maybe_auto()
         if not self.configured():
-            return {"configured": False, "ok": False, "error": "", "inbounds": [], "onlines": None, "version": None}
+            return {"configured": False, "ok": False, "error": "", "inbounds": [], "onlines": None, "version": None,
+                    "nodes": []}
         now = time.time()
         if self._cache and now - self._cache[0] < (ttl if self._cache[1]["ok"] else 60):
             return self._cache[1]
-        out = {"configured": True, "ok": False, "error": "", "inbounds": [], "onlines": None, "version": None}
+        out = {"configured": True, "ok": False, "error": "", "inbounds": [], "onlines": None, "version": None,
+               "nodes": []}
         try:
             out["inbounds"] = self.inbounds()
             out["ok"] = True
@@ -1568,6 +1678,11 @@ class PanelAPI:
                 out["onlines"] = sorted(self.onlines())
             except PanelError:
                 pass  # online status is optional
+            try:
+                out["nodes"] = self.nodes()
+                self.remember_locations(out["nodes"])
+            except PanelError:
+                pass
         self._cache = (now, out)
         return out
 
@@ -1786,6 +1901,35 @@ class Auth:
 
 # ---------------------------------------------------------------- admin state and actions
 
+LOCATION_PREFIX = "EZXUI-"
+
+
+def location_code(scheme, address, port, base_path, token):
+    data = json.dumps({"s": scheme, "a": address, "p": int(port), "b": base_path or "/", "t": token}, separators=(",", ":"))
+    return LOCATION_PREFIX + base64.urlsafe_b64encode(data.encode()).decode().rstrip("=")
+
+
+def parse_location(code="", url="", token=""):
+    """A location code from node.sh, or a panel URL plus its API token -> connection dict."""
+    code = (code or "").strip()
+    if code:
+        m = re.search(re.escape(LOCATION_PREFIX) + r"([A-Za-z0-9_=-]+)", code)
+        raw = b64decode(m.group(1)) if m else None
+        try:
+            j = json.loads(raw or "")
+            return {"scheme": j.get("s") or "https", "address": str(j["a"]), "port": int(j["p"]),
+                    "basePath": j.get("b") or "/", "token": str(j["t"])}
+        except (ValueError, KeyError, TypeError):
+            raise PanelError("کد لوکیشن درست نیست؛ کامل کپی‌اش کن")
+    u = urllib.parse.urlsplit((url or "").strip())
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise PanelError("کد لوکیشن، یا آدرس پنل سرور جدید را بگذار")
+    if not (token or "").strip():
+        raise PanelError("توکن API سرور جدید لازم است")
+    return {"scheme": u.scheme, "address": u.hostname, "port": u.port or (443 if u.scheme == "https" else 80),
+            "basePath": u.path or "/", "token": token.strip()}
+
+
 def node_key(n):
     return "%s|%s|%s|%s" % (n["proto"], n["server"], n["port"], n["name"])
 
@@ -1827,6 +1971,16 @@ def deco_lines(app):
     return out
 
 
+def inbound_security(ib):
+    stream = (ib.get("raw") or {}).get("streamSettings") or {}
+    if isinstance(stream, str):
+        try:
+            stream = json.loads(stream or "{}")
+        except ValueError:
+            stream = {}
+    return stream.get("security") or "none"
+
+
 def admin_state(app, host):
     panel = app.panel.overview()  # may connect automatically and reload the settings
     cfg, rt = app.cfg, app.rt
@@ -1846,6 +2000,7 @@ def admin_state(app, host):
         "settings": {
             "direct_first": cfg.get("direct_first", True), "iran_direct": cfg.get("iran_direct", True),
             "title": cfg.get("title", ""), "label_main": label(cfg, "label_main"),
+            "main_location": cfg.get("main_location", ""),
             "label_deco": label(cfg, "label_deco"), "label_auto": label(cfg, "label_auto"),
             "xui_sub_url": cfg.get("xui_sub_url", "auto"), "public_host": cfg.get("public_host", ""),
             "monitor_minutes": int(cfg.get("monitor_minutes") or 10), "test_sub_id": cfg.get("test_sub_id", ""),
@@ -1863,8 +2018,18 @@ def admin_state(app, host):
                     "xray": bool(find_xray())},
         "panel": {k: panel[k] for k in ("configured", "ok", "error", "version")},
         "inbounds": [{"id": ib["id"], "remark": ib["remark"], "protocol": ib["protocol"], "port": ib["port"],
-                      "enable": ib["enable"]} for ib in panel["inbounds"]
+                      "enable": ib["enable"], "node": ib.get("node"), "security": inbound_security(ib)}
+                     for ib in panel["inbounds"]
                      if ib["protocol"] in ("vless", "vmess", "trojan", "shadowsocks")],
+        "locations": [{"id": 0, "main": True, "name": cfg.get("main_location") or "سرور اصلی",
+                       "address": rt.get("public_host") or host.rsplit(":", 1)[0], "status": "online",
+                       "inbounds": [ib["id"] for ib in panel["inbounds"] if not ib.get("node")]}] + [
+            {"id": n["id"], "main": False, "name": n.get("remark") or n.get("name"), "address": n.get("address"),
+             "status": n.get("status") or "unknown", "enable": n.get("enable", True), "latency": n.get("latencyMs"),
+             "cpu": n.get("cpuPct"), "mem": n.get("memPct"), "error": n.get("lastError") or "",
+             "xray": n.get("xrayState") or "", "version": n.get("panelVersion") or "",
+             "inbounds": [ib["id"] for ib in panel["inbounds"] if ib.get("node") == n["id"]]}
+            for n in panel.get("nodes") or []],
         "users": [{k: u[k] for k in ("sub", "name", "emails", "enable", "used", "total", "expiry", "devices",
                                      "inbounds", "online")} for u in users],
         "users_source": source,
@@ -1872,7 +2037,7 @@ def admin_state(app, host):
 
 
 SETTING_BOOLS = ("direct_first", "iran_direct", "tg_enable", "panel_auto")
-SETTING_TEXTS = {"title": 60, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
+SETTING_TEXTS = {"title": 60, "main_location": 40, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("tg_token", "panel_token", "panel_pass")
 
@@ -1967,7 +2132,7 @@ def do_action(app, action, body, host):
             return done("تست Decoها انجام شد")
 
         if action == "tgtest":
-            err = tg_send(app.rt, "🔗 xui-chain · %s\n\n✅ پیام آزمایشی. هشدارهای Deco اینجا میاد."
+            err = tg_send(app.rt, "🔗 EZ-XUI · %s\n\n✅ پیام آزمایشی. هشدارهای Deco اینجا میاد."
                           % (app.rt.get("public_host") or "server"))
             return fail(err) if err else done("پیام آزمایشی فرستاده شد")
 
@@ -1989,6 +2154,51 @@ def do_action(app, action, body, host):
                                        max(0, _int(body.get("devices"))), bool(body.get("first_use")),
                                        [_int(i) for i in body.get("inbounds") or []])
             return done("کاربر %s ساخته شد" % name, sub=sub)
+
+        if action in ("loc_add", "loc_setup", "loc_attach", "loc_delete"):
+            p = app.panel.overview()
+            if not p["ok"]:
+                return fail(p["error"] or "اول پنل 3x-ui را وصل کن")
+            if p["version"] != 3:
+                return fail("لوکیشن‌ها به 3x-ui نسخه‌ی ۳ نیاز دارند")
+            emails = [c["email"] for c in all_clients()]
+            if action == "loc_add":
+                name = str(body.get("name", "")).strip()[:40]
+                if not name:
+                    return fail("یه اسم برای لوکیشن بذار، مثلاً 🇩🇪 آلمان")
+                conn = parse_location(body.get("code", ""), body.get("url", ""), body.get("token", ""))
+                node_id = app.panel.add_node(name, conn)
+                msg = "لوکیشن %s اضافه شد" % name
+                if body.get("template") and node_id:
+                    ib = app.panel.clone_inbound(_int(body["template"]), node_id, name)
+                    if body.get("attach") and ib:
+                        n = app.panel.attach_all(emails, [ib])
+                        msg += "، inbound ساخته شد و %d کاربر اضافه شدند" % n
+                    else:
+                        msg += " و inbound ساخته شد"
+                return done(msg)
+            node_id = _int(body.get("node"))
+            node = next((n for n in p["nodes"] if n["id"] == node_id), None)
+            if not node:
+                return fail("این لوکیشن پیدا نشد")
+            name = node.get("remark") or node.get("name")
+            if action == "loc_setup":
+                ib = app.panel.clone_inbound(_int(body.get("template")), node_id, name)
+                n = app.panel.attach_all(emails, [ib]) if body.get("attach") else 0
+                return done("inbound روی %s ساخته شد%s" % (name, "، %d کاربر اضافه شدند" % n if n else ""))
+            if action == "loc_attach":
+                ids = [ib["id"] for ib in p["inbounds"] if ib.get("node") == node_id
+                       and ib["protocol"] in ("vless", "vmess", "trojan", "shadowsocks")]
+                if not ids:
+                    return fail("این لوکیشن هنوز inbound ندارد")
+                n = app.panel.attach_all(emails, ids)
+                return done("همه‌ی کاربرها به %s اضافه شدند (%d)" % (name, n))
+            app.panel.delete_node(node_id)
+            cfg = load_config()
+            cfg["locations"] = {k: v for k, v in (cfg.get("locations") or {}).items() if k != node.get("address")}
+            save_config(cfg)
+            app.reload()
+            return done("لوکیشن %s حذف شد" % name)
 
         if action in ("user_update", "user_enable", "user_reset", "user_delete"):
             u = find_user(str(body.get("sub", "")))
@@ -2026,7 +2236,7 @@ ADMIN_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#0a0f1d">
-<title>xui-chain</title>
+<title>EZ-XUI</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css">
 <style>
 :root{--bg:#0a0f1d;--bg2:#0d1426;--card:#111a2e;--card2:#16213b;--line:#22304f;--fg:#e8edf7;--mut:#8b98b4;--acc:#5b8cff;--acc2:#8b5cff;--ok:#22c55e;--warn:#f5a524;--bad:#f43f5e;--okbg:rgba(34,197,94,.12);--warnbg:rgba(245,165,36,.13);--badbg:rgba(244,63,94,.12);--accbg:rgba(91,140,255,.14);--shadow:0 12px 32px rgba(0,0,0,.35);--r:18px;color-scheme:dark}
@@ -2035,23 +2245,34 @@ ADMIN_HTML = r"""<!doctype html>
 html,body{margin:0;background:var(--bg);color:var(--fg)}
 body{font:15px/1.65 Vazirmatn,Tahoma,system-ui,sans-serif;min-height:100vh;background:radial-gradient(1200px 500px at 85% -10%,rgba(91,140,255,.16),transparent 60%),radial-gradient(900px 400px at -10% 10%,rgba(139,92,255,.12),transparent 60%),var(--bg);background-attachment:fixed}
 button,input,textarea,select{font:inherit;color:inherit}
+input,textarea,select{font-size:16px}/* no zoom on focus in iOS */
+button{touch-action:manipulation}
 .i{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
 .ltr{direction:ltr;unicode-bidi:plaintext}.cmd{direction:ltr;unicode-bidi:isolate;white-space:nowrap;font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 .mut{color:var(--mut)}.small{font-size:12.5px}
-.wrap{max-width:780px;margin:0 auto;padding:12px 16px 110px}
+.wrap{max-width:780px;margin:0 auto;padding:12px 16px calc(110px + env(safe-area-inset-bottom))}
+.fade{animation:fade .18s ease-out}
+select.in{appearance:none;-webkit-appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),linear-gradient(135deg,var(--mut) 50%,transparent 50%);background-position:16px 50%,11px 50%;background-size:5px 5px;background-repeat:no-repeat;padding-left:30px}
+.code{direction:ltr;text-align:left;background:var(--bg2);border:1px dashed var(--line);border-radius:12px;padding:10px 12px;font:13px/1.5 ui-monospace,Menlo,monospace;word-break:break-all;margin:8px 0}
+.step{display:flex;gap:10px;margin:14px 0 6px;align-items:center;font-weight:700}.step .n{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;background:var(--accbg);color:var(--acc);font-size:13px;flex:none}
+.locs{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.loc-chip{font-size:12px;padding:1px 8px;border-radius:8px;background:var(--card2);border:1px solid var(--line);color:var(--mut)}
+.lcard{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px;margin:10px 0}
+.lhead{display:flex;align-items:center;gap:10px}.lhead .t{flex:1;min-width:0}.lhead .t b{display:block;font-size:16px}.lhead .t small{color:var(--mut);direction:ltr;display:block;text-align:right;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lmeta{display:flex;gap:12px;flex-wrap:wrap;font-size:12.5px;color:var(--mut);margin-top:8px}.lmeta span{display:inline-flex;align-items:center;gap:4px}.lmeta .i{width:15px;height:15px}
+.ib-head{font-size:13px;color:var(--mut);margin:12px 2px 2px;display:flex;align-items:center;gap:6px}.ib-head .i{width:16px;height:16px}
 /* header */
 .top{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 16px;padding-top:max(10px,env(safe-area-inset-top));background:var(--bg);background:color-mix(in srgb,var(--bg) 78%,transparent);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
 .top .inner{max-width:780px;margin:0 auto;width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px}
 .brand{display:flex;align-items:center;gap:10px;min-width:0}
-.logo{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;color:#fff;background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:0 6px 18px rgba(91,140,255,.35)}
+.logo{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;color:#fff;font:800 15px/1 Vazirmatn,system-ui,sans-serif;letter-spacing:.5px;direction:ltr;background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:0 6px 18px rgba(91,140,255,.35)}
 .brand b{display:block;font-size:16px;line-height:1.2}.brand small{display:block;color:var(--mut);font-size:12px;direction:ltr;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:52vw}
 .hbtns{display:flex;gap:6px}
 .ibtn{width:40px;height:40px;border-radius:12px;border:1px solid var(--line);background:var(--card);display:grid;place-items:center;cursor:pointer;color:var(--fg)}
 .ibtn:active{transform:scale(.96)}
 /* bottom nav */
 .nav{position:fixed;bottom:0;left:0;right:0;z-index:20;padding:8px 12px max(8px,env(safe-area-inset-bottom));background:var(--bg);background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-top:1px solid var(--line)}
-.nav .inner{max-width:520px;margin:0 auto;display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
-.nav button{border:0;background:none;color:var(--mut);display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 0;border-radius:14px;cursor:pointer;font-size:12px}
+.nav .inner{max-width:560px;margin:0 auto;display:grid;grid-template-columns:repeat(5,1fr);gap:4px}
+.nav button{border:0;background:none;color:var(--mut);display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 0;border-radius:14px;cursor:pointer;font-size:11.5px;white-space:nowrap;transition:background .15s,color .15s}
 .nav button.on{color:var(--acc);background:var(--accbg)}
 .nav .i{width:22px;height:22px}
 /* cards and blocks */
@@ -2094,7 +2315,7 @@ label.f{display:block;margin:10px 0}
 label.f>span{display:block;font-size:13px;color:var(--mut);margin-bottom:5px}
 .in,textarea.in{width:100%;background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:11px 12px;outline:none;transition:border .15s,box-shadow .15s}
 .in:focus{border-color:var(--acc);box-shadow:0 0 0 4px var(--accbg)}
-textarea.in{min-height:120px;font:13px/1.6 ui-monospace,Menlo,Consolas,monospace;direction:ltr}
+textarea.in{min-height:120px;font:14px/1.6 ui-monospace,Menlo,Consolas,monospace;direction:ltr}
 .in.ltr{direction:ltr;text-align:left}
 .cols{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.cols2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .hint{font-size:12.5px;color:var(--mut);margin-top:4px}
@@ -2156,7 +2377,7 @@ textarea.in{min-height:120px;font:13px/1.6 ui-monospace,Menlo,Consolas,monospace
 /* auth */
 .auth{min-height:100vh;display:grid;place-items:center;padding:24px 16px}
 .auth .box{width:100%;max-width:380px;text-align:center}
-.auth .logo{width:64px;height:64px;border-radius:20px;margin:0 auto 14px}.auth .logo .i{width:32px;height:32px}
+.auth .logo{width:68px;height:68px;border-radius:22px;margin:0 auto 14px;font-size:24px}
 .auth h1{font-size:22px;margin:0 0 4px}
 .auth form{margin-top:18px;text-align:right}
 .skel{height:90px;border-radius:18px;background:linear-gradient(90deg,var(--card),var(--card2),var(--card));background-size:200% 100%;animation:sk 1.2s infinite;margin:12px 0}
@@ -2256,8 +2477,11 @@ const sw=(name,checked,title,hint="")=>`<label class="sw"><div><div>${title}</di
 const field=(name,title,value="",attrs="",hint="")=>`<label class="f"><span>${title}</span><input name="${name}" value="${esc(value)}" ${attrs.includes("class=")?attrs:'class="in" '+attrs}>${hint?`<div class="hint">${hint}</div>`:""}</label>`;
 
 /* sheet */
+let sheetHist=false,ignorePop=false;
+window.addEventListener("popstate",()=>{if(ignorePop){ignorePop=false;return}sheetHist=false;if($("#ov"))closeSheet(true)});
 function sheet(html,onMount){
-  closeSheet();
+  closeSheet(true);
+  if(!sheetHist){try{history.pushState({sheet:1},"");sheetHist=true}catch(e){}}
   const ov=document.createElement("div");ov.className="ov";ov.id="ov";
   ov.innerHTML=`<div class="sheet" role="dialog"><div class="grab"></div>${html}</div>`;
   ov.addEventListener("click",e=>{if(e.target===ov)closeSheet()});
@@ -2265,23 +2489,24 @@ function sheet(html,onMount){
   onMount&&onMount(ov.firstChild);
   return ov.firstChild;
 }
-function closeSheet(){const o=$("#ov");if(o){o.remove();document.body.style.overflow=""}}
+function closeSheet(keepHist){const o=$("#ov");if(o){o.remove();document.body.style.overflow=""}if(!keepHist&&sheetHist){sheetHist=false;ignorePop=true;try{history.back()}catch(e){ignorePop=false}}}
 document.addEventListener("keydown",e=>{if(e.key==="Escape")closeSheet()});
 function confirmSheet(title,text,okLabel,danger){
   return new Promise(res=>{
+    let done=false;const finish=v=>{if(!done){done=true;res(v)}};
     sheet(`<h3>${ic(danger?"alert":"info")} ${title}</h3><p class="mut">${text}</p><div class="row-btns"><button class="btn ghost" data-r="0">انصراف</button><button class="btn ${danger?"danger":""}" data-r="1">${okLabel}</button></div>`,
-      el=>$$("[data-r]",el).forEach(b=>b.onclick=()=>{closeSheet();res(b.dataset.r==="1")}));
+      el=>{$$("[data-r]",el).forEach(b=>b.onclick=()=>{closeSheet();finish(b.dataset.r==="1")});new MutationObserver((m,o)=>{if(!document.body.contains(el)){o.disconnect();finish(false)}}).observe(document.body,{childList:true})});
   });
 }
 
 /* auth screens */
 function authView(){
   const setup=S.auth==="setup";
-  return `<div class="auth"><div class="box"><div class="logo">${ic("link")}</div><h1>xui-chain</h1>
+  return `<div class="auth"><div class="box"><div class="logo">EZ</div><h1>EZ-XUI</h1>
   <div class="mut">${setup?"اولین ورود: یه رمز برای پنل بذار":"برای ورود رمز پنل رو بزن"}</div>
   <form id="authf" class="card">
   <label class="f"><span>رمز</span><input class="in ltr" type="password" name="password" autocomplete="${setup?"new-password":"current-password"}" required minlength="${setup?6:1}" autofocus></label>
-  ${setup?`<label class="f"><span>تکرار رمز</span><input class="in ltr" type="password" name="password2" autocomplete="new-password" required></label><div class="hint">حداقل ۶ کاراکتر. اگه یادت رفت، روی سرور بزن: <span class="cmd">xui-chain password</span></div>`:""}
+  ${setup?`<label class="f"><span>تکرار رمز</span><input class="in ltr" type="password" name="password2" autocomplete="new-password" required></label><div class="hint">حداقل ۶ کاراکتر. اگه یادت رفت، روی سرور بزن: <span class="cmd">ez-xui password</span></div>`:""}
   <button class="btn block" style="margin-top:12px">${ic(setup?"shield":"lock")} ${setup?"ذخیره و ورود":"ورود"}</button></form></div></div>`;
 }
 function bindAuth(){
@@ -2296,16 +2521,17 @@ function bindAuth(){
 }
 
 /* layout */
-const TABS=[["home","home","خانه"],["users","users","کاربرها"],["decos","link","Decoها"],["settings","sliders","تنظیمات"]];
+const TABS=[["home","home","خانه"],["users","users","کاربرها"],["locations","globe","لوکیشن‌ها"],["decos","link","Decoها"],["settings","sliders","تنظیمات"]];
 function render(){
   const app=$("#app");
   if(!S.state){app.innerHTML=S.auth?authView():`<div class="wrap"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>`;bindAuth();return}
   const dark=document.documentElement.dataset.theme==="dark";
   const keepQ=document.activeElement&&document.activeElement.id==="q";
-  app.innerHTML=`<header class="top"><div class="inner"><div class="brand"><div class="logo">${ic("link")}</div><div><b>xui-chain</b><small>${esc(S.state.host)}</small></div></div>
+  app.innerHTML=`<header class="top"><div class="inner"><div class="brand"><div class="logo">EZ</div><div><b>EZ-XUI</b><small>${esc(S.state.host)}</small></div></div>
   <div class="hbtns"><button class="ibtn" data-act="refresh" title="به‌روزرسانی">${ic("refresh")}</button><button class="ibtn" data-act="theme" title="تم">${ic(dark?"sun":"moon")}</button></div></div></header>
-  <main class="wrap" id="main">${VIEWS[S.tab]()}</main>
+  <main class="wrap ${S.fade?"fade":""}" id="main">${(VIEWS[S.tab]||VIEWS.home)()}</main>
   <nav class="nav"><div class="inner">${TABS.map(([id,icon,l])=>`<button data-act="tab" data-tab="${id}" class="${S.tab===id?"on":""}">${ic(icon)}<span>${l}</span></button>`).join("")}</div></nav>`;
+  S.fade=false;
   if(S.tab==="users"){renderUserList();if(keepQ){const q=$("#q");q.focus();q.setSelectionRange(q.value.length,q.value.length)}}
 }
 
@@ -2333,7 +2559,7 @@ VIEWS.home=()=>{
    <div class="stat"><div class="k">${ic("users")} کاربر فعال</div><div class="v">${fa(active)} <small>از ${fa(users.length)}</small></div></div>
    <div class="stat"><div class="k">${ic("zap")} آنلاین</div><div class="v">${st.panel.ok?fa(online):"—"}</div></div>
    <div class="stat"><div class="k">${ic("link")} Deco سالم</div><div class="v">${fa(ds.ok)} <small>از ${fa(ds.nodes.length)}</small></div></div>
-   <div class="stat"><div class="k">${ic("globe")} مصرف کل</div><div class="v">${gb(used)} <small>GB</small></div></div>
+   ${multiLoc()?`<div class="stat"><div class="k">${ic("globe")} لوکیشن آنلاین</div><div class="v">${fa(st.locations.filter(l=>l.main||l.status==="online").length)} <small>از ${fa(st.locations.length)}</small></div></div>`:`<div class="stat"><div class="k">${ic("globe")} مصرف کل</div><div class="v">${gb(used)} <small>GB</small></div></div>`}
   </div>
   ${!st.panel.configured?`<div class="card"><h2>${ic("info")} پنل 3x-ui وصل نیست</h2><p class="mut">${st.settings.panel_auto&&st.settings.auto_note?esc(st.settings.auto_note):"برای ساخت و مدیریت کاربر از همین‌جا، پنل رو در تنظیمات وصل کن."}</p><button class="btn sm" data-act="goto-panel">رفتن به تنظیمات پنل</button></div>`:""}
   ${attention.length?`<div class="sec-title"><h3>نیاز به تمدید</h3><button class="btn sm ghost" data-act="tab" data-tab="users">همه</button></div><div class="card list-mini">${attention.map(u=>{const s=ustat(u);return `<div class="it" data-act="edit" data-sub="${esc(u.sub)}"><span class="ltr"><b>${esc(u.name)}</b></span><span class="badge b-${s[0]}">${s[0]==="soon"?daysText(u):s[1]}</span></div>`}).join("")}</div>`:""}
@@ -2369,6 +2595,7 @@ function renderUserList(){
   el.innerHTML=list.map(u=>{
     const s=ustat(u),p=pct(u.used,u.total);
     return `<div class="ucard"><div class="uhead"><div class="uname">${u.online!==null?`<span class="dot ${u.online?"on":""}" title="${u.online?"آنلاین":"آفلاین"}"></span>`:""}<b>${esc(u.name)}</b></div><span class="badge b-${s[0]}">${s[1]}</span></div>
+    ${multiLoc()?`<div class="locs">${userLocs(u).map(l=>`<span class="loc-chip">${esc(l.name)}</span>`).join("")||`<span class="loc-chip">بدون لوکیشن</span>`}</div>`:""}
     <div class="bar"><i class="${barCls(p)}" style="width:${u.total?p:4}%"></i></div>
     <div class="umeta"><span>${usage(u)}</span><span>${daysText(u)}</span></div>
     <div class="uacts"><button data-act="share" data-sub="${esc(u.sub)}" ${u.sub?"":"disabled"}>${ic("share")}<span>لینک</span></button><button data-act="edit" data-sub="${esc(u.sub)}">${ic("edit")}<span>تمدید</span></button><button data-act="umore" data-sub="${esc(u.sub)}" aria-label="بیشتر">${ic("more")}</button></div></div>`;
@@ -2376,6 +2603,9 @@ function renderUserList(){
 }
 document.addEventListener("input",e=>{if(e.target.id==="q"){S.q=e.target.value;renderUserList()}});
 const userBy=sub=>S.state.users.find(u=>u.sub===sub);
+const locOfInbound=id=>{const ib=S.state.inbounds.find(x=>x.id===id);if(!ib)return null;return S.state.locations.find(l=>l.main?!ib.node:l.id===ib.node)||null};
+const userLocs=u=>{const out=[];u.inbounds.forEach(id=>{const l=locOfInbound(id);if(l&&!out.includes(l))out.push(l)});return out};
+const multiLoc=()=>S.state.locations.length>1;
 
 function shareSheet(u){
   const link=linkOf(u);
@@ -2403,7 +2633,7 @@ function userForm(u){
    <label class="f"><span>دستگاه</span><input class="in ltr" name="devices" value="${u?u.devices:0}" inputmode="numeric"></label>
   </div><div class="hint">۰ یعنی نامحدود</div>
   ${sw("first_use",u?u.expiry<0:false,"روزها از اولین اتصال شروع شود","تا کاربر وصل نشده، زمانش نمی‌گذره")}
-  ${isNew?(ibs.length?`<div class="mut small" style="margin-top:6px">روی کدام inbound</div>${ibs.map((ib,k)=>`<label class="check"><input type="checkbox" name="inbound" value="${ib.id}" ${k===0?"checked":""}><span><b>${esc(ib.remark||"#"+ib.id)}</b> <span class="mut small ltr">${esc(ib.protocol)} · ${ib.port}</span></span></label>`).join("")}`:
+  ${isNew?(ibs.length?`<div class="mut small" style="margin-top:6px">${multiLoc()?"لوکیشن‌ها و inboundها":"روی کدام inbound"}</div>${st.locations.map(l=>{const list=ibs.filter(ib=>l.main?!ib.node:ib.node===l.id);if(!list.length)return "";return `${multiLoc()?`<div class="ib-head">${ic("globe")} ${esc(l.name)}</div>`:""}${list.map((ib,k)=>`<label class="check"><input type="checkbox" name="inbound" value="${ib.id}" ${k===0?"checked":""}><span><b>${esc(ib.remark||"#"+ib.id)}</b> <span class="mut small ltr">${esc(ib.protocol)} · ${ib.port}</span></span></label>`).join("")}`}).join("")}`:
    `<div class="err">${st.panel.configured?esc(st.panel.error||"inboundی پیدا نشد"):"اول پنل 3x-ui را در تنظیمات وصل کن."}</div>`):sw("zero",false,"مصرف صفر شود","برای شروع دوره‌ی جدید")}`;
 }
 function addUserSheet(){
@@ -2414,7 +2644,7 @@ function addUserSheet(){
     f.onsubmit=async e=>{e.preventDefault();const b=$("button:not([type=button])",f);
       const body={name:f.uname.value.trim(),gb:f.gb.value,days:f.days.value,devices:f.devices.value,first_use:f.first_use.checked,inbounds:$$("input[name=inbound]:checked",f).map(x=>+x.value)};
       if(!body.inbounds.length){toast("حداقل یک inbound انتخاب کن","bad");return}
-      const j=await act(b,"user_add",body);if(j.ok){closeSheet();shareSheet(userBy(j.sub)||{sub:j.sub,name:body.name})}};
+      const j=await act(b,"user_add",body);if(j.ok)shareSheet(userBy(j.sub)||{sub:j.sub,name:body.name})};
   });
 }
 function editSheet(u){
@@ -2434,6 +2664,70 @@ function moreSheet(u){
   <button data-act="u-enable" data-sub="${esc(u.sub)}" data-v="${u.enable?0:1}">${ic("power")} ${u.enable?"غیرفعال کردن":"فعال کردن"}</button>
   <button data-act="u-reset" data-sub="${esc(u.sub)}">${ic("refresh")} صفر کردن مصرف</button>
   <button class="danger" data-act="u-del" data-sub="${esc(u.sub)}">${ic("trash")} حذف کاربر</button></div>`);
+}
+
+/* locations */
+const FLAGS=["🇩🇪 آلمان","🇳🇱 هلند","🇫🇮 فنلاند","🇫🇷 فرانسه","🇬🇧 انگلیس","🇸🇪 سوئد","🇺🇸 آمریکا","🇨🇦 کانادا","🇹🇷 ترکیه","🇦🇪 امارات"];
+const NODE_CMD="bash <(curl -Ls https://raw.githubusercontent.com/saeedcrazy/xui-chain/main/node.sh)";
+const flagChips=()=>`<div class="chips">${FLAGS.map(f=>`<button type="button" class="chip" data-flag="${esc(f)}">${esc(f)}</button>`).join("")}</div>`;
+const bindFlags=(el,input)=>$$("[data-flag]",el).forEach(b=>b.onclick=()=>{input.value=b.dataset.flag;$$("[data-flag]",el).forEach(x=>x.classList.toggle("on",x===b))});
+const mainInbounds=()=>S.state.inbounds.filter(ib=>!ib.node);
+const templateSelect=()=>{const list=mainInbounds();const best=list.find(ib=>ib.security==="reality")||list[0];
+  return `<select class="in" name="template">${list.map(ib=>`<option value="${ib.id}" ${best&&ib.id===best.id?"selected":""}>${esc(ib.remark||"#"+ib.id)} · ${esc(ib.protocol)}${ib.security&&ib.security!=="none"?" · "+esc(ib.security):""} · ${ib.port}</option>`).join("")}</select>`};
+const usersOn=l=>S.state.users.filter(u=>u.inbounds.some(id=>l.inbounds.includes(id))).length;
+VIEWS.locations=()=>{
+  const st=S.state,p=st.panel;
+  if(!p.ok)return `<div class="card"><h2>${ic("globe")} لوکیشن‌ها</h2><p class="mut">${p.configured?esc(p.error||"پنل در دسترس نیست"):"اول پنل 3x-ui را در تنظیمات وصل کن."}</p><button class="btn sm" data-act="goto-panel">تنظیمات پنل</button></div>`;
+  if(p.version!==3)return `<div class="card"><h2>${ic("globe")} لوکیشن‌ها</h2><p class="mut">لوکیشن‌ها به 3x-ui نسخه‌ی ۳ نیاز دارند. روی سرور بزن <span class="cmd">x-ui update</span></p></div>`;
+  return `<div class="card"><h2>${ic("globe")} لوکیشن‌ها</h2><p class="mut small">سرورهای دیگه رو به‌عنوان لوکیشن اضافه کن. هر کاربر توی لینکش همه‌ی لوکیشن‌هایی که بهشون اضافه شده رو می‌بینه، هر کدوم هم با Decoها.</p>
+  <button class="btn block" data-act="loc-add">${ic("plus")} لوکیشن جدید</button></div>
+  ${st.locations.map(l=>{
+    const on=l.status==="online";const n=usersOn(l);
+    const ibs=st.inbounds.filter(ib=>l.inbounds.includes(ib.id));
+    return `<div class="lcard"><div class="lhead"><span class="prio">${ic("globe")}</span><div class="t"><b>${esc(l.name)}</b><small>${esc(l.address||"")}</small></div>
+    <span class="badge ${l.main||on?"b-on":l.status==="offline"?"b-exp":"b-off"}">${l.main?"این سرور":on?"آنلاین":l.status==="offline"?"آفلاین":"در حال اتصال"}</span></div>
+    <div class="lmeta"><span>${ic("users")} ${fa(n)} کاربر</span>${l.latency!=null&&!l.main?`<span>${ic("zap")} پینگ ${fa(l.latency)}ms</span>`:""}${l.cpu!=null&&!l.main?`<span>CPU ${fa(Math.round(l.cpu))}٪</span>`:""}${l.mem!=null&&!l.main?`<span>رم ${fa(Math.round(l.mem))}٪</span>`:""}</div>
+    ${l.error?`<div class="err">${esc(l.error)}</div>`:""}
+    <div class="locs">${ibs.map(ib=>`<span class="loc-chip ltr">${esc(ib.remark||ib.protocol)} · ${ib.port}</span>`).join("")||`<span class="loc-chip">هنوز inbound ندارد</span>`}</div>
+    <div class="row-btns">${l.main?`<button class="btn sm ghost" data-act="loc-rename">${ic("edit")} اسم این سرور</button>`:
+      (ibs.length?`<button class="btn sm ghost" data-act="loc-attach" data-id="${l.id}">${ic("users")} افزودن همه‌ی کاربرها</button>`:`<button class="btn sm" data-act="loc-setup" data-id="${l.id}">${ic("zap")} آماده‌سازی</button>`)+
+      `<button class="btn sm ghost icon" data-act="loc-del" data-id="${l.id}" aria-label="حذف">${ic("trash")}</button>`}</div></div>`}).join("")}`;
+};
+function locAddSheet(){
+  sheet(`<h3>${ic("plus")} لوکیشن جدید</h3><form id="lf">
+  <div class="step"><span class="n">۱</span>روی سرور جدید (با SSH) این رو بزن:</div>
+  <div class="code">${esc(NODE_CMD)}</div><button type="button" class="btn sm ghost" data-act="copy" data-text="${esc(NODE_CMD)}">${ic("copy")} کپی دستور</button>
+  <div class="hint">اگه 3x-ui روی اون سرور نیست، خودش نصبش می‌کنه. آخرش یه کد می‌ده که با <span class="cmd">EZXUI-</span> شروع می‌شه.</div>
+  <div class="step"><span class="n">۲</span>اسم لوکیشن</div>
+  <input class="in" name="lname" placeholder="🇩🇪 آلمان" required autocomplete="off">${flagChips()}
+  <div class="step"><span class="n">۳</span>کد رو اینجا بذار</div>
+  <textarea class="in" name="code" style="min-height:90px" placeholder="EZXUI-…"></textarea>
+  ${mainInbounds().length?`${sw("setup",true,"inbound مثل این سرور بساز","با همون پروتکل و پورت، روی سرور جدید")}<div id="tplbox">${templateSelect()}</div>${sw("attach",true,"همه‌ی کاربرها رو به این لوکیشن اضافه کن","لینک ساب همه‌شون این لوکیشن رو هم می‌گیره")}`:""}
+  <details style="margin-top:10px"><summary class="mut">کد ندارم (آدرس پنل و توکن)</summary>
+  ${field("purl","آدرس پنل سرور جدید","",'class="in ltr" placeholder="https://1.2.3.4:2053/path/"')}${field("ptoken","توکن API سرور جدید","",'class="in ltr" type="password" autocomplete="off"')}</details>
+  <button class="btn block" style="margin-top:14px">${ic("check")} افزودن لوکیشن</button></form>`,el=>{
+    const f=$("#lf",el);bindFlags(el,f.lname);
+    const setup=f.elements.namedItem("setup"),attach=f.elements.namedItem("attach");
+    if(setup)setup.onchange=()=>{$("#tplbox",el).style.display=setup.checked?"":"none"};
+    f.onsubmit=async e=>{e.preventDefault();
+      const body={name:f.lname.value.trim(),code:f.code.value.trim(),url:f.purl.value.trim(),token:f.ptoken.value.trim(),
+        template:setup&&setup.checked?+f.template.value:0,attach:!!(setup&&setup.checked&&attach&&attach.checked)};
+      if(!body.code&&!body.url){toast("کد لوکیشن رو بذار","bad");return}
+      const j=await act($("button:not([type=button])",f),"loc_add",body);
+      if(j.ok){closeSheet();S.tab="locations";render();setTimeout(()=>api("state",{},true).then(render).catch(()=>{}),6000)}};
+  });
+}
+function locSetupSheet(l){
+  sheet(`<h3>${ic("zap")} آماده‌سازی ${esc(l.name)}</h3><p class="mut small">یه inbound مثل inboundهای این سرور روی ${esc(l.name)} ساخته می‌شه.</p><form id="sf">
+  ${templateSelect()}${sw("attach",true,"همه‌ی کاربرها رو اضافه کن","")}
+  <button class="btn block" style="margin-top:12px">${ic("check")} انجام بده</button></form>`,el=>{
+    const f=$("#sf",el);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button",f),"loc_setup",{node:l.id,template:+f.template.value,attach:f.elements.namedItem("attach").checked});if(j.ok)closeSheet()}});
+}
+function locRenameSheet(){
+  sheet(`<h3>${ic("edit")} اسم این سرور</h3><form id="rnf"><input class="in" name="lname" value="${esc(S.state.settings.main_location)}" placeholder="🇫🇮 فنلاند" autocomplete="off">${flagChips()}
+  <div class="hint">توی اپ کاربرها، کانفیگ‌های این سرور با این اسم نشون داده می‌شن.</div>
+  <button class="btn block" style="margin-top:12px">${ic("check")} ذخیره</button></form>`,el=>{
+    const f=$("#rnf",el);bindFlags(el,f.lname);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button:not([type=button])",f),"settings",{main_location:f.lname.value.trim()});if(j.ok)closeSheet()}});
 }
 
 /* decos */
@@ -2485,14 +2779,14 @@ VIEWS.settings=()=>{
    ${sw("iran_direct",s.iran_direct,"سایت‌های ‎.ir بدون تونل","سایت‌های ایرانی مستقیم باز می‌شن")}
    <div class="mut small" style="margin-top:10px">اسم مسیرها در اپ کاربر</div>
    <div class="cols">${field("label_main","مستقیم",s.label_main,'class="in ltr"')}${field("label_deco","واسط‌ها",s.label_deco,'class="in ltr"')}${field("label_auto","خودکار",s.label_auto,'class="in ltr"')}</div>
-   ${field("title","اسم پروفایل در اپ",s.title,'placeholder="xui-chain"')}
+   ${field("title","اسم پروفایل در اپ",s.title,'placeholder="EZ-XUI"')}
    <button class="btn block">${ic("check")} ذخیره</button></form>
 
   <form class="card" data-sec="panel" id="panel-sec"><h2>${ic("server")} پنل 3x-ui</h2>
    <div class="badge ${p.ok?"b-on":p.configured?"b-exp":"b-off"}" style="margin:4px 0 8px">${p.ok?"وصل"+(s.panel_source==="auto"?"، خودکار":"، دستی")+"، API نسخه‌ی "+fa(p.version||""):p.configured?"خطا":"وصل نیست"}</div>
    ${p.error?`<div class="err">${esc(p.error)}</div>`:""}
    <p class="mut small">برای ساخت و مدیریت کاربر از همین‌جا.</p>
-   ${sw("panel_auto",s.panel_auto,"اتصال خودکار از روی سرور","xui-chain خودش از روی همین سرور به پنل وصل می‌شه و یه توکن به اسم xui-chain در پنل می‌سازه (در Settings ← API Tokens پنل دیده می‌شه).")}
+   ${sw("panel_auto",s.panel_auto,"اتصال خودکار از روی سرور","EZ-XUI خودش از روی همین سرور به پنل وصل می‌شه و یه توکن به اسم xui-chain در پنل می‌سازه (در Settings ← API Tokens پنل دیده می‌شه).")}
    ${s.panel_auto&&s.auto_note?`<div class="hint">${ic("info")} ${esc(s.auto_note)}</div>`:""}
    <div class="row-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="panel-auto">${ic("zap")} اتصال خودکار الان</button></div>
    <details style="margin-top:12px" ${s.panel_source==="manual"||(!s.panel_auto)?"open":""}><summary class="mut" style="cursor:pointer">اتصال دستی (اختیاری)</summary>
@@ -2522,8 +2816,8 @@ VIEWS.settings=()=>{
 
   <div class="card"><h2>${ic("info")} درباره</h2>
    <div class="kv"><span>نسخه</span><span class="ltr">${esc(S.state.version)}</span></div>
-   <div class="kv"><span>به‌روزرسانی</span><span class="cmd">xui-chain update</span></div>
-   <div class="kv"><span>رمز یادت رفت؟</span><span class="cmd">xui-chain password</span></div></div>`;
+   <div class="kv"><span>به‌روزرسانی</span><span class="cmd">ez-xui update</span></div>
+   <div class="kv"><span>رمز یادت رفت؟</span><span class="cmd">ez-xui password</span></div></div>`;
 };
 document.addEventListener("submit",async e=>{
   const f=e.target;
@@ -2537,7 +2831,7 @@ document.addEventListener("submit",async e=>{
 
 /* actions */
 const ACTS={
-  tab:b=>{S.tab=b.dataset.tab;try{localStorage.setItem("xc_tab",S.tab)}catch(e){}closeSheet();render();scrollTo(0,0)},
+  tab:b=>{if(S.tab===b.dataset.tab&&!$("#ov")){scrollTo({top:0,behavior:"smooth"});return}S.tab=b.dataset.tab;S.fade=true;try{localStorage.setItem("xc_tab",S.tab)}catch(e){}closeSheet();render();scrollTo(0,0)},
   theme:()=>{const dark=document.documentElement.dataset.theme==="dark";S.theme=dark?"light":"dark";try{localStorage.setItem("xc_theme",S.theme)}catch(e){}applyTheme();render()},
   refresh:b=>act(b,"state",{}),
   test:b=>act(b,"test",{}),
@@ -2556,6 +2850,11 @@ const ACTS={
   "deco-move":b=>{const l=decoLines(),i=+b.dataset.i,j=i+(+b.dataset.d);[l[i],l[j]]=[l[j],l[i]];saveDecos(l,null)},
   "deco-del":async b=>{const i=+b.dataset.i,d=S.state.decos[i];if(await confirmSheet("حذف Deco","<span class=\"ltr\">"+esc(d.title)+"</span> از فهرست حذف بشه؟","حذف کن",true)){const l=decoLines();l.splice(i,1);saveDecos(l,null)}},
   "panel-test":b=>act(b,"panel_test",{}),
+  "loc-add":()=>locAddSheet(),
+  "loc-rename":()=>locRenameSheet(),
+  "loc-setup":b=>{const l=S.state.locations.find(x=>x.id===+b.dataset.id);if(l)locSetupSheet(l)},
+  "loc-attach":async b=>{const l=S.state.locations.find(x=>x.id===+b.dataset.id);if(l&&await confirmSheet("افزودن همه‌ی کاربرها","همه‌ی کاربرها به "+esc(l.name)+" اضافه می‌شن و لینک‌شون این لوکیشن رو هم می‌گیره.","اضافه کن"))act(null,"loc_attach",{node:l.id})},
+  "loc-del":async b=>{const l=S.state.locations.find(x=>x.id===+b.dataset.id);if(l&&await confirmSheet("حذف لوکیشن",esc(l.name)+" و inboundهاش از پنل حذف می‌شن. خود 3x-ui روی اون سرور دست نمی‌خوره.","حذف کن",true))act(null,"loc_delete",{node:l.id})},
   "panel-auto":b=>act(b,"panel_auto",{}),
   "tg-test":b=>act(b,"tgtest",{}),
   "goto-panel":()=>{closeSheet();S.tab="settings";render();setTimeout(()=>{const p=$("#panel-sec");p&&p.scrollIntoView({behavior:"smooth"})},50)},
@@ -2783,6 +3082,15 @@ def main(argv):
         set_password(password)
         print("admin password: %s" % password)
         return 0
+    if cmd == "location-code":
+        if len(argv) < 3:
+            print("usage: xui_chain.py location-code <api-token> [address]")
+            return 2
+        s = xui_settings()
+        address = s.get("webDomain") or (argv[3] if len(argv) > 3 else "")
+        scheme = "https" if s.get("webCertFile") and s.get("webKeyFile") else "http"
+        print(location_code(scheme, address, s.get("webPort") or "2053", s.get("webBasePath") or "/", argv[2]))
+        return 0
     if cmd == "has-password":
         return 0 if load_config().get("admin_pass") else 1
     app = App()
@@ -2793,7 +3101,7 @@ def main(argv):
         scheme = "https" if rt.get("cert_file") else "http"
         host = rt.get("public_host") or "<server-ip>"
         print("admin page : %s://%s:%s/%s/" % (scheme, host, rt["port"], rt["admin_path"]))
-        print("password   : %s" % ("set (change it with: xui-chain password)" if app.cfg.get("admin_pass")
+        print("password   : %s" % ("set (change it with: ez-xui password)" if app.cfg.get("admin_pass")
                                    else "not set yet, choose one on the admin page"))
         print("user links : %s://%s:%s/%s/<subId>" % (scheme, host, rt["port"], rt["sub_path"]))
         print("panel sub  : %s" % rt["xui_sub_url"])

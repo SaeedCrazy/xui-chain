@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# xui-chain installer: chained subscriptions for a 3x-ui panel.
+# EZ-XUI installer: chained subscriptions and an easy admin panel for 3x-ui.
 #   bash <(curl -Ls https://raw.githubusercontent.com/saeedcrazy/xui-chain/main/install.sh)
 set -euo pipefail
 
@@ -25,7 +25,7 @@ fi
 
 mkdir -p "$APP_DIR" "$CONF_DIR"
 chmod 700 "$CONF_DIR"
-echo "Downloading xui-chain..."
+echo "Downloading EZ-XUI..."
 curl -fsSL "$REPO_RAW/xui_chain.py" -o "$APP_DIR/xui_chain.py.new"
 python3 -m py_compile "$APP_DIR/xui_chain.py.new"
 mv "$APP_DIR/xui_chain.py.new" "$APP_DIR/xui_chain.py"
@@ -41,7 +41,7 @@ PORT=$(python3 -c "import json;print(json.load(open('$CONF_DIR/config.json')).ge
 
 cat > /etc/systemd/system/xui-chain.service <<EOF
 [Unit]
-Description=xui-chain (chained subscriptions for 3x-ui)
+Description=EZ-XUI (chained subscriptions and admin panel for 3x-ui)
 After=network-online.target x-ui.service
 Wants=network-online.target
 
@@ -62,11 +62,12 @@ case "\${1:-info}" in
   restart)   systemctl restart xui-chain && echo restarted ;;
   log)       journalctl -u xui-chain -n 50 --no-pager ;;
   update)    bash $APP_DIR/install.sh ;;
-  uninstall) systemctl disable --now xui-chain; rm -f /etc/systemd/system/xui-chain.service /usr/local/bin/xui-chain; rm -rf $APP_DIR; echo "removed (settings kept in $CONF_DIR)" ;;
-  *)         echo "usage: xui-chain [info|password [new]|restart|log|update|uninstall]" ;;
+  uninstall) systemctl disable --now xui-chain; rm -f /etc/systemd/system/xui-chain.service /usr/local/bin/xui-chain /usr/local/bin/ez-xui; rm -rf $APP_DIR; echo "removed (settings kept in $CONF_DIR)" ;;
+  *)         echo "usage: ez-xui [info|password [new]|restart|log|update|uninstall]" ;;
 esac
 EOF
 chmod +x /usr/local/bin/xui-chain
+ln -sf /usr/local/bin/xui-chain /usr/local/bin/ez-xui
 
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow "$PORT"/tcp >/dev/null && echo "ufw: opened port $PORT"
@@ -77,7 +78,7 @@ systemctl enable xui-chain >/dev/null 2>&1
 systemctl restart xui-chain
 sleep 2
 if ! systemctl is-active --quiet xui-chain; then
-  red "xui-chain failed to start:"; journalctl -u xui-chain -n 20 --no-pager; exit 1
+  red "EZ-XUI failed to start:"; journalctl -u xui-chain -n 20 --no-pager; exit 1
 fi
 
 PASS_LINE=""
@@ -87,9 +88,9 @@ fi
 
 IP=$(curl -fs4 --max-time 5 https://api.ipify.org || hostname -I | awk '{print $1}')
 INFO=$(python3 "$APP_DIR/xui_chain.py" info | sed "s/<server-ip>/$IP/")
-green "xui-chain is running."
+green "EZ-XUI is running."
 echo "$INFO"
 [ -n "$PASS_LINE" ] && green "$PASS_LINE"
 echo
 echo "Open the admin page link above in your phone browser."
-echo "Commands: xui-chain info | password | restart | log | update | uninstall"
+echo "Commands: ez-xui info | password | restart | log | update | uninstall"

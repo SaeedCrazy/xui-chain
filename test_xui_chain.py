@@ -306,7 +306,7 @@ class EndToEnd(unittest.TestCase):
     def test_admin_page_is_static_and_hardened(self):
         status, h, page = self.get("/adm1n/")
         self.assertEqual(status, 200)
-        self.assertIn("<title>xui-chain</title>", page)
+        self.assertIn("<title>EZ-XUI</title>", page)
         self.assertEqual(h["Referrer-Policy"], "no-referrer")
         self.assertIn("frame-ancestors 'none'", h["Content-Security-Policy"])
         self.assertEqual(self.get("/adm1n")[0], 200)  # redirected to the slash
@@ -600,6 +600,7 @@ class FakeXUI(BaseHTTPRequestHandler):
     mode = "v3"
     added, calls = [], []
     logins = 0
+    nodes = []
     OLD = {"id": 7, "uuid": "11111111-1111-1111-1111-111111111111", "email": "old", "subId": "oldsub",
            "flow": "xtls-rprx-vision", "totalGB": 10 * GB, "expiryTime": 0, "enable": True, "limitIp": 1,
            "limitHwid": 2, "comment": "", "createdAt": 1, "updatedAt": 2}
@@ -631,6 +632,8 @@ class FakeXUI(BaseHTTPRequestHandler):
             return self.reply(200, {"success": True, "obj": "csrf1"}, cookie=None if self.session() else "anon")
         if not self.path.startswith("/base/panel/api/") or not self.session():
             return self.reply(404)
+        if self.path == "/base/panel/api/nodes/list" and v3:
+            return self.reply(200, {"success": True, "obj": FakeXUI.nodes})
         if self.path == "/base/panel/api/inbounds/list":
             old = {k: FakeXUI.OLD[k] for k in ("email", "subId", "flow", "totalGB", "expiryTime", "enable", "limitIp")}
             old["id"] = FakeXUI.OLD["uuid"]
@@ -640,7 +643,11 @@ class FakeXUI(BaseHTTPRequestHandler):
                  "clientStats": [{"email": "old", "up": GB, "down": GB, "total": 10 * GB, "expiryTime": 0}]},
                 {"id": 2, "remark": "ss22", "protocol": "shadowsocks", "port": 1080, "enable": True,
                  "settings": json.dumps({"method": "2022-blake3-aes-128-gcm", "clients": []})},
-                {"id": 3, "remark": "wg", "protocol": "wireguard", "port": 51820, "enable": True, "settings": "{}"}]})
+                {"id": 3, "remark": "wg", "protocol": "wireguard", "port": 51820, "enable": True, "settings": "{}"},
+                {"id": 4, "remark": "tls", "protocol": "vless", "port": 8443, "enable": True, "settings": "{}",
+                 "streamSettings": json.dumps({"security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "/root/c.pem"}]}})}]
+                + [{"id": 100 + n["id"], "remark": n["remark"], "protocol": "vless", "port": 443, "enable": True,
+                    "settings": "{}", "nodeId": n["id"]} for n in FakeXUI.nodes if n.get("ready")]})
         if v3 and self.path.startswith("/base/panel/api/clients/get/"):
             email = urllib.parse.unquote(self.path.rsplit("/", 1)[1])
             if email != "old":
@@ -668,6 +675,27 @@ class FakeXUI(BaseHTTPRequestHandler):
             FakeXUI.calls.append((path, data))
         elif not v3 and re.fullmatch(r"inbounds/(updateClient/1111.*|1/delClient/1111.*|1/resetClientTraffic/old)", path):
             FakeXUI.calls.append((path, data))
+        elif v3 and path in ("nodes/add", "nodes/certFingerprint") or (v3 and re.fullmatch(r"nodes/(update|del)/\d+", path)):
+            FakeXUI.calls.append((path, data))
+            if path == "nodes/certFingerprint":
+                return self.reply(200, {"success": True, "obj": "FP=="})
+            if path.startswith("nodes/del/"):
+                FakeXUI.nodes = [n for n in FakeXUI.nodes if n["id"] != int(path.rsplit("/", 1)[1])]
+                return self.reply(200, {"success": True})
+            if data.get("address") == "self.signed" and data.get("tlsVerifyMode") == "verify":
+                return self.reply(200, {"success": False, "msg": "x509: certificate signed by unknown authority"})
+            if path.startswith("nodes/update/"):
+                return self.reply(200, {"success": True})
+            node = {"id": len(FakeXUI.nodes) + 1, "name": data["name"], "remark": data["remark"], "address": data["address"],
+                    "port": data["port"], "status": "online", "latencyMs": 40}
+            FakeXUI.nodes.append(node)
+            return self.reply(200, {"success": True, "obj": node})
+        elif v3 and path in ("inbounds/add", "clients/bulkAttach") or re.fullmatch(r"inbounds/del/\d+", path):
+            FakeXUI.calls.append((path, data))
+            if path == "inbounds/add":
+                return self.reply(200, {"success": True, "obj": {"id": 42}})
+            if path == "clients/bulkAttach":
+                return self.reply(200, {"success": True, "obj": {"attached": data["emails"], "skipped": [], "errors": []}})
         elif path in ("clients/onlines", "inbounds/onlines") and (path.startswith("clients") == v3):
             return self.reply(200, {"success": True, "obj": ["old"]})
         else:
@@ -697,6 +725,7 @@ class PanelTests(unittest.TestCase):
         FakeXUI.added.clear()
         FakeXUI.calls.clear()
         FakeXUI.logins = 0
+        FakeXUI.nodes = []
 
     def app(self, **cfg):
         a = type("A", (), {})()
@@ -710,7 +739,7 @@ class PanelTests(unittest.TestCase):
 
     def test_v3_login_csrf_and_add(self):
         a, api = self.app(panel_user="admin", panel_pass="pw")
-        self.assertEqual([ib["protocol"] for ib in api.inbounds()], ["vless", "shadowsocks", "wireguard"])
+        self.assertEqual([ib["protocol"] for ib in api.inbounds()], ["vless", "shadowsocks", "wireguard", "vless"])
         before = time.time()
         sub = api.add_client("ali", 25, 30, 2, False, [1, 2])
         self.assertRegex(sub, r"^[a-z0-9]{16}$")
@@ -851,6 +880,75 @@ class PanelTests(unittest.TestCase):
             cfg.update(auto_token="", panel_auto=True)
             xc.save_config(cfg)
 
+    def test_locations(self):
+        xc.save_config(dict(xc.load_config(), panel_user="admin", panel_pass="pw", panel_auto=False, locations={}))
+        app = xc.App(db_path=self.db)
+        code = xc.location_code("https", "de.example.com", 2053, "/p4th/", "nodetok")
+        self.assertTrue(code.startswith("EZXUI-"))
+        self.assertEqual(xc.parse_location("  " + code + "\n"), {"scheme": "https", "address": "de.example.com",
+                                                                 "port": 2053, "basePath": "/p4th/", "token": "nodetok"})
+        self.assertEqual(xc.parse_location(url="http://5.6.7.8:54321/x/", token=" t "),
+                         {"scheme": "http", "address": "5.6.7.8", "port": 54321, "basePath": "/x/", "token": "t"})
+        for bad in [dict(code="EZXUI-!!!"), dict(url="5.6.7.8"), dict(url="https://a.b/", token="")]:
+            with self.assertRaises(xc.PanelError):
+                xc.parse_location(**bad)
+        # add with a code, build an inbound like the reality one and attach every user
+        status, out = xc.do_action(app, "loc_add", {"name": "🇩🇪 آلمان", "code": code, "template": 1, "attach": True}, "h:1")
+        self.assertTrue(out["ok"], out)
+        paths = [c[0] for c in FakeXUI.calls]
+        self.assertEqual(paths, ["nodes/add", "inbounds/add", "clients/bulkAttach"])
+        node_body, ib_body, attach = (c[1] for c in FakeXUI.calls)
+        self.assertEqual((node_body["remark"], node_body["address"], node_body["port"], node_body["basePath"],
+                          node_body["apiToken"], node_body["tlsVerifyMode"]),
+                         ("🇩🇪 آلمان", "de.example.com", 2053, "/p4th/", "nodetok", "verify"))
+        self.assertEqual((ib_body["nodeId"], ib_body["port"], ib_body["protocol"], ib_body["settings"]["clients"]),
+                         (1, 443, "vless", []))
+        self.assertEqual(attach, {"emails": ["old"], "inboundIds": [42]})
+        locs = out["state"]["locations"]
+        self.assertEqual([(l["id"], l["name"], l["main"]) for l in locs], [(0, "سرور اصلی", True), (1, "🇩🇪 آلمان", False)])
+        self.assertEqual(xc.load_config()["locations"], {"de.example.com": "🇩🇪 آلمان"})
+        # a TLS inbound with certificate files cannot be copied to another server
+        self.assertIn("Reality", xc.do_action(app, "loc_setup", {"node": 1, "template": 4}, "h")[1]["error"])
+        # the same server again only updates its token
+        FakeXUI.calls.clear()
+        xc.do_action(app, "loc_add", {"name": "DE", "code": xc.location_code("https", "de.example.com", 2053, "/", "new")}, "h")
+        self.assertEqual(FakeXUI.calls[0][0], "nodes/update/1")
+        self.assertEqual(len(FakeXUI.nodes), 1)
+        # self-signed certificate: pinned
+        FakeXUI.calls.clear()
+        out = xc.do_action(app, "loc_add", {"name": "NL", "url": "https://self.signed:2053/", "token": "t"}, "h")[1]
+        self.assertTrue(out["ok"], out)
+        self.assertEqual([c[0] for c in FakeXUI.calls], ["nodes/add", "nodes/certFingerprint", "nodes/add"])
+        self.assertEqual((FakeXUI.calls[2][1]["tlsVerifyMode"], FakeXUI.calls[2][1]["pinnedCertSha256"]), ("pin", "FP=="))
+        # add every user to a location that has inbounds, then delete it with its inbounds
+        FakeXUI.nodes[0]["ready"] = True
+        app.panel.forget()
+        FakeXUI.calls.clear()
+        out = xc.do_action(app, "loc_attach", {"node": 1}, "h")[1]
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(FakeXUI.calls[-1], ("clients/bulkAttach", {"emails": ["old"], "inboundIds": [101]}))
+        out = xc.do_action(app, "loc_delete", {"node": 1}, "h")[1]
+        self.assertTrue(out["ok"], out)
+        self.assertEqual([c[0] for c in FakeXUI.calls[-2:]], ["inbounds/del/101", "nodes/del/1"])
+        self.assertEqual(xc.load_config()["locations"], {"self.signed": "NL"})
+        FakeXUI.mode = "v2"
+        app.panel.cookies, app.panel.version = {}, None
+        app.panel.forget()
+        self.assertIn("نسخه‌ی ۳", xc.do_action(app, "loc_attach", {"node": 1}, "h")[1]["error"])
+        xc.save_config(dict(xc.load_config(), locations={}))
+
+    def test_location_labels(self):
+        rt = dict(xc.DEFAULTS)
+        own = xc.parse_nodes(OWN[:1] + [OWN[0].replace("203.0.113.10", "de.example.com").replace("#user1-reality", "#x|📊1GB")])
+        self.assertEqual([xc.location_label(n, rt) for n in own], ["user1-reality", "x"])
+        rt.update(locations={"de.example.com": "🇩🇪 آلمان"}, main_location="🇫🇮 فنلاند")
+        self.assertEqual([xc.location_label(n, rt) for n in own], ["🇫🇮 فنلاند", "🇩🇪 آلمان"])
+        for n in own:
+            n["name"] = xc.location_label(n, rt)
+        confs = json.loads(xc.build_xray(own, xc.parse_nodes(UPS[1:2]), rt, "t")[0])
+        self.assertEqual([c["remarks"] for c in confs],
+                         ["⚡ Auto", "🇫🇮 فنلاند · Main", "🇩🇪 آلمان · Main", "🇫🇮 فنلاند · Deco1", "🇩🇪 آلمان · Deco1"])
+
     def test_admin_api_user_management(self):
         xc.save_config(dict(xc.load_config(), admin_path="adm2", panel_user="admin", panel_pass="pw"))
         xc.set_password("secret1")
@@ -867,7 +965,7 @@ class PanelTests(unittest.TestCase):
         try:
             st = call("login", {"password": "secret1"})["state"]
             self.assertTrue(st["panel"]["ok"])
-            self.assertEqual([ib["id"] for ib in st["inbounds"]], [1, 2])  # wireguard is not offered
+            self.assertEqual([ib["id"] for ib in st["inbounds"]], [1, 2, 4])  # wireguard is not offered
             self.assertEqual([(u["name"], u["sub"], u["used"], u["online"]) for u in st["users"]],
                              [("old", "oldsub", 2 * GB, True)])  # from the panel API: no clients in the DB
             out = call("user_add", {"name": "mina", "gb": 5, "days": 10, "devices": 1, "inbounds": [1]})
