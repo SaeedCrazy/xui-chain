@@ -58,11 +58,12 @@ cat > /usr/local/bin/xui-chain <<EOF
 #!/usr/bin/env bash
 case "\${1:-info}" in
   info)      python3 $APP_DIR/xui_chain.py info ;;
+  password)  python3 $APP_DIR/xui_chain.py password "\${@:2}" ;;
   restart)   systemctl restart xui-chain && echo restarted ;;
   log)       journalctl -u xui-chain -n 50 --no-pager ;;
   update)    bash $APP_DIR/install.sh ;;
   uninstall) systemctl disable --now xui-chain; rm -f /etc/systemd/system/xui-chain.service /usr/local/bin/xui-chain; rm -rf $APP_DIR; echo "removed (settings kept in $CONF_DIR)" ;;
-  *)         echo "usage: xui-chain [info|restart|log|update|uninstall]" ;;
+  *)         echo "usage: xui-chain [info|password [new]|restart|log|update|uninstall]" ;;
 esac
 EOF
 chmod +x /usr/local/bin/xui-chain
@@ -79,10 +80,16 @@ if ! systemctl is-active --quiet xui-chain; then
   red "xui-chain failed to start:"; journalctl -u xui-chain -n 20 --no-pager; exit 1
 fi
 
+PASS_LINE=""
+if ! python3 "$APP_DIR/xui_chain.py" has-password; then
+  PASS_LINE=$(python3 "$APP_DIR/xui_chain.py" password)
+fi
+
 IP=$(curl -fs4 --max-time 5 https://api.ipify.org || hostname -I | awk '{print $1}')
 INFO=$(python3 "$APP_DIR/xui_chain.py" info | sed "s/<server-ip>/$IP/")
 green "xui-chain is running."
 echo "$INFO"
+[ -n "$PASS_LINE" ] && green "$PASS_LINE"
 echo
 echo "Open the admin page link above in your phone browser."
-echo "Commands: xui-chain info | restart | log | update | uninstall"
+echo "Commands: xui-chain info | password | restart | log | update | uninstall"

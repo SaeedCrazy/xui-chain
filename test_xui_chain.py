@@ -1,8 +1,10 @@
 """Tests: python3 -m unittest -v test_xui_chain.py"""
 
 import base64
+import http.cookiejar
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -284,35 +286,96 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.get("/wrong/")[0], 404)
         self.assertEqual(self.get("/")[0], 404)
 
-    def test_admin_page_and_save(self):
-        status, _, page = self.get("/adm1n/")
+    def admin(self, action, body=None, xc_header=True):
+        req = urllib.request.Request("%s/adm1n/api/%s" % (self.base, action), data=json.dumps(body or {}).encode(),
+                                     headers={"Content-Type": "application/json", **({"X-XC": "1"} if xc_header else {})})
+        try:
+            with self.opener.open(req, timeout=20) as r:
+                return r.status, json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode() or "{}")
+
+    def login(self):
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        if not xc.load_config().get("admin_pass"):
+            xc.set_password("secret1")
+        status, out = self.admin("login", {"password": "secret1"})
+        self.assertTrue(out["ok"], out)
+        return out
+
+    def test_admin_page_is_static_and_hardened(self):
+        status, h, page = self.get("/adm1n/")
         self.assertEqual(status, 200)
-        self.assertIn("ali", page)
-        self.assertIn("/chain/abc", page)
-        form = urllib.parse.urlencode({"upstreams": self.friend + "\n" + UPS[3], "title": "من",
-                                       "xui_sub_url": "auto", "iran_direct": "on"}).encode()
-        status, _, page = self.get("/adm1n/save", data=form)
-        self.assertEqual(status, 200)  # followed the redirect
-        self.assertIn("ذخیره شد", page)
+        self.assertIn("<title>xui-chain</title>", page)
+        self.assertEqual(h["Referrer-Policy"], "no-referrer")
+        self.assertIn("frame-ancestors 'none'", h["Content-Security-Policy"])
+        self.assertEqual(self.get("/adm1n")[0], 200)  # redirected to the slash
+        self.assertEqual(self.get("/nope/api/state", data=b"{}")[0], 404)
+
+    def test_admin_auth_flow(self):
+        cfg = xc.load_config()
+        cfg["admin_pass"] = ""
+        xc.save_config(cfg)
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.assertEqual(self.admin("state", xc_header=False)[0], 403)
+        self.assertEqual(self.admin("state"), (401, {"ok": False, "auth": "setup"}))
+        self.assertIn("حداقل", self.admin("setup", {"password": "123"})[1]["error"])
+        status, out = self.admin("setup", {"password": "secret1"})
+        self.assertTrue(out["ok"])
+        self.assertIn("users", out["state"])
+        self.assertEqual(self.admin("setup", {"password": "other99"})[0], 400)  # only once
+        self.assertTrue(self.admin("state")[1]["ok"])
+        self.assertTrue(self.admin("logout")[1]["ok"])
+        self.assertEqual(self.admin("state"), (401, {"ok": False, "auth": "login"}))
+        self.assertEqual(self.admin("login", {"password": "nope"})[1]["error"], "رمز درست نیست")
+        self.assertTrue(self.admin("login", {"password": "secret1"})[1]["ok"])
+        # changing the password signs every session out
+        self.assertEqual(self.admin("password", {"old": "x", "new": "newpass1"})[1]["error"], "رمز فعلی درست نیست")
+        status, out = self.admin("password", {"old": "secret1", "new": "newpass1"})
+        self.assertTrue(out["ok"])
+        self.assertTrue(self.admin("state")[1]["ok"])  # this browser got a fresh cookie
+        stale = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.opener, mine = stale, self.opener
+        self.assertTrue(self.admin("login", {"password": "newpass1"})[1]["ok"])
+        self.opener = mine
+        # brute force lock
+        self.app.auth.fails.clear()
+        for _ in range(5):
+            self.admin("login", {"password": "wrong"})
+        status, out = self.admin("login", {"password": "newpass1"})
+        self.assertEqual(status, 429)
+        self.app.auth.fails.clear()
+        xc.set_password("secret1")
+
+    def test_admin_state_decos_and_settings(self):
+        out = self.login()
+        st = out["state"]
+        self.assertEqual([(u["name"], u["sub"]) for u in st["users"]], [("ali", "abc")])
+        self.assertTrue(st["base"].endswith("/chain/"))
+        status, out = self.admin("decos", {"lines": ["vless://broken", UPS[3]]})
+        self.assertFalse(out["ok"])
+        self.assertIn("قابل استفاده نیستند", out["error"])
+        self.assertEqual(xc.UPSTREAMS.lines(), UPS[1:3])  # unchanged
+        status, out = self.admin("decos", {"lines": [self.friend, UPS[3], ""]})
+        self.assertTrue(out["ok"], out)
+        decos = out["state"]["decos"]
+        self.assertEqual([d["kind"] for d in decos], ["sub", "link"])
+        self.assertEqual([[n["n"] for n in d["nodes"]] for d in decos], [[1, 2], [3]])
+        self.assertEqual(decos[0]["quota"]["total"], 50 * GB)
+        status, out = self.admin("settings", {"title": "من", "direct_first": False, "panel_pass": "",
+                                              "tg_token": None, "monitor_minutes": "1"})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["state"]["settings"]["monitor_minutes"], 2)
         self.assertFalse(self.app.cfg["direct_first"])
-        nodes = xc.UPSTREAMS.nodes()
-        self.assertEqual([n["name"] for n in nodes], ["friend-a", "friend-b", "friend-d"])
-        self.assertEqual(nodes[0]["src"], self.friend)
-        self.assertIn("45.0 از 50.0 GB مانده", page)
-        self.assertIn("⏳ 9 روز", page)
         status, h, body = self.get("/chain/abc", ua="clash.meta")
-        self.assertEqual(status, 200)
         self.assertIn("filename*=UTF-8''%D9%85%D9%86.yaml", h["Content-Disposition"])
         if yaml:
             prof = yaml.safe_load(body)
             auto = next(g for g in prof["proxy-groups"] if g["name"] == "⚡ Auto")["proxies"]
             self.assertTrue(auto and all(n.endswith("Deco") for n in auto))
-        xc.save_upstreams_text("\n".join(UPS[1:3]))
-        self.app.cfg["direct_first"] = True
-        self.app.rt["direct_first"] = True
-
-    def test_wrong_admin_post(self):
-        self.assertEqual(self.get("/nope/save", data=b"upstreams=x")[0], 404)
+        self.admin("decos", {"lines": UPS[1:3]})
+        self.admin("settings", {"title": "", "direct_first": True})
+        self.assertFalse(self.admin("user_add", {"name": "x", "inbounds": [1]})[1]["ok"])  # no panel connected
 
 
 @unittest.skipIf(shutil.which("openssl") is None, "openssl not installed")
@@ -370,7 +433,8 @@ class PanelCertificate(unittest.TestCase):
             client.check_hostname = False
             with urllib.request.urlopen("https://127.0.0.1:%d%s" % (port, admin), timeout=10, context=client) as r:
                 page = r.read().decode()
-            self.assertIn("https://panel.example.com:", page)
+            self.assertIn("xui-chain", page)
+            self.assertTrue(xc.link_base(app.rt, "1.2.3.4:9").startswith("https://panel.example.com:"))
             # a client that never finishes the handshake does not block others
             idle = socket.create_connection(("127.0.0.1", port))
             idle.sendall(b"\x16")
@@ -532,10 +596,13 @@ class MonitorTests(unittest.TestCase):
 
 
 class FakeXUI(BaseHTTPRequestHandler):
-    """3x-ui panel API: mode "v3" (CSRF, /clients/add) or "v2" (/inbounds/addClient)."""
+    """3x-ui panel API: mode "v3" (CSRF, /clients/*) or "v2" (/inbounds/* client calls)."""
     mode = "v3"
-    added = []
+    added, calls = [], []
     logins = 0
+    OLD = {"id": 7, "uuid": "11111111-1111-1111-1111-111111111111", "email": "old", "subId": "oldsub",
+           "flow": "xtls-rprx-vision", "totalGB": 10 * GB, "expiryTime": 0, "enable": True, "limitIp": 1,
+           "limitHwid": 2, "comment": "", "createdAt": 1, "updatedAt": 2}
 
     def log_message(self, *a):
         pass
@@ -559,17 +626,26 @@ class FakeXUI(BaseHTTPRequestHandler):
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
 
     def do_GET(self):
-        if self.path == "/base/csrf-token" and FakeXUI.mode == "v3":
+        v3 = FakeXUI.mode == "v3"
+        if self.path == "/base/csrf-token" and v3:
             return self.reply(200, {"success": True, "obj": "csrf1"}, cookie=None if self.session() else "anon")
         if not self.path.startswith("/base/panel/api/") or not self.session():
             return self.reply(404)
         if self.path == "/base/panel/api/inbounds/list":
+            old = {k: FakeXUI.OLD[k] for k in ("email", "subId", "flow", "totalGB", "expiryTime", "enable", "limitIp")}
+            old["id"] = FakeXUI.OLD["uuid"]
             return self.reply(200, {"success": True, "obj": [
                 {"id": 1, "remark": "reality", "protocol": "vless", "port": 443, "enable": True,
-                 "settings": json.dumps({"clients": [{"email": "old", "flow": "xtls-rprx-vision"}]})},
+                 "settings": json.dumps({"clients": [old]}),
+                 "clientStats": [{"email": "old", "up": GB, "down": GB, "total": 10 * GB, "expiryTime": 0}]},
                 {"id": 2, "remark": "ss22", "protocol": "shadowsocks", "port": 1080, "enable": True,
                  "settings": json.dumps({"method": "2022-blake3-aes-128-gcm", "clients": []})},
                 {"id": 3, "remark": "wg", "protocol": "wireguard", "port": 51820, "enable": True, "settings": "{}"}]})
+        if v3 and self.path.startswith("/base/panel/api/clients/get/"):
+            email = urllib.parse.unquote(self.path.rsplit("/", 1)[1])
+            if email != "old":
+                return self.reply(200, {"success": False, "msg": "record not found"})
+            return self.reply(200, {"success": True, "obj": {"client": FakeXUI.OLD, "inboundIds": [1]}})
         self.reply(404)
 
     def do_POST(self):
@@ -579,17 +655,24 @@ class FakeXUI(BaseHTTPRequestHandler):
         data = self.read()
         if self.path == "/base/login":
             ok = data.get("username") == "admin" and data.get("password") == "pw"
-            FakeXUI.logins += ok
+            FakeXUI.logins += 1
             return self.reply(200, {"success": ok, "msg": "" if ok else "wrong password"}, cookie="logged" if ok else None)
         if not self.session():
             return self.reply(404)
-        if v3 and self.path == "/base/panel/api/clients/add":
+        path = self.path[len("/base/panel/api/"):]
+        if v3 and path == "clients/add":
             FakeXUI.added.append(data)
-            return self.reply(200, {"success": True, "msg": "Client added"})
-        if not v3 and self.path == "/base/panel/api/inbounds/addClient":
+        elif not v3 and path == "inbounds/addClient":
             FakeXUI.added.append({"id": int(data["id"]), "settings": json.loads(data["settings"])})
-            return self.reply(200, {"success": True, "msg": "ok"})
-        self.reply(404)
+        elif v3 and re.fullmatch(r"clients/(update|del|resetTraffic)/old", path):
+            FakeXUI.calls.append((path, data))
+        elif not v3 and re.fullmatch(r"inbounds/(updateClient/1111.*|1/delClient/1111.*|1/resetClientTraffic/old)", path):
+            FakeXUI.calls.append((path, data))
+        elif path in ("clients/onlines", "inbounds/onlines") and (path.startswith("clients") == v3):
+            return self.reply(200, {"success": True, "obj": ["old"]})
+        else:
+            return self.reply(404)
+        self.reply(200, {"success": True, "msg": "ok"})
 
 
 class PanelTests(unittest.TestCase):
@@ -602,9 +685,6 @@ class PanelTests(unittest.TestCase):
         con.execute("CREATE TABLE settings (id INTEGER PRIMARY KEY, key TEXT, value TEXT)")
         con.executemany("INSERT INTO settings (key, value) VALUES (?, ?)",
                         [("webPort", str(cls.srv.server_address[1])), ("webBasePath", "base")])
-        con.execute("CREATE TABLE client_traffics (id INTEGER PRIMARY KEY, email TEXT, up INT, down INT, total INT, expiry_time INT)")
-        con.execute("INSERT INTO client_traffics (email, up, down, total, expiry_time) VALUES ('old', ?, ?, ?, ?)",
-                    (GB, GB, 10 * GB, int((time.time() + 5.5 * 86400) * 1000)))
         con.commit()
         con.close()
 
@@ -613,7 +693,9 @@ class PanelTests(unittest.TestCase):
         cls.srv.shutdown()
 
     def setUp(self):
+        FakeXUI.mode = "v3"
         FakeXUI.added.clear()
+        FakeXUI.calls.clear()
         FakeXUI.logins = 0
 
     def app(self, **cfg):
@@ -627,7 +709,6 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(a.rt["panel_url"], "http://127.0.0.1:%d/base/" % self.srv.server_address[1])
 
     def test_v3_login_csrf_and_add(self):
-        FakeXUI.mode = "v3"
         a, api = self.app(panel_user="admin", panel_pass="pw")
         self.assertEqual([ib["protocol"] for ib in api.inbounds()], ["vless", "shadowsocks", "wireguard"])
         before = time.time()
@@ -647,17 +728,21 @@ class PanelTests(unittest.TestCase):
         self.assertEqual((c["totalGB"], c["expiryTime"]), (0, -7 * 86400000))
         self.assertEqual(len(base64.b64decode(c["password"])), 16)  # 2022-blake3-aes-128-gcm key
 
-    def test_v3_token(self):
-        FakeXUI.mode = "v3"
+    def test_v3_manage(self):
         _, api = self.app(panel_token="tok")
-        api.add_client("sara", 1, 0, 0, False, [1])
+        api.update_user("oldsub", ["old"], {"totalGB": 50 * GB, "enable": True})
+        path, sent = FakeXUI.calls[-1]
+        self.assertEqual(path, "clients/update/old")
+        self.assertEqual((sent["id"], sent["totalGB"], sent["limitHwid"], sent["flow"]),
+                         (FakeXUI.OLD["uuid"], 50 * GB, 2, "xtls-rprx-vision"))
+        self.assertNotIn("uuid", sent)
+        api.reset_user("oldsub", ["old"])
+        api.delete_user("oldsub", ["old"])
+        self.assertEqual([c[0] for c in FakeXUI.calls[1:]], ["clients/resetTraffic/old", "clients/del/old"])
+        self.assertEqual(api.onlines(), {"old"})
         self.assertEqual(FakeXUI.logins, 0)
-        self.assertEqual(FakeXUI.added[0]["client"]["expiryTime"], 0)
-        _, bad = self.app(panel_token="nope")
-        with self.assertRaises(xc.PanelError):
-            bad.inbounds()
 
-    def test_v2_fallback(self):
+    def test_v2_manage(self):
         FakeXUI.mode = "v2"
         _, api = self.app(panel_user="admin", panel_pass="pw")
         sub = api.add_client("ali", 10, 0, 0, False, [1, 2])
@@ -665,45 +750,136 @@ class PanelTests(unittest.TestCase):
         clients = [x["settings"]["clients"][0] for x in FakeXUI.added]
         self.assertEqual([c["email"] for c in clients], ["ali", "ali-2"])
         self.assertEqual({c["subId"] for c in clients}, {sub})
-        FakeXUI.mode = "v3"
+        api.update_user("oldsub", ["old"], {"enable": False})
+        path, sent = FakeXUI.calls[-1]
+        self.assertEqual(path, "inbounds/updateClient/" + FakeXUI.OLD["uuid"])
+        self.assertEqual(sent["id"], "1")
+        client = json.loads(sent["settings"])["clients"][0]
+        self.assertEqual((client["email"], client["enable"], client["flow"]), ("old", False, "xtls-rprx-vision"))
+        api.reset_user("oldsub", ["old"])
+        api.delete_user("oldsub", ["old"])
+        self.assertEqual([c[0] for c in FakeXUI.calls[1:]],
+                         ["inbounds/1/resetClientTraffic/old", "inbounds/1/delClient/" + FakeXUI.OLD["uuid"]])
+        self.assertEqual(api.onlines(), {"old"})
+        with self.assertRaises(xc.PanelError):
+            api.update_user("nobody", ["nobody"], {"enable": True})
 
-    def test_errors(self):
-        FakeXUI.mode = "v3"
+    def test_errors_and_backoff(self):
         with self.assertRaises(xc.PanelError) as e:
             self.app(panel_user="admin", panel_pass="bad")[1].inbounds()
         self.assertIn("wrong password", str(e.exception))
         with self.assertRaises(xc.PanelError):
             self.app()[1].inbounds()
         with self.assertRaises(xc.PanelError):
-            self.app(panel_user="admin", panel_pass="pw")[1].add_client("x", 1, 1, 0, False, [3, 99][1:])
+            self.app(panel_user="admin", panel_pass="pw")[1].add_client("x", 1, 1, 0, False, [99])
+        _, bad = self.app(panel_token="nope")
+        with self.assertRaises(xc.PanelError):
+            bad.inbounds()
+        FakeXUI.logins = 0
+        _, api = self.app(panel_user="admin", panel_pass="bad")
+        first = api.overview()
+        self.assertFalse(first["ok"])
+        self.assertIn("wrong password", first["error"])
+        api.overview()
+        self.assertEqual(FakeXUI.logins, 1)  # the failure is cached, no second login attempt
+        self.assertFalse(self.app()[1].overview()["configured"])
 
-    def test_admin_add_user_flow(self):
-        FakeXUI.mode = "v3"
-        xc.save_config(dict(xc.DEFAULTS, admin_path="adm2", panel_user="admin", panel_pass="pw"))
+    def test_admin_api_user_management(self):
+        xc.save_config(dict(xc.load_config(), admin_path="adm2", panel_user="admin", panel_pass="pw"))
+        xc.set_password("secret1")
         app = xc.App(db_path=self.db)
         srv = start(ThreadingHTTPServer(("127.0.0.1", 0), xc.make_handler(app)))
-        base = "http://127.0.0.1:%d/adm2/" % srv.server_address[1]
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+        def call(action, body=None):
+            req = urllib.request.Request("http://127.0.0.1:%d/adm2/api/%s" % (srv.server_address[1], action),
+                                         data=json.dumps(body or {}).encode(),
+                                         headers={"Content-Type": "application/json", "X-XC": "1"})
+            with opener.open(req, timeout=20) as r:
+                return json.loads(r.read().decode())
         try:
-            page = urllib.request.urlopen(base, timeout=10).read().decode()
-            self.assertIn('name="inbound" value="1" checked', page)
-            self.assertIn('value="2"', page)
-            self.assertNotIn('value="3"', page)  # wireguard is not offered
-            form = urllib.parse.urlencode([("name", "mina"), ("gb", "5"), ("days", "10"), ("devices", "1"),
-                                           ("inbound", "1")]).encode()
-            page = urllib.request.urlopen(base + "adduser", data=form, timeout=10).read().decode()
-            sub = FakeXUI.added[-1]["client"]["subId"]
-            self.assertIn("کاربر mina ساخته شد", page)
-            self.assertIn('data-qr="http://127.0.0.1:%d/chain/%s"' % (srv.server_address[1], sub), page)
-            bad = urllib.parse.urlencode([("name", "علی"), ("inbound", "1")]).encode()
-            page = urllib.request.urlopen(base + "adduser", data=bad, timeout=10).read().decode()
-            self.assertIn("اسم فقط حروف انگلیسی", page)
-            self.assertEqual(len(FakeXUI.added), 1)
+            st = call("login", {"password": "secret1"})["state"]
+            self.assertTrue(st["panel"]["ok"])
+            self.assertEqual([ib["id"] for ib in st["inbounds"]], [1, 2])  # wireguard is not offered
+            self.assertEqual([(u["name"], u["sub"], u["used"], u["online"]) for u in st["users"]],
+                             [("old", "oldsub", 2 * GB, True)])  # from the panel API: no clients in the DB
+            out = call("user_add", {"name": "mina", "gb": 5, "days": 10, "devices": 1, "inbounds": [1]})
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["sub"], FakeXUI.added[-1]["client"]["subId"])
+            self.assertIn("اسم فقط", call("user_add", {"name": "علی", "inbounds": [1]})["error"])
+            self.assertIn("کاربری با این اسم", call("user_add", {"name": "old", "inbounds": [1]})["error"])
+            before = time.time()
+            out = call("user_update", {"sub": "oldsub", "gb": 20, "days": 30, "devices": 3, "reset": True})
+            self.assertTrue(out["ok"], out)
+            sent = FakeXUI.calls[0][1]
+            self.assertEqual((sent["totalGB"], sent["limitIp"], sent["enable"]), (20 * GB, 3, True))
+            self.assertAlmostEqual(sent["expiryTime"] / 1000, before + 30 * 86400, delta=5)
+            self.assertEqual(FakeXUI.calls[1][0], "clients/resetTraffic/old")
+            self.assertTrue(call("user_enable", {"sub": "oldsub", "enable": False})["ok"])
+            self.assertFalse(FakeXUI.calls[2][1]["enable"])
+            self.assertTrue(call("user_delete", {"sub": "oldsub"})["ok"])
+            self.assertEqual(FakeXUI.calls[3][0], "clients/del/old")
+            self.assertIn("پیدا نشد", call("user_delete", {"sub": "ghost"})["error"])
+            self.assertIn("اتصال به پنل برقرار است", call("panel_test")["msg"])
         finally:
             srv.shutdown()
 
-    def test_usage_in_user_list(self):
-        self.assertEqual(xc.client_usage(self.db)["old"][:2], (2 * GB, 10 * GB))
-        self.assertEqual(xc.client_usage("/nonexistent"), {})
+
+class ReadClientsTests(unittest.TestCase):
+    def db(self, v3):
+        path = os.path.join(tempfile.mkdtemp(), "x-ui.db")
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE inbounds (id INTEGER PRIMARY KEY, settings TEXT)")
+        con.execute("CREATE TABLE client_traffics (id INTEGER PRIMARY KEY, email TEXT, up INT, down INT, total INT, expiry_time INT)")
+        exp = int((time.time() + 5 * 86400) * 1000)
+        clients = [{"email": "a", "subId": "s1", "enable": True, "totalGB": 10 * GB, "expiryTime": exp, "limitIp": 2},
+                   {"email": "a-2", "subId": "s1", "enable": True, "totalGB": 10 * GB, "expiryTime": exp},
+                   {"email": "b", "subId": "", "enable": False, "totalGB": "0", "expiryTime": -86400000 * 3}]
+        con.execute("INSERT INTO inbounds (id, settings) VALUES (1, ?)", (json.dumps({"clients": clients[:1] + clients[2:]}),))
+        con.execute("INSERT INTO inbounds (id, settings) VALUES (2, ?)", (json.dumps({"clients": clients[1:2]}),))
+        con.executemany("INSERT INTO client_traffics (email, up, down, total, expiry_time) VALUES (?, ?, ?, ?, ?)",
+                        [("a", GB, GB, 10 * GB, exp), ("a-2", GB, 0, 10 * GB, exp), ("b", 0, 0, 0, -86400000 * 3)])
+        if v3:
+            con.execute("CREATE TABLE clients (id INTEGER PRIMARY KEY, email TEXT, sub_id TEXT, enable INT, total_gb INT, expiry_time INT, limit_ip INT)")
+            con.execute("CREATE TABLE client_inbounds (client_id INT, inbound_id INT)")
+            con.execute("INSERT INTO clients VALUES (1, 'c', 'cs', 1, 0, 0, 4)")
+            con.execute("INSERT INTO client_inbounds VALUES (1, 2)")
+        con.commit()
+        con.close()
+        return path
+
+    def test_v2_and_v3(self):
+        users = {u["name"]: u for u in xc.group_users(xc.read_clients(self.db(False)), {"a-2"})}
+        self.assertEqual(sorted(users), ["a", "b"])
+        a = users["a"]
+        self.assertEqual((a["sub"], a["emails"], a["used"], a["total"], a["devices"], a["inbounds"], a["online"]),
+                         ("s1", ["a", "a-2"], 3 * GB, 10 * GB, 2, [1, 2], True))
+        self.assertEqual((users["b"]["enable"], users["b"]["expiry"], users["b"]["online"]), (False, -86400000 * 3, False))
+        users = {u["name"]: u for u in xc.group_users(xc.read_clients(self.db(True)))}
+        self.assertEqual((users["c"]["sub"], users["c"]["devices"], users["c"]["inbounds"], users["c"]["online"]),
+                         ("cs", 4, [2], None))
+        self.assertEqual(xc.read_clients("/nonexistent/x.db"), [])
+
+    def test_server_stats(self):
+        st = xc.server_stats()
+        self.assertGreaterEqual(st["cpus"], 1)
+        if os.path.exists("/proc/meminfo"):
+            self.assertGreater(st["mem_total"], st["mem_used"] > 0)
+
+    def test_password_hash(self):
+        h = xc.hash_password("hello123")
+        self.assertTrue(xc.check_password("hello123", h))
+        self.assertFalse(xc.check_password("hello124", h))
+        self.assertFalse(xc.check_password("x", "garbage"))
+        auth = xc.Auth()
+        xc.set_password("hello123")
+        token = auth.issue()
+        self.assertTrue(auth.valid(token))
+        self.assertFalse(auth.valid(token[:-1] + ("0" if token[-1] != "0" else "1")))
+        self.assertFalse(auth.valid("1." + token.split(".")[1]))  # expired
+        xc.set_password("hello999")
+        self.assertFalse(auth.valid(token))
+        xc.set_password("secret1")
 
 
 if __name__ == "__main__":
