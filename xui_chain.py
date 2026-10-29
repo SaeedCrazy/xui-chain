@@ -22,8 +22,11 @@ import html
 import http.client
 import json
 import os
+import pty
+import random
 import re
 import secrets
+import select
 import shutil
 import socket
 import sqlite3
@@ -38,7 +41,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "3.2.0"
+VERSION = "4.0.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -64,6 +67,11 @@ DEFAULTS = {
     "test_interval": 120,
     "title": "",
     "main_location": "",       # display name of this server, e.g. "🇫🇮 فنلاند"
+    "auto_mode": "priority",   # Auto picks by priority order, or the fastest measured
+    "servers": [],             # managed servers (SSH as root): [{id, name, host, port, user, role, facts}]
+    "tunnels": [],             # tunnels between them
+    "main_facts": {},          # this server's own facts
+    "probe_url": "",           # download used by the Iran-side test
     "show_auto": True,         # which entries the users' apps list
     "show_main": True,
     "show_deco_any": True,     # Clash: "Deco" = your server through the first working Deco
@@ -642,6 +650,7 @@ def deco_options(cfg, ups):
     for i, n in enumerate(ups, 1):
         o = stored.get(node_key(n)) or {}
         out.append((i, n, {"chain": o.get("chain", True), "own": o.get("own", False),
+                           "chain_auto": o.get("chain_auto", True), "own_auto": o.get("own_auto", False),
                            "chain_name": (o.get("chain_name") or "").strip() or "%s%d" % (deco, i),
                            "own_name": (o.get("own_name") or "").strip() or n["name"]}))
     return out
@@ -653,13 +662,16 @@ def build_mihomo(own, ups, cfg):
     main, deco = label(cfg, "label_main"), label(cfg, "label_deco")
     names = {G_MAIN, g_auto, G_UP, "DIRECT", "REJECT"}
     skipped = []
-    hops, owns = [], []
+    hops, owns, auto_order = [], [], []
     for i, n, o in deco_options(cfg, ups):
         try:
             if o["chain"]:
                 hops.append((o, to_mihomo(n, unique(names, "%s%d · %s" % (deco, i, n["name"])))))
             if o["own"]:
-                owns.append(to_mihomo(n, unique(names, o["own_name"])))
+                p = to_mihomo(n, unique(names, o["own_name"]))
+                owns.append(p)
+                if o["own_auto"]:
+                    auto_order.append(("own", i, p["name"]))
         except ValueError as e:
             skipped.append("upstream %d: %s" % (i, e))
     up_proxies = [p for _, p in hops]
@@ -677,12 +689,18 @@ def build_mihomo(own, ups, cfg):
                     p = to_mihomo(n, unique(names, route_name(cfg, n, one, o["chain_name"])))
                     p["dialer-proxy"] = u["name"]
                     single.append(p)
+                    if o["chain_auto"]:
+                        auto_order.append(("chain", int(u["name"].split(" ")[0][len(deco):] or 0), p["name"]))
         except ValueError as e:
             skipped.append("%s: %s" % (n["name"], e))
     if not direct and not owns:
         raise ValueError("no usable config for this user")
-    auto = [p["name"] for p in (direct if cfg.get("direct_first", True) or not up_proxies else []) + chained]
+    # Auto: Main first (or last), then every chosen entry in Deco priority order
+    ordered = [name for _, _, name in sorted(auto_order, key=lambda x: (x[1], 0 if x[0] == "chain" else 1))]
+    mains = [p["name"] for p in direct]
+    auto = (mains + ordered) if cfg.get("direct_first", True) else (ordered + mains)
     auto = auto or [p["name"] for p in owns]
+    fastest = (cfg.get("auto_mode") or "priority") == "fastest"
     visible = ([g_auto] if cfg.get("show_auto", True) else []) + [p["name"] for p in (
         (direct if cfg.get("show_main", True) else []) + (chained if cfg.get("show_deco_any", True) else [])
         + single + owns)]
@@ -690,7 +708,8 @@ def build_mihomo(own, ups, cfg):
             "timeout": 5000, "lazy": False}
     groups = [
         {"name": G_MAIN, "type": "select", "proxies": visible or [g_auto]},
-        dict({"name": g_auto, "type": "fallback", "proxies": auto}, **test),
+        dict({"name": g_auto, "type": "url-test" if fastest else "fallback", "proxies": auto},
+             **(dict(test, tolerance=60) if fastest else test)),
     ]
     if up_proxies:
         groups.append(dict({"name": G_UP, "type": "fallback", "proxies": [p["name"] for p in up_proxies]}, **test))
@@ -751,7 +770,7 @@ def build_xray(own, ups, cfg, remarks):
         if o["chain"]:
             chain_ups.append((i, n, o))
         if o["own"]:
-            own_decos.append((n, o))
+            own_decos.append((i, n, o))
     own_ok = []
     for n in own:
         try:
@@ -777,28 +796,48 @@ def build_xray(own, ups, cfg, remarks):
             singles.append(xray_config(route_name(cfg, n, one, o["chain_name"]),
                                        [chained(n, i, "proxy"), to_xray(u, "up-%d" % i)],
                                        cfg, {"outboundTag": "proxy"}))
-    for u, o in own_decos:
+    for i, u, o in own_decos:
         singles.append(xray_config(o["own_name"], [to_xray(u, "proxy")], cfg, {"outboundTag": "proxy"}))
     singles = singles or direct
-    if not chain_ups or not own_ok or not cfg.get("show_auto", True):
+    auto_chains = [(i, u, o) for i, u, o in chain_ups if o["chain_auto"]]
+    auto_owns = [(i, u, o) for i, u, o in own_decos if o["own_auto"]]
+    if not (auto_chains or auto_owns) or not cfg.get("show_auto", True):
         return json.dumps(singles, ensure_ascii=False, indent=2), skipped
 
-    mine = []
-    for k, n in enumerate(own_ok, 1):
-        if cfg.get("direct_first", True):
-            mine.append(to_xray(n, "me-%d-direct" % k))
-        for i, u, o in chain_ups:
-            mine.append(chained(n, i, "me-%d-via-up-%d" % (k, i)))
-    auto = xray_config(auto_name(cfg), mine + [to_xray(u, "up-%d" % i) for i, u, o in chain_ups], cfg,
-                       {"balancerTag": "auto"})
+    # members of Auto in priority order: Main, then each Deco (its chain, then its own config)
+    mine, prio = [], []
+    mains = [to_xray(n, "me-%d-direct" % k) for k, n in enumerate(own_ok, 1)]
+    if cfg.get("direct_first", True):
+        mine += mains
+    for i, u, o in sorted(auto_chains + auto_owns, key=lambda x: x[0]):
+        if o in [x[2] for x in auto_chains] and (i, u, o) in auto_chains:
+            for k, n in enumerate(own_ok, 1):
+                mine.append(chained(n, i, "me-%d-via-up-%d" % (k, i)))
+        if (i, u, o) in auto_owns:
+            out = to_xray(u, "me-own-up-%d" % i)
+            mine.append(out)
+    if not cfg.get("direct_first", True):
+        mine += mains
+    seen = set()
+    members = []
+    for o in mine:
+        if o["tag"] not in seen:
+            seen.add(o["tag"])
+            members.append(o)
+    hops = [to_xray(u, "up-%d" % i) for i, u, o in chain_ups if o["chain_auto"]]
+    auto = xray_config(auto_name(cfg), members + hops, cfg, {"balancerTag": "auto"})
     auto["observatory"] = {
         "subjectSelector": ["me-"],
         "probeURL": cfg.get("test_url") or DEFAULTS["test_url"],
         "probeInterval": "%ds" % int(cfg.get("test_interval") or 120),
         "enableConcurrency": True,
     }
-    auto["routing"]["balancers"] = [{"tag": "auto", "selector": ["me-"], "strategy": {"type": "leastPing"},
-                                     "fallbackTag": mine[0]["tag"]}]
+    if (cfg.get("auto_mode") or "priority") == "fastest":
+        strategy = {"type": "leastPing"}
+    else:  # earlier members cost less, so Xray prefers them unless they are much slower
+        strategy = {"type": "leastLoad", "settings": {"expected": 1, "costs": [
+            {"regexp": False, "match": o["tag"], "value": round(1 + 0.6 * k, 2)} for k, o in enumerate(members)]}}
+    auto["routing"]["balancers"] = [{"tag": "auto", "selector": ["me-"], "strategy": strategy, "fallbackTag": members[0]["tag"]}]
     return json.dumps([auto] + singles, ensure_ascii=False, indent=2), skipped
 
 
@@ -1947,6 +1986,1003 @@ class Auth:
             self.fails.pop(ip, None)
 
 
+# ---------------------------------------------------------------- servers (SSH as root)
+
+SSH_KEY = conf_path("id_ed25519")
+SSH_BIN = os.environ.get("EZ_SSH_BIN", "ssh")
+SSH_KEYGEN_BIN = os.environ.get("EZ_SSH_KEYGEN", "ssh-keygen")
+RAW_BASE = os.environ.get("XUI_CHAIN_RAW", "https://raw.githubusercontent.com/saeedcrazy/xui-chain/main")
+EZ_DIR = "/usr/local/ez-xui"          # binaries and configs EZ-XUI puts on managed servers
+
+
+class SSHError(Exception):
+    pass
+
+
+def ensure_ssh_key():
+    """EZ-XUI's own key pair for the managed servers. -> public key line"""
+    if not os.path.isfile(SSH_KEY):
+        os.makedirs(os.path.dirname(SSH_KEY), exist_ok=True)
+        try:
+            subprocess.run([SSH_KEYGEN_BIN, "-q", "-t", "ed25519", "-N", "", "-C", "ez-xui", "-f", SSH_KEY],
+                           check=True, capture_output=True, timeout=30)
+        except FileNotFoundError:
+            raise SSHError("ابزار SSH روی این سرور نصب نیست؛ روی سرور بزن: apt install -y openssh-client")
+    with open(SSH_KEY + ".pub") as f:
+        return f.read().strip()
+
+
+def shq(s):
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+class Remote:
+    """Runs scripts on one server: locally for this machine, over SSH (our key) otherwise."""
+
+    def __init__(self, srv):
+        self.srv = srv
+
+    @property
+    def local(self):
+        return bool(self.srv.get("local"))
+
+    def _ssh_base(self):
+        s = self.srv
+        return [SSH_BIN, "-i", SSH_KEY, "-p", str(s.get("port") or 22), "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=12",
+                "-o", "ServerAliveInterval=15", "-o", "UserKnownHostsFile=" + conf_path("known_hosts"),
+                "%s@%s" % (s.get("user") or "root", s["host"])]
+
+    def run(self, script, timeout=120):
+        """-> (rc, stdout, stderr). The script runs with bash as root."""
+        if self.local:
+            cmd = ["bash", "-s"]
+        else:
+            shell = "bash -s" if (self.srv.get("user") or "root") == "root" else "sudo -n bash -s"
+            cmd = self._ssh_base() + [shell]
+        try:
+            p = subprocess.run(cmd, input=script.encode(), capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise SSHError("timeout after %ds" % timeout)
+        except OSError as e:
+            raise SSHError(str(e))
+        out, err = p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+        if p.returncode == 255 and not self.local:
+            raise SSHError("SSH: " + (err.strip().splitlines() or ["connection failed"])[-1])
+        return p.returncode, out, err
+
+    def check(self, script, timeout=120, what="command"):
+        rc, out, err = self.run(script, timeout)
+        if rc != 0:
+            tail = (err.strip() or out.strip()).splitlines()[-3:]
+            raise SSHError("%s failed (%d): %s" % (what, rc, " | ".join(tail)))
+        return out
+
+    def install_key(self, password, timeout=40):
+        """First contact: log in with the password once and leave our key behind."""
+        pub = ensure_ssh_key()
+        s = self.srv
+        remote = ("umask 077; mkdir -p ~/.ssh; grep -qF %s ~/.ssh/authorized_keys 2>/dev/null || "
+                  "echo %s >> ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys; echo EZ_KEY_OK"
+                  % (shq(pub), shq(pub)))
+        cmd = [SSH_BIN, "-p", str(s.get("port") or 22), "-o", "StrictHostKeyChecking=accept-new",
+               "-o", "ConnectTimeout=12", "-o", "NumberOfPasswordPrompts=1", "-o", "PubkeyAuthentication=no",
+               "-o", "UserKnownHostsFile=" + conf_path("known_hosts"),
+               "%s@%s" % (s.get("user") or "root", s["host"]), remote]
+        pid, fd = pty.fork()
+        if pid == 0:  # child
+            os.execvp(cmd[0], cmd)
+        out, sent, deadline = b"", False, time.time() + timeout
+        try:
+            while time.time() < deadline:
+                r, _, _ = select.select([fd], [], [], 1)
+                if not r:
+                    continue
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                out += chunk
+                low = out.lower()
+                if not sent and (b"password:" in low or b"passphrase" in low):
+                    os.write(fd, (password + "\n").encode())
+                    sent = True
+                    out = b""
+                elif b"(yes/no" in low:
+                    os.write(fd, b"yes\n")
+                    out = b""
+        finally:
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            os.close(fd)
+        text = out.decode("utf-8", "replace")
+        if "EZ_KEY_OK" in text:
+            return True
+        if "permission denied" in text.lower():
+            raise SSHError("رمز یا نام کاربری درست نیست")
+        if not sent:
+            raise SSHError("سرور رمز نخواست؛ احتمالاً SSH با رمز بسته است یا آدرس و پورت اشتباه است")
+        raise SSHError("کلید نصب نشد: " + text.strip()[-200:])
+
+
+FACTS_SCRIPT = r'''
+echo "hostname=$(hostname)"
+echo "arch=$(uname -m)"
+. /etc/os-release 2>/dev/null; echo "os=${PRETTY_NAME:-linux}"
+echo "ip=$(curl -4fs --max-time 6 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+echo "cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+echo "qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+echo "fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)"
+echo "cpus=$(nproc 2>/dev/null)"
+echo "mem=$(awk '/MemTotal/{print $2*1024}' /proc/meminfo)"
+echo "load=$(cut -d' ' -f1 /proc/loadavg)"
+echo "uptime=$(cut -d' ' -f1 /proc/uptime)"
+echo "xui=$([ -x /usr/local/x-ui/x-ui ] && echo 1 || echo 0)"
+echo "xui_port=$(sqlite3 /etc/x-ui/x-ui.db "select value from settings where key='webPort'" 2>/dev/null)"
+echo "iperf3=$(command -v iperf3 >/dev/null && echo 1 || echo 0)"
+echo "backhaul=$([ -x /usr/local/ez-xui/backhaul ] && echo 1 || echo 0)"
+echo "gost=$([ -x /usr/local/ez-xui/gost ] && echo 1 || echo 0)"
+echo "xray=$([ -x /usr/local/ez-xui/xray ] && echo 1 || echo 0)"
+echo "wg=$(command -v wg >/dev/null && echo 1 || echo 0)"
+echo "ipv6=$(ip -6 addr show scope global 2>/dev/null | grep -q inet6 && echo 1 || echo 0)"
+echo "units=$(systemctl list-units --type=service --all --no-legend 'ez-*' 2>/dev/null | awk '{print $1":"$3}' | tr '\n' ' ')"
+echo "EZ_FACTS_OK"
+'''
+
+TUNE_SCRIPT = r'''
+set -e
+modprobe tcp_bbr 2>/dev/null || true
+cat > /etc/sysctl.d/99-ez-xui.conf <<'EOF'
+# EZ-XUI network tuning: BBR + fq, larger buffers, forwarding for tunnels
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.ip_forward = 1
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_fin_timeout = 25
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_max_syn_backlog = 8192
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.ip_local_port_range = 10240 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+fs.file-max = 1048576
+EOF
+sysctl -q --system >/dev/null 2>&1 || sysctl -q -p /etc/sysctl.d/99-ez-xui.conf >/dev/null 2>&1 || true
+grep -q "ez-xui" /etc/security/limits.conf 2>/dev/null || cat >> /etc/security/limits.conf <<'EOF'
+# ez-xui
+* soft nofile 1048576
+* hard nofile 1048576
+EOF
+mkdir -p /etc/systemd/system.conf.d
+printf '[Manager]\nDefaultLimitNOFILE=1048576\n' > /etc/systemd/system.conf.d/ez-xui.conf
+systemctl daemon-reexec 2>/dev/null || true
+echo "cc=$(sysctl -n net.ipv4.tcp_congestion_control)"
+echo "qdisc=$(sysctl -n net.core.default_qdisc)"
+echo "EZ_TUNE_OK"
+'''
+
+# shared bash helpers prepended to engine scripts
+BASH_LIB = r'''
+set -e
+export DEBIAN_FRONTEND=noninteractive
+EZ=/usr/local/ez-xui; mkdir -p $EZ/conf
+arch() { case "$(uname -m)" in x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;; *) echo amd64;; esac; }
+pkg() { # install packages if missing
+  local need=""; for p in "$@"; do command -v "$p" >/dev/null 2>&1 || need="$need $p"; done
+  [ -z "$need" ] && return 0
+  if command -v apt-get >/dev/null; then apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y -qq $need >/dev/null 2>&1
+  elif command -v dnf >/dev/null; then dnf install -y -q $need >/dev/null 2>&1
+  elif command -v yum >/dev/null; then yum install -y -q $need >/dev/null 2>&1; fi
+}
+fetch() { # fetch URL OUT
+  curl -fsSL --retry 3 --retry-delay 2 --max-time 240 -o "$2" "$1" || wget -q -O "$2" "$1"
+}
+unit() { # unit NAME "Description" "ExecStart" [ExecStop] [Type]
+  cat > /etc/systemd/system/$1.service <<EOF
+[Unit]
+Description=$2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=${5:-simple}
+ExecStart=$3
+${4:+ExecStop=$4}
+Restart=${6:-always}
+RestartSec=3
+LimitNOFILE=1048576
+${7:+RemainAfterExit=yes}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "$1" >/dev/null 2>&1 || true
+  systemctl restart "$1"
+}
+fw_open() { # fw_open PORT proto
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then ufw allow "$1/$2" >/dev/null 2>&1 || true; fi
+}
+need_backhaul() { [ -x $EZ/backhaul ] && return 0
+  local t; t=$(mktemp -d); fetch "https://github.com/Musixal/Backhaul/releases/download/v0.7.2/backhaul_linux_$(arch).tar.gz" "$t/b.tgz"
+  tar -xzf "$t/b.tgz" -C "$t"; install -m 755 "$(find "$t" -type f -name backhaul | head -1)" $EZ/backhaul; rm -rf "$t"; }
+need_gost() { [ -x $EZ/gost ] && return 0
+  local t u; t=$(mktemp -d)
+  u=$(curl -fsSL --max-time 20 https://api.github.com/repos/go-gost/gost/releases/latest | grep browser_download_url | grep "linux_$(arch).tar.gz" | head -1 | cut -d'"' -f4)
+  [ -n "$u" ] || u="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_$(arch).tar.gz"
+  fetch "$u" "$t/g.tgz"; tar -xzf "$t/g.tgz" -C "$t"; install -m 755 "$(find "$t" -type f -name gost | head -1)" $EZ/gost; rm -rf "$t"; }
+need_xray() { [ -x $EZ/xray ] && return 0
+  local t a; t=$(mktemp -d); a=$(arch); [ "$a" = amd64 ] && a=64 || a=arm64-v8a
+  pkg unzip; fetch "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$a.zip" "$t/x.zip"
+  unzip -qo "$t/x.zip" -d "$t"; install -m 755 "$t/xray" $EZ/xray; cp -n "$t"/*.dat $EZ/ 2>/dev/null || true; rm -rf "$t"; }
+'''
+
+
+def arch_ok(a):
+    return "arm64" if a in ("aarch64", "arm64") else "amd64"
+
+
+def parse_kv(text):
+    out = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def server_facts(srv, timeout=40):
+    rc, out, err = Remote(srv).run(FACTS_SCRIPT, timeout)
+    if "EZ_FACTS_OK" not in out:
+        raise SSHError((err.strip() or out.strip() or "no answer")[-200:])
+    f = parse_kv(out)
+    return {"hostname": f.get("hostname", ""), "arch": arch_ok(f.get("arch", "")), "os": f.get("os", ""),
+            "ip": f.get("ip", ""), "cc": f.get("cc", ""), "qdisc": f.get("qdisc", ""), "fwd": f.get("fwd") == "1",
+            "cpus": _int(f.get("cpus")), "mem": _int(f.get("mem")), "load": float(f.get("load") or 0),
+            "uptime": float(f.get("uptime") or 0), "xui": f.get("xui") == "1", "xui_port": _int(f.get("xui_port")),
+            "tools": {k: f.get(k) == "1" for k in ("iperf3", "backhaul", "gost", "xray", "wg")},
+            "ipv6": f.get("ipv6") == "1",
+            "units": dict(u.split(":", 1) for u in f.get("units", "").split() if ":" in u), "at": int(time.time() * 1000)}
+
+
+# ---------------------------------------------------------------- tunnels
+
+ENGINES = {
+    # id: (name, direction, transports, notes)
+    "direct":   ("انتقال مستقیم (iptables)", "entry->exit", [], "بدون لایه‌ی اضافه؛ سریع‌ترین، ولی آی‌پی خارج باید از ایران باز باشد"),
+    "backhaul": ("Backhaul", "exit->entry", ["tcpmux", "tcp", "ws", "wss", "wsmux", "wssmux", "udp"], "محبوب و سریع؛ سرور خارج به ایران وصل می‌شود"),
+    "gost":     ("GOST", "entry->exit", ["tls", "wss", "mwss", "mtls", "tcp"], "ساده و پایدار؛ ایران به خارج وصل می‌شود"),
+    "xray":     ("Xray Reality", "entry->exit", ["reality", "grpc-reality", "xhttp-reality"], "شبیه HTTPS معمولی؛ سخت‌ترین برای فیلتر"),
+    "wireguard": ("WireGuard", "entry->exit", [], "در هسته‌ی لینوکس؛ UDP لازم دارد"),
+    "gre":      ("GRE", "both", [], "لایه‌ی شبکه؛ پروتکل ۴۷ باید باز باشد"),
+}
+BENCH_PORT = 5201
+
+
+def parse_ports(text):
+    """"443, 2053=8443, 10000-10050" -> [(entry_spec, exit_spec)] validated."""
+    out = []
+    for raw in re.split(r"[,\s]+", text or ""):
+        raw = raw.strip()
+        if not raw:
+            continue
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?(?:[=:](\d+)(?:-(\d+))?)?", raw)
+        if not m:
+            raise ValueError("پورت نامعتبر: %s" % raw)
+        a, b, c, d = m.groups()
+        for v in (a, b, c, d):
+            if v and not 1 <= int(v) <= 65535:
+                raise ValueError("پورت خارج از بازه: %s" % raw)
+        if b and int(b) < int(a):
+            raise ValueError("بازه‌ی پورت اشتباه: %s" % raw)
+        entry = a + ("-" + b if b else "")
+        exit_ = (c + ("-" + d if d else "")) if c else entry
+        out.append((entry, exit_))
+    return out
+
+
+def expand_ports(pairs):
+    """[(entry, exit)] -> [(entry_port, exit_port)] one per port."""
+    out = []
+    for e, x in pairs:
+        ea, eb = (e.split("-") + [None])[:2]
+        xa, xb = (x.split("-") + [None])[:2]
+        n = int(eb or ea) - int(ea) + 1
+        for i in range(n):
+            out.append((int(ea) + i, int(xa) + (i if xb else 0)))
+    return out
+
+
+def tunnel_scripts(t, entry, exit_, tunnel_ip):
+    """Bash for both sides. t: tunnel dict; entry/exit: server dicts with facts.
+    -> {"entry": script, "exit": script, "entry_remove": ..., "exit_remove": ...}"""
+    eng, tid = t["engine"], t["id"]
+    ports = parse_ports(t.get("ports", ""))
+    if t.get("bench"):
+        ports.append((str(BENCH_PORT), str(BENCH_PORT)))
+    flat = expand_ports(ports)
+    cport = int(t.get("cport") or 0)
+    token = t.get("token") or secrets.token_hex(12)
+    exit_ip, entry_ip = exit_["facts"]["ip"], entry["facts"]["ip"]
+    name = "ez-%s" % tid
+    lib = BASH_LIB
+    S = {}
+
+    def rm_unit(unit):
+        return "systemctl disable --now %s >/dev/null 2>&1 || true; rm -f /etc/systemd/system/%s.service; systemctl daemon-reload\n" % (unit, unit)
+
+    if eng == "direct":
+        rules = "".join('iptables -t nat -A PREROUTING -p %s --dport %d -m comment --comment %s -j DNAT --to-destination %s:%d\n'
+                        % (p, ep, name, exit_ip, xp) for ep, xp in flat for p in ("tcp", "udp"))
+        rules += "iptables -t nat -A POSTROUTING -d %s -m comment --comment %s -j MASQUERADE\n" % (exit_ip, name)
+        rules += "iptables -A FORWARD -d %s -m comment --comment %s -j ACCEPT\niptables -A FORWARD -s %s -m comment --comment %s -j ACCEPT\n" % (exit_ip, name, exit_ip, name)
+        clean = ("for T in nat filter; do iptables -t $T -S | grep -- '--comment %s' | sed 's/^-A/-D/' | while read -r r; do iptables -t $T $r 2>/dev/null || true; done; done\n" % name)
+        S["entry"] = lib + "pkg iptables\nsysctl -w net.ipv4.ip_forward=1 >/dev/null\n" + \
+            "cat > $EZ/conf/%s.sh <<'EOF'\n#!/bin/bash\n%s%sEOF\n" % (name, clean, rules) + \
+            "cat > $EZ/conf/%s-stop.sh <<'EOF'\n#!/bin/bash\n%sEOF\nchmod +x $EZ/conf/%s*.sh\n" % (name, clean, name) + \
+            'unit %s "EZ-XUI direct forward %s" "$EZ/conf/%s.sh" "$EZ/conf/%s-stop.sh" oneshot no yes\n' % (name, tid, name, name) + \
+            "".join("fw_open %d tcp; fw_open %d udp\n" % (ep, ep) for ep, _ in flat) + "echo EZ_SETUP_OK\n"
+        S["exit"] = lib + "echo EZ_SETUP_OK\n"
+        S["entry_remove"] = lib + rm_unit(name) + clean + "rm -f $EZ/conf/%s*.sh\necho EZ_REMOVE_OK\n" % name
+        S["exit_remove"] = "echo EZ_REMOVE_OK\n"
+
+    elif eng == "backhaul":
+        tr = t.get("transport") or "tcpmux"
+        mux = tr in ("tcpmux", "wsmux", "wssmux")
+        tls = tr in ("wss", "wssmux")
+        plist = ", ".join('"%s=%s"' % (e, x) if e != x else '"%s"' % e for e, x in ports)
+        server = ('[server]\nbind_addr = "0.0.0.0:%d"\ntransport = "%s"\ntoken = "%s"\nkeepalive_period = 75\nnodelay = true\n'
+                  'heartbeat = 40\nchannel_size = 2048\naccept_udp = %s\nsniffer = false\nweb_port = 0\nlog_level = "warn"\n'
+                  % (cport, tr, token, "true" if (tr == "tcp" and t.get("udp")) else "false"))
+        if mux:
+            server += "mux_con = 8\nmux_version = 1\nmux_framesize = 32768\nmux_recievebuffer = 4194304\nmux_streambuffer = 65536\n"
+        if tls:
+            server += 'tls_cert = "%s/conf/%s.crt"\ntls_key = "%s/conf/%s.key"\n' % (EZ_DIR, name, EZ_DIR, name)
+        server += "ports = [%s]\n" % plist
+        client = ('[client]\nremote_addr = "%s:%d"\ntransport = "%s"\ntoken = "%s"\nconnection_pool = 8\naggressive_pool = false\n'
+                  'keepalive_period = 75\ndial_timeout = 10\nnodelay = true\nretry_interval = 3\nsniffer = false\nweb_port = 0\nlog_level = "warn"\n'
+                  % (entry_ip, cport, tr, token))
+        if mux:
+            client += "mux_version = 1\nmux_framesize = 32768\nmux_recievebuffer = 4194304\nmux_streambuffer = 65536\n"
+        if tr in ("wss", "wssmux"):
+            client += 'edge_ip = ""\n'
+        cert = ("[ -f $EZ/conf/%s.crt ] || openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj /CN=www.cloudflare.com "
+                "-keyout $EZ/conf/%s.key -out $EZ/conf/%s.crt >/dev/null 2>&1\n" % (name, name, name)) if tls else ""
+        S["entry"] = lib + "need_backhaul\n" + cert + "cat > $EZ/conf/%s.toml <<'EOF'\n%sEOF\n" % (name, server) + \
+            'unit %s "EZ-XUI Backhaul server %s" "$EZ/backhaul -c $EZ/conf/%s.toml"\n' % (name, tid, name) + \
+            "fw_open %d %s\n" % (cport, "udp" if tr == "udp" else "tcp") + \
+            "".join("fw_open %d tcp; fw_open %d udp\n" % (ep, ep) for ep, _ in flat) + "echo EZ_SETUP_OK\n"
+        S["exit"] = lib + "need_backhaul\ncat > $EZ/conf/%s.toml <<'EOF'\n%sEOF\n" % (name, client) + \
+            'unit %s "EZ-XUI Backhaul client %s" "$EZ/backhaul -c $EZ/conf/%s.toml"\necho EZ_SETUP_OK\n' % (name, tid, name)
+        S["entry_remove"] = lib + rm_unit(name) + "rm -f $EZ/conf/%s.*\necho EZ_REMOVE_OK\n" % name
+        S["exit_remove"] = S["entry_remove"]
+
+    elif eng == "gost":
+        tr = t.get("transport") or "tls"
+        user, pw = "ez", token
+        listeners = " ".join("-L %s://:%d/127.0.0.1:%d" % (p, ep, xp) for ep, xp in flat for p in ("tcp", "udp"))
+        scheme = {"tls": "relay+tls", "wss": "relay+wss", "mwss": "relay+mwss", "mtls": "relay+mtls", "tcp": "relay+tcp"}[tr]
+        exit_cmd = "$EZ/gost -L %s://%s:%s@:%d" % (scheme, user, pw, cport)
+        entry_cmd = "$EZ/gost %s -F %s://%s:%s@%s:%d" % (listeners, scheme, user, pw, exit_ip, cport)
+        S["exit"] = lib + "need_gost\n" + 'unit %s "EZ-XUI GOST relay %s" "%s"\nfw_open %d tcp\necho EZ_SETUP_OK\n' % (name, tid, exit_cmd, cport)
+        S["entry"] = lib + "need_gost\n" + 'unit %s "EZ-XUI GOST entry %s" "%s"\n' % (name, tid, entry_cmd) + \
+            "".join("fw_open %d tcp; fw_open %d udp\n" % (ep, ep) for ep, _ in flat) + "echo EZ_SETUP_OK\n"
+        S["entry_remove"] = lib + rm_unit(name) + "echo EZ_REMOVE_OK\n"
+        S["exit_remove"] = S["entry_remove"]
+
+    elif eng == "xray":
+        tr = t.get("transport") or "reality"
+        uid = t.get("uuid") or str(uuid.uuid4())
+        sni = t.get("sni") or "www.microsoft.com"
+        priv, pub, sid = t.get("priv", ""), t.get("pub", ""), t.get("sid") or secrets.token_hex(4)
+        stream_in = {"network": "tcp", "security": "reality",
+                     "realitySettings": {"show": False, "dest": sni + ":443", "xver": 0, "serverNames": [sni],
+                                         "privateKey": priv, "shortIds": [sid]}}
+        stream_out = {"network": "tcp", "security": "reality",
+                      "realitySettings": {"serverName": sni, "fingerprint": "chrome", "publicKey": pub, "shortId": sid, "spiderX": "/"}}
+        flow = "xtls-rprx-vision"
+        if tr == "grpc-reality":
+            stream_in["network"] = stream_out["network"] = "grpc"
+            stream_in["grpcSettings"] = {"serviceName": "ez" + sid}
+            stream_out["grpcSettings"] = {"serviceName": "ez" + sid, "multiMode": True}
+            flow = ""
+        elif tr == "xhttp-reality":
+            stream_in["network"] = stream_out["network"] = "xhttp"
+            stream_in["xhttpSettings"] = {"path": "/" + sid, "mode": "auto"}
+            stream_out["xhttpSettings"] = {"path": "/" + sid, "mode": "auto"}
+            flow = ""
+        exit_conf = {"log": {"loglevel": "warning"},
+                     "inbounds": [{"tag": "tunnel", "listen": "0.0.0.0", "port": cport, "protocol": "vless",
+                                   "settings": {"clients": [dict({"id": uid, "level": 0}, **({"flow": flow} if flow else {}))], "decryption": "none"},
+                                   "streamSettings": stream_in}],
+                     "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}}]}
+        inbounds = [{"tag": "in-%d" % ep, "listen": "0.0.0.0", "port": ep, "protocol": "dokodemo-door",
+                     "settings": {"address": "127.0.0.1", "port": xp, "network": "tcp,udp"}} for ep, xp in flat]
+        vless_out = {"tag": "exit", "protocol": "vless",
+                     "settings": {"vnext": [{"address": exit_ip, "port": cport,
+                                             "users": [dict({"id": uid, "encryption": "none", "level": 0}, **({"flow": flow} if flow else {}))]}]},
+                     "streamSettings": stream_out}
+        outbounds = [vless_out]
+        if t.get("via"):  # reach the exit through a Deco config
+            try:
+                hop = to_xray(t["via"], "hop")
+                vless_out["streamSettings"]["sockopt"] = {"dialerProxy": "hop"}
+                outbounds.append(hop)
+            except ValueError:
+                pass
+        entry_conf = {"log": {"loglevel": "warning"}, "inbounds": inbounds, "outbounds": outbounds}
+        S["exit"] = lib + "need_xray\ncat > $EZ/conf/%s.json <<'EOF'\n%s\nEOF\n" % (name, json.dumps(exit_conf, indent=1)) + \
+            'unit %s "EZ-XUI Xray tunnel exit %s" "$EZ/xray run -c $EZ/conf/%s.json"\nfw_open %d tcp\necho EZ_SETUP_OK\n' % (name, tid, name, cport)
+        S["entry"] = lib + "need_xray\ncat > $EZ/conf/%s.json <<'EOF'\n%s\nEOF\n" % (name, json.dumps(entry_conf, indent=1)) + \
+            'unit %s "EZ-XUI Xray tunnel entry %s" "$EZ/xray run -c $EZ/conf/%s.json"\n' % (name, tid, name) + \
+            "".join("fw_open %d tcp; fw_open %d udp\n" % (ep, ep) for ep, _ in flat) + "echo EZ_SETUP_OK\n"
+        S["entry_remove"] = lib + rm_unit(name) + "rm -f $EZ/conf/%s.json\necho EZ_REMOVE_OK\n" % name
+        S["exit_remove"] = S["entry_remove"]
+
+    elif eng in ("wireguard", "gre"):
+        a, b = tunnel_ip + ".1", tunnel_ip + ".2"   # entry .1, exit .2
+        dnat = "".join('iptables -t nat -A PREROUTING -p %s --dport %d -m comment --comment %s -j DNAT --to-destination %s:%d\n'
+                       % (p, ep, name, b, xp) for ep, xp in flat for p in ("tcp", "udp"))
+        dnat += "iptables -t nat -A POSTROUTING -d %s -m comment --comment %s -j MASQUERADE\n" % (b, name)
+        dnat += "iptables -A FORWARD -d %s -m comment --comment %s -j ACCEPT\niptables -A FORWARD -s %s -m comment --comment %s -j ACCEPT\n" % (b, name, b, name)
+        clean = ("for T in nat filter; do iptables -t $T -S | grep -- '--comment %s' | sed 's/^-A/-D/' | while read -r r; do iptables -t $T $r 2>/dev/null || true; done; done\n" % name)
+        if eng == "wireguard":
+            epriv, epub, xpriv, xpub = t.get("wg_entry_priv", ""), t.get("wg_entry_pub", ""), t.get("wg_exit_priv", ""), t.get("wg_exit_pub", "")
+            entry_conf = ("[Interface]\nPrivateKey = %s\nAddress = %s/30\nMTU = 1380\nTable = off\n"
+                          "PostUp = ip route add %s/32 dev %%i; %s"
+                          "PostDown = %s\n\n[Peer]\nPublicKey = %s\nEndpoint = %s:%d\nAllowedIPs = %s/32\nPersistentKeepalive = 25\n"
+                          % (epriv, a, b, dnat.replace("\n", "; "), clean.replace("\n", " "), xpub, exit_ip, cport, b))
+            exit_conf = ("[Interface]\nPrivateKey = %s\nAddress = %s/30\nListenPort = %d\nMTU = 1380\n\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\n"
+                         % (xpriv, b, cport, epub, a))
+            S["exit"] = lib + "pkg wireguard-tools\nmkdir -p /etc/wireguard\ncat > /etc/wireguard/%s.conf <<'EOF'\n%sEOF\nchmod 600 /etc/wireguard/%s.conf\n" % (name, exit_conf, name) + \
+                "systemctl enable --now wg-quick@%s >/dev/null 2>&1 || (systemctl restart wg-quick@%s)\nfw_open %d udp\necho EZ_SETUP_OK\n" % (name, name, cport)
+            S["entry"] = lib + "pkg wireguard-tools iptables\nsysctl -w net.ipv4.ip_forward=1 >/dev/null\nmkdir -p /etc/wireguard\ncat > /etc/wireguard/%s.conf <<'EOF'\n%sEOF\nchmod 600 /etc/wireguard/%s.conf\n" % (name, entry_conf, name) + \
+                "systemctl enable wg-quick@%s >/dev/null 2>&1; systemctl restart wg-quick@%s\n" % (name, name) + \
+                "".join("fw_open %d tcp; fw_open %d udp\n" % (ep, ep) for ep, _ in flat) + "echo EZ_SETUP_OK\n"
+            S["entry_remove"] = lib + "systemctl disable --now wg-quick@%s >/dev/null 2>&1 || true\n%srm -f /etc/wireguard/%s.conf\necho EZ_REMOVE_OK\n" % (name, clean, name)
+            S["exit_remove"] = lib + "systemctl disable --now wg-quick@%s >/dev/null 2>&1 || true\nrm -f /etc/wireguard/%s.conf\necho EZ_REMOVE_OK\n" % (name, name)
+        else:
+            def gre(local_ip, remote_ip, me, peer, extra):
+                up = ("ip tunnel del %s 2>/dev/null || true\nip tunnel add %s mode gre local %s remote %s ttl 255\n"
+                      "ip addr add %s/30 dev %s\nip link set %s mtu 1380 up\n%s" % (name, name, local_ip, remote_ip, me, name, name, extra))
+                down = "%sip tunnel del %s 2>/dev/null || true\n" % (clean if extra else "", name)
+                return ("modprobe ip_gre 2>/dev/null || true\ncat > $EZ/conf/%s.sh <<'EOF'\n#!/bin/bash\n%sEOF\ncat > $EZ/conf/%s-stop.sh <<'EOF'\n#!/bin/bash\n%sEOF\nchmod +x $EZ/conf/%s*.sh\n"
+                        'unit %s "EZ-XUI GRE %s" "$EZ/conf/%s.sh" "$EZ/conf/%s-stop.sh" oneshot no yes\n' % (name, up, name, down, name, name, tid, name, name))
+            S["entry"] = lib + "pkg iptables\nsysctl -w net.ipv4.ip_forward=1 >/dev/null\n" + gre(entry_ip, exit_ip, a, b, dnat) + \
+                "".join("fw_open %d tcp; fw_open %d udp\n" % (ep, ep) for ep, _ in flat) + "echo EZ_SETUP_OK\n"
+            S["exit"] = lib + gre(exit_ip, entry_ip, b, a, "") + "echo EZ_SETUP_OK\n"
+            S["entry_remove"] = lib + rm_unit(name) + clean + "ip tunnel del %s 2>/dev/null || true\nrm -f $EZ/conf/%s*.sh\necho EZ_REMOVE_OK\n" % (name, name)
+            S["exit_remove"] = lib + rm_unit(name) + "ip tunnel del %s 2>/dev/null || true\nrm -f $EZ/conf/%s*.sh\necho EZ_REMOVE_OK\n" % (name, name)
+    else:
+        raise ValueError("unknown engine")
+    S["token"] = token
+    return S
+
+
+def tunnel_status_script(t):
+    name = "ez-%s" % t["id"]
+    unit = ("wg-quick@" + name) if t["engine"] == "wireguard" else name
+    ports = [ep for ep, _ in expand_ports(parse_ports(t.get("ports", "")))]
+    listen = " ".join(str(p) for p in ports[:20])
+    return ("echo \"active=$(systemctl is-active %s 2>/dev/null)\"\n"
+            "echo \"since=$(systemctl show %s -p ActiveEnterTimestamp --value 2>/dev/null)\"\n"
+            "L=$(ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -u | tr '\\n' ' ')\n"
+            "ok=0; for p in %s; do echo \" $L \" | grep -q \" $p \" && ok=$((ok+1)); done; echo \"listening=$ok/%d\"\n"
+            "echo \"log=$(journalctl -u %s -n 3 --no-pager -o cat 2>/dev/null | tail -c 300 | tr '\\n' ' ')\"\n"
+            % (unit, unit, listen, len(ports), unit))
+
+
+def bench_scripts(t, entry, exit_, tunnel_ip):
+    """iperf3 through the tunnel: exit runs a one-shot server, entry measures download and upload."""
+    eng = t["engine"]
+    if eng == "direct":
+        target = exit_["facts"]["ip"]
+    elif eng in ("wireguard", "gre"):
+        target = tunnel_ip + ".2"
+    else:
+        target = "127.0.0.1"
+    bind = "" if eng == "direct" else ("-B %s " % (tunnel_ip + ".2") if eng in ("wireguard", "gre") else "-B 127.0.0.1 ")
+    exit_script = BASH_LIB + "pkg iperf3\npkill -f 'iperf3 -s -p %d' 2>/dev/null || true\nnohup iperf3 -s -p %d %s-1 -D >/dev/null 2>&1\nsleep 1\necho EZ_BENCH_SERVER_OK\n" % (BENCH_PORT, BENCH_PORT, bind)
+    entry_script = (BASH_LIB + "pkg iperf3\n"
+                    "t0=$(date +%%s%%N); timeout 5 bash -c 'cat < /dev/null > /dev/tcp/%s/%d' 2>/dev/null && echo \"connect_ms=$(( ($(date +%%s%%N)-t0)/1000000 ))\" || echo connect_ms=-1\n"
+                    "iperf3 -c %s -p %d -t 6 -R -J 2>/dev/null | python3 -c 'import sys,json\n"
+                    "try:\n d=json.load(sys.stdin); e=d[\"end\"]; r=e.get(\"sum_received\") or e.get(\"sum\"); print(\"down_mbps=%%.1f\" %% (r[\"bits_per_second\"]/1e6)); print(\"retrans=%%s\" %% e.get(\"sum_sent\",{}).get(\"retransmits\",\"\"))\n"
+                    "except Exception as ex: print(\"down_mbps=-1\"); print(\"err=%%s\" %% ex)' 2>/dev/null\n"
+                    "sleep 1\n"
+                    "iperf3 -c %s -p %d -t 5 -J 2>/dev/null | python3 -c 'import sys,json\n"
+                    "try:\n d=json.load(sys.stdin); r=d[\"end\"].get(\"sum_received\") or d[\"end\"][\"sum\"]; print(\"up_mbps=%%.1f\" %% (r[\"bits_per_second\"]/1e6))\n"
+                    "except Exception: print(\"up_mbps=-1\")' 2>/dev/null\n"
+                    "echo EZ_BENCH_OK\n" % (target, BENCH_PORT, target, BENCH_PORT, target, BENCH_PORT))
+    return entry_script, exit_script
+
+
+PATH_TEST_SCRIPT = r'''
+P=$(ping -c 5 -W 2 -q @IP@ 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}'); echo "ping_ms=${P:--1}"
+L=$(ping -c 5 -W 2 -q @IP@ 2>/dev/null | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+'); echo "loss=${L:-100}"
+for p in @PORTS@; do t0=$(date +%s%N); if timeout 4 bash -c "cat < /dev/null > /dev/tcp/@IP@/$p" 2>/dev/null; then echo "tcp_$p=$(( ($(date +%s%N)-t0)/1000000 ))"; else echo "tcp_$p=-1"; fi; done
+echo "mtu=$(ping -c 1 -M do -s 1352 -W 2 @IP@ >/dev/null 2>&1 && echo 1380ok || echo small)"
+echo EZ_PATH_OK
+'''
+
+PROBE_SCRIPT_HEAD = r'''
+set +e
+EZ=/usr/local/ez-xui
+''' + BASH_LIB.replace("set -e\n", "") + r'''
+need_xray
+URL="@URL@"
+run_one() { # run_one IDX CONFIG_JSON_B64 SERVER PORT
+  local i=$1 conf=$2 host=$3 port=$4 p
+  t0=$(date +%s%N); if timeout 4 bash -c "cat < /dev/null > /dev/tcp/$host/$port" 2>/dev/null; then echo "R $i tcp=$(( ($(date +%s%N)-t0)/1000000 ))"; else echo "R $i tcp=-1"; fi
+  p=$((20000 + RANDOM % 20000)); echo "$conf" | base64 -d | sed "s/__PORT__/$p/" > /tmp/ez-probe-$i.json
+  $EZ/xray run -c /tmp/ez-probe-$i.json >/dev/null 2>&1 & xp=$!
+  for k in 1 2 3 4 5 6 7 8 9 10; do sleep 0.3; timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/$p" 2>/dev/null && break; done
+  out=$(curl -s -o /dev/null --max-time 25 -x socks5h://127.0.0.1:$p -w "%{http_code} %{time_connect} %{time_starttransfer} %{speed_download}" "$URL" 2>/dev/null)
+  echo "R $i http=${out:-0 0 0 0}"
+  kill $xp 2>/dev/null; wait $xp 2>/dev/null; rm -f /tmp/ez-probe-$i.json
+}
+'''
+
+
+def probe_script(entries, url):
+    """entries: [(idx, xray_outbounds, server, port)] -> bash that tests each from the Iran server."""
+    body = PROBE_SCRIPT_HEAD.replace("@URL@", url)
+    for i, outbounds, host, port in entries:
+        conf = {"log": {"loglevel": "none"},
+                "inbounds": [{"listen": "127.0.0.1", "port": "__PORT__", "protocol": "socks", "settings": {"udp": False}}],
+                "outbounds": outbounds}
+        raw = json.dumps(conf).replace('"__PORT__"', "__PORT__")
+        body += "run_one %d %s %s %d\n" % (i, base64.b64encode(raw.encode()).decode(), shq(host), int(port))
+    return body + "echo EZ_PROBE_OK\n"
+
+
+# ---------------------------------------------------------------- background jobs
+
+class Jobs:
+    """Long operations (SSH setups, benchmarks) run in threads; the UI polls their log."""
+
+    def __init__(self):
+        self.jobs = {}
+        self.lock = threading.Lock()
+
+    def start(self, title, fn):
+        jid = secrets.token_hex(4)
+        job = {"id": jid, "title": title, "status": "running", "log": [], "result": None, "error": "",
+               "started": int(time.time() * 1000), "ended": 0}
+        with self.lock:
+            self.jobs[jid] = job
+            for old in sorted(self.jobs.values(), key=lambda j: j["started"])[:-30]:
+                if old["status"] != "running":
+                    self.jobs.pop(old["id"], None)
+
+        def log(msg):
+            with self.lock:
+                job["log"].append(msg)
+
+        def run():
+            try:
+                job["result"] = fn(log)
+                job["status"] = "done"
+            except Exception as e:  # reported to the UI
+                job["status"] = "failed"
+                job["error"] = str(e)
+            job["ended"] = int(time.time() * 1000)
+        threading.Thread(target=run, daemon=True).start()
+        return job
+
+    def get(self, jid):
+        with self.lock:
+            j = self.jobs.get(jid)
+            return dict(j, log=list(j["log"])) if j else None
+
+    def active(self):
+        with self.lock:
+            return [dict(j, log=j["log"][-3:]) for j in self.jobs.values() if j["status"] == "running"]
+
+
+# ---------------------------------------------------------------- network manager
+
+class Net:
+    """Servers, tunnels, tests. State lives in the config (servers, tunnels)."""
+
+    def __init__(self, app):
+        self.app = app
+        self.jobs = Jobs()
+        self.lock = threading.Lock()
+        self.bench = {}     # tunnel id -> last benchmark
+        self.paths = {}     # "entry|exit" -> last path test
+        self.probes = {}    # sub id or "decos" -> last probe from Iran
+        self.trials = {}    # "entry|exit" -> engine trial results
+
+    # -- storage
+    def servers(self):
+        cfg = load_config()
+        own = {"id": "main", "name": cfg.get("main_location") or "این سرور", "host": self.app.rt.get("public_host") or "",
+               "role": "foreign", "local": True, "facts": cfg.get("main_facts") or {}}
+        return [own] + list(cfg.get("servers") or [])
+
+    def server(self, sid):
+        for s in self.servers():
+            if s["id"] == sid:
+                return s
+        raise PanelError("این سرور پیدا نشد")
+
+    def save_server(self, srv):
+        cfg = load_config()
+        if srv.get("local"):
+            cfg["main_facts"] = srv.get("facts") or {}
+        else:
+            lst = [s for s in (cfg.get("servers") or []) if s["id"] != srv["id"]]
+            lst.append({k: v for k, v in srv.items() if k != "local"})
+            cfg["servers"] = sorted(lst, key=lambda s: s.get("created", 0))
+        save_config(cfg)
+        self.app.reload()
+
+    def tunnels(self):
+        return list(load_config().get("tunnels") or [])
+
+    def save_tunnel(self, t):
+        cfg = load_config()
+        lst = [x for x in (cfg.get("tunnels") or []) if x["id"] != t["id"]]
+        lst.append(t)
+        cfg["tunnels"] = sorted(lst, key=lambda x: x.get("created", 0))
+        save_config(cfg)
+        self.app.reload()
+
+    def drop_tunnel(self, tid):
+        cfg = load_config()
+        cfg["tunnels"] = [x for x in (cfg.get("tunnels") or []) if x["id"] != tid]
+        save_config(cfg)
+        self.app.reload()
+
+    # -- servers
+    def add_server(self, name, host, port, user, password, role, log):
+        host = host.strip()
+        if not re.fullmatch(r"[A-Za-z0-9.\-:\[\]]{3,253}", host):
+            raise PanelError("آدرس سرور درست نیست")
+        if any(s.get("host") == host and int(s.get("port") or 22) == int(port) for s in self.servers()):
+            raise PanelError("این سرور قبلاً اضافه شده")
+        srv = {"id": secrets.token_hex(3), "name": name.strip()[:40] or host, "host": host, "port": int(port),
+               "user": (user or "root").strip(), "role": role if role in ("iran", "foreign") else "foreign",
+               "created": int(time.time() * 1000), "facts": {}, "error": ""}
+        log("ورود با رمز و نصب کلید…")
+        try:
+            Remote(srv).install_key(password)
+        except SSHError as e:
+            raise PanelError(str(e))
+        log("کلید نصب شد. خواندن مشخصات سرور…")
+        srv["facts"] = server_facts(srv)
+        self.save_server(srv)
+        log("سرور %s اضافه شد (%s، %s)" % (srv["name"], srv["facts"].get("os", ""), srv["facts"].get("ip", "")))
+        return srv
+
+    def refresh(self, sid, log=None):
+        srv = self.server(sid)
+        try:
+            srv["facts"] = server_facts(srv)
+            srv["error"] = ""
+        except SSHError as e:
+            srv["error"] = str(e)
+        self.save_server(srv)
+        return srv
+
+    def tune(self, sid, log):
+        srv = self.server(sid)
+        log("اعمال BBR، بافرها و محدودیت‌ها روی %s…" % srv["name"])
+        out = Remote(srv).check(TUNE_SCRIPT, 90, "tuning")
+        f = parse_kv(out)
+        srv["facts"] = dict(srv.get("facts") or {}, cc=f.get("cc", ""), qdisc=f.get("qdisc", ""), fwd=True, tuned=True)
+        self.save_server(srv)
+        return f
+
+    def remove_server(self, sid):
+        if sid == "main":
+            raise PanelError("این سرور را نمی‌شود حذف کرد")
+        if any(sid in (t["entry"], t["exit"]) for t in self.tunnels()):
+            raise PanelError("اول تانل‌های این سرور را حذف کن")
+        cfg = load_config()
+        cfg["servers"] = [s for s in (cfg.get("servers") or []) if s["id"] != sid]
+        save_config(cfg)
+        self.app.reload()
+
+    def facts_ok(self, srv):
+        if not (srv.get("facts") or {}).get("ip"):
+            srv["facts"] = server_facts(srv)
+            self.save_server(srv)
+        return srv
+
+    # -- tunnels
+    def _tunnel_ip(self, t):
+        n = 1 + sum(1 for x in self.tunnels() if x["id"] < t["id"]) % 200
+        return "10.77.%d" % n
+
+    def create_tunnel(self, body, log):
+        entry, exit_ = self.server(body.get("entry")), self.server(body.get("exit"))
+        if entry["id"] == exit_["id"]:
+            raise PanelError("ورودی و خروجی نمی‌توانند یک سرور باشند")
+        eng = body.get("engine")
+        if eng not in ENGINES:
+            raise PanelError("نوع تانل نامعتبر")
+        ports = parse_ports(body.get("ports", ""))
+        if not ports:
+            raise PanelError("حداقل یک پورت بده، مثلاً 443")
+        used = {p for x in self.tunnels() if x["entry"] == entry["id"] for p, _ in expand_ports(parse_ports(x.get("ports", "")))}
+        clash = [str(p) for p, _ in expand_ports(ports) if p in used]
+        if clash:
+            raise PanelError("این پورت‌ها روی سرور ورودی قبلاً در تانل دیگری هستند: " + ", ".join(clash[:5]))
+        t = {"id": secrets.token_hex(3), "name": (body.get("name") or "").strip()[:40] or ENGINES[eng][0],
+             "entry": entry["id"], "exit": exit_["id"], "engine": eng, "transport": body.get("transport") or (ENGINES[eng][2][0] if ENGINES[eng][2] else ""),
+             "ports": ", ".join(e if e == x else "%s=%s" % (e, x) for e, x in ports),
+             "cport": _int(body.get("cport")) or random.randint(20000, 60000), "udp": bool(body.get("udp")),
+             "created": int(time.time() * 1000), "status": "setting-up", "error": ""}
+        if ENGINES[eng][2] and t["transport"] not in ENGINES[eng][2]:
+            raise PanelError("ترنسپورت نامعتبر")
+        if body.get("via"):
+            via = next((n for n in UPSTREAMS.nodes() if node_key(n) == body["via"]), None)
+            if via:
+                t["via"] = via
+                t["via_name"] = via["name"]
+        self.save_tunnel(t)
+        try:
+            self.apply_tunnel(t, log)
+        except Exception as e:
+            t["status"], t["error"] = "failed", str(e)
+            self.save_tunnel(t)
+            raise
+        return t
+
+    def apply_tunnel(self, t, log):
+        entry, exit_ = self.facts_ok(self.server(t["entry"])), self.facts_ok(self.server(t["exit"]))
+        if t["engine"] == "xray" and not t.get("priv"):
+            log("ساخت کلیدهای Reality روی %s…" % exit_["name"])
+            out = Remote(exit_).check(BASH_LIB + "need_xray\n$EZ/xray x25519\n", 240, "xray keys")
+            m1, m2 = re.search(r"Private[^:]*:\s*(\S+)", out), re.search(r"Public[^:]*:\s*(\S+)", out)
+            if not (m1 and m2):
+                m1, m2 = re.search(r"PrivateKey:\s*(\S+)", out), re.search(r"Password:\s*(\S+)", out)
+            if not (m1 and m2):
+                raise PanelError("کلید Reality ساخته نشد: " + out[-120:])
+            t["priv"], t["pub"], t["uuid"], t["sid"] = m1.group(1), m2.group(1), str(uuid.uuid4()), secrets.token_hex(4)
+        if t["engine"] == "wireguard" and not t.get("wg_entry_priv"):
+            log("ساخت کلیدهای WireGuard…")
+            for side, srv in (("entry", entry), ("exit", exit_)):
+                out = Remote(srv).check(BASH_LIB + "pkg wireguard-tools\nk=$(wg genkey); echo \"priv=$k\"; echo \"pub=$(echo $k | wg pubkey)\"\n", 180, "wg keys")
+                kv = parse_kv(out)
+                t["wg_%s_priv" % side], t["wg_%s_pub" % side] = kv["priv"], kv["pub"]
+        scripts = tunnel_scripts(t, entry, exit_, self._tunnel_ip(t))
+        t["token"] = scripts["token"]
+        order = (("exit", exit_), ("entry", entry)) if ENGINES[t["engine"]][1] != "exit->entry" else (("entry", entry), ("exit", exit_))
+        for side, srv in order:
+            log("راه‌اندازی سمت %s روی %s…" % ("خروجی" if side == "exit" else "ورودی", srv["name"]))
+            out = Remote(srv).check(scripts[side], 420, "setup on " + srv["name"])
+            if "EZ_SETUP_OK" not in out:
+                raise PanelError("راه‌اندازی روی %s ناتمام ماند" % srv["name"])
+        t["status"], t["error"] = "up", ""
+        self.save_tunnel(t)
+        log("تانل آماده‌ست. بررسی وضعیت…")
+        self.status_tunnel(t["id"])
+        return t
+
+    def status_tunnel(self, tid):
+        t = next((x for x in self.tunnels() if x["id"] == tid), None)
+        if not t:
+            raise PanelError("تانل پیدا نشد")
+        res = {}
+        for side in ("entry", "exit"):
+            srv = self.server(t[side])
+            try:
+                rc, out, err = Remote(srv).run(tunnel_status_script(t), 30)
+                kv = parse_kv(out)
+                res[side] = {"active": kv.get("active", ""), "listening": kv.get("listening", ""), "log": kv.get("log", ""), "since": kv.get("since", "")}
+            except SSHError as e:
+                res[side] = {"active": "unreachable", "error": str(e)}
+        up = res["entry"].get("active") == "active" and res["exit"].get("active") in ("active", "", "inactive")
+        if t["engine"] in ("direct",):
+            up = res["entry"].get("active") == "active"
+        elif t["engine"] in ("backhaul", "gost", "xray", "wireguard", "gre"):
+            up = res["entry"].get("active") == "active" and res["exit"].get("active") == "active"
+        t["status"] = "up" if up else "down"
+        t["check"] = dict(res, at=int(time.time() * 1000))
+        self.save_tunnel(t)
+        return t
+
+    def remove_tunnel(self, tid, log):
+        t = next((x for x in self.tunnels() if x["id"] == tid), None)
+        if not t:
+            raise PanelError("تانل پیدا نشد")
+        entry, exit_ = self.server(t["entry"]), self.server(t["exit"])
+        try:
+            scripts = tunnel_scripts(t, self.facts_ok(entry), self.facts_ok(exit_), self._tunnel_ip(t))
+        except Exception:
+            scripts = {}
+        errors = []
+        for side, srv in (("entry", entry), ("exit", exit_)):
+            if not scripts.get(side + "_remove"):
+                continue
+            log("پاک کردن از %s…" % srv["name"])
+            try:
+                Remote(srv).check(scripts[side + "_remove"], 120, "remove")
+            except SSHError as e:
+                errors.append("%s: %s" % (srv["name"], e))
+        self.drop_tunnel(tid)
+        self.bench.pop(tid, None)
+        if errors:
+            log("پاک شد، با خطا: " + "؛ ".join(errors))
+        return errors
+
+    def path_test(self, entry_id, exit_id, log):
+        entry, exit_ = self.facts_ok(self.server(entry_id)), self.facts_ok(self.server(exit_id))
+        ports = sorted({22, 443, 2053, int(exit_["facts"].get("xui_port") or 0) or 443, 8443})
+        log("تست مسیر از %s به %s…" % (entry["name"], exit_["name"]))
+        out = Remote(entry).check(PATH_TEST_SCRIPT.replace("@IP@", exit_["facts"]["ip"]).replace("@PORTS@", " ".join(map(str, ports))), 90, "path test")
+        kv = parse_kv(out)
+        res = {"ping_ms": float(kv.get("ping_ms") or -1), "loss": _int(kv.get("loss")), "mtu": kv.get("mtu", ""),
+               "tcp": {p: _int(kv.get("tcp_%d" % p, -1)) for p in ports}, "at": int(time.time() * 1000)}
+        self.paths["%s|%s" % (entry_id, exit_id)] = res
+        return res
+
+    def benchmark(self, tid, log):
+        t = next((x for x in self.tunnels() if x["id"] == tid), None)
+        if not t:
+            raise PanelError("تانل پیدا نشد")
+        if t["status"] != "up":
+            raise PanelError("تانل بالا نیست")
+        entry, exit_ = self.facts_ok(self.server(t["entry"])), self.facts_ok(self.server(t["exit"]))
+        tunnel_ip = self._tunnel_ip(t)
+        if t["engine"] in ("backhaul", "gost", "xray") and not t.get("bench"):
+            log("افزودن پورت تست به تانل…")
+            t["bench"] = True
+            self.save_tunnel(t)
+            self.apply_tunnel(t, log)
+        e_script, x_script = bench_scripts(t, entry, exit_, tunnel_ip)
+        log("اجرای iperf3 روی %s…" % exit_["name"])
+        Remote(exit_).check(x_script, 180, "iperf3 server")
+        log("اندازه‌گیری سرعت از %s (حدود ۱۵ ثانیه)…" % entry["name"])
+        out = Remote(entry).check(e_script, 180, "iperf3 client")
+        kv = parse_kv(out)
+        res = {"down_mbps": float(kv.get("down_mbps") or -1), "up_mbps": float(kv.get("up_mbps") or -1),
+               "connect_ms": _int(kv.get("connect_ms", -1)), "retrans": kv.get("retrans", ""), "at": int(time.time() * 1000)}
+        self.bench[tid] = res
+        t["bench_result"] = res
+        self.save_tunnel(t)
+        log("دانلود %s Mbps، آپلود %s Mbps" % (res["down_mbps"], res["up_mbps"]))
+        return res
+
+    def trial(self, entry_id, exit_id, combos, log):
+        """Set up each engine with only the test port, benchmark it, tear it down; keep the table."""
+        entry, exit_ = self.facts_ok(self.server(entry_id)), self.facts_ok(self.server(exit_id))
+        results = []
+        for eng, tr in combos:
+            t = {"id": "t" + secrets.token_hex(2), "name": "trial", "entry": entry_id, "exit": exit_id, "engine": eng,
+                 "transport": tr, "ports": "", "cport": random.randint(30000, 60000), "bench": True,
+                 "created": int(time.time() * 1000), "status": "setting-up"}
+            label = ENGINES[eng][0] + (" · " + tr if tr else "")
+            log("▶ %s" % label)
+            row = {"engine": eng, "transport": tr, "label": label, "ok": False, "error": ""}
+            self.save_tunnel(t)
+            try:
+                self.apply_tunnel(t, log)
+                time.sleep(2)
+                if t["status"] != "up":
+                    raise PanelError("بالا نیامد: " + json.dumps(t.get("check", {}), ensure_ascii=False)[:200])
+                row.update(self.benchmark(t["id"], log), ok=True)
+            except Exception as e:
+                row["error"] = str(e)[:300]
+                log("✗ %s: %s" % (label, row["error"]))
+            finally:
+                try:
+                    self.remove_tunnel(t["id"], log)
+                except Exception:
+                    self.drop_tunnel(t["id"])
+            results.append(row)
+        good = [r for r in results if r["ok"] and r.get("down_mbps", -1) > 0]
+        best = max(good, key=lambda r: (r["down_mbps"], -max(r.get("connect_ms", 0), 0))) if good else None
+        out = {"results": results, "best": best, "at": int(time.time() * 1000)}
+        self.trials["%s|%s" % (entry_id, exit_id)] = out
+        return out
+
+    # -- user-experience probe from an Iran server
+    def probe(self, server_id, sub, log):
+        srv = self.facts_ok(self.server(server_id))
+        rt = self.app.rt
+        entries = []
+        if sub:
+            status, hdrs, body = http_get(rt["xui_sub_url"] + urllib.parse.quote(sub), connect=rt.get("xui_connect", ""))
+            if status != 200:
+                raise PanelError("ساب کاربر خوانده نشد")
+            own = label_configs(parse_nodes(split_lines(body)), rt)
+        else:
+            own = []
+        ups = UPSTREAMS.nodes()
+        main = label(rt, "label_main")
+        for n in own:
+            try:
+                entries.append((len(entries), [to_xray(n, "proxy")], n["server"], n["port"], route_name(rt, n, len(own) == 1, main)))
+            except ValueError:
+                pass
+        for i, u, o in deco_options(rt, ups):
+            try:
+                hop = to_xray(u, "up")
+            except ValueError:
+                continue
+            if o["chain"]:
+                for n in own:
+                    try:
+                        c = to_xray(n, "proxy")
+                        c["streamSettings"]["sockopt"] = {"dialerProxy": "up"}
+                        entries.append((len(entries), [c, hop], u["server"], u["port"], route_name(rt, n, len(own) == 1, o["chain_name"])))
+                    except ValueError:
+                        pass
+            entries.append((len(entries), [dict(hop, tag="proxy")], u["server"], u["port"], o["own_name"]))
+        if not entries:
+            raise PanelError("کانفیگی برای تست نیست")
+        entries = entries[:12]
+        log("تست %d مسیر از %s (هر کدام تا ۲۵ ثانیه)…" % (len(entries), srv["name"]))
+        script = probe_script([(i, ob, h, p) for i, ob, h, p, _ in entries], rt.get("probe_url") or "https://speed.cloudflare.com/__down?bytes=10000000")
+        out = Remote(srv).check(script, 60 + 35 * len(entries), "probe")
+        rows = {i: {"name": nm, "server": h, "tcp_ms": None, "ttfb_ms": None, "mbps": None, "ok": False} for i, _, h, _, nm in entries}
+        for line in out.splitlines():
+            m = re.match(r"R (\d+) (tcp|http)=(.*)", line)
+            if not m:
+                continue
+            i, kind, val = int(m.group(1)), m.group(2), m.group(3).split()
+            if i not in rows:
+                continue
+            if kind == "tcp":
+                rows[i]["tcp_ms"] = int(val[0]) if val and val[0] != "-1" else None
+            else:
+                try:
+                    code, tc, ttfb, speed = val[0], float(val[1]), float(val[2]), float(val[3])
+                except (ValueError, IndexError):
+                    continue
+                rows[i]["ok"] = code.startswith("2")
+                rows[i]["ttfb_ms"] = int(ttfb * 1000) if ttfb else None
+                rows[i]["mbps"] = round(speed * 8 / 1e6, 1) if speed else 0
+        res = {"server": srv["name"], "rows": [rows[i] for i in sorted(rows)], "at": int(time.time() * 1000), "sub": sub}
+        self.probes[sub or "decos"] = res
+        return res
+
+    # -- a location (3x-ui node) straight from a server
+    def node_from_server(self, server_id, name, template, attach, log):
+        srv = self.facts_ok(self.server(server_id))
+        if srv.get("local"):
+            raise PanelError("این سرور خودِ پنل است")
+        log("اجرای node.sh روی %s (اگر 3x-ui نداشته باشد نصب می‌شود؛ چند دقیقه)…" % srv["name"])
+        out = Remote(srv).check("export DEBIAN_FRONTEND=noninteractive\nbash <(curl -fsSL %s/node.sh) 2>&1\n" % RAW_BASE, 900, "node.sh")
+        m = re.search(LOCATION_PREFIX + r"[A-Za-z0-9_=-]+", out)
+        if not m:
+            raise PanelError("کد لوکیشن به دست نیامد: " + out.strip()[-200:])
+        conn = parse_location(m.group(0))
+        log("ثبت لوکیشن در پنل…")
+        node_id = self.app.panel.add_node(name or srv["name"], conn)
+        msg = "لوکیشن %s اضافه شد" % (name or srv["name"])
+        if template and node_id:
+            ib = self.app.panel.clone_inbound(_int(template), node_id, name or srv["name"])
+            if attach and ib:
+                emails = [c["email"] for c in (read_clients(self.app.db_path) or clients_from_panel(self.app.panel.overview()["inbounds"]))]
+                n = self.app.panel.attach_all(emails, [ib])
+                msg += "، inbound ساخته شد و %d کاربر اضافه شدند" % n
+            else:
+                msg += " و inbound ساخته شد"
+        srv["node_id"] = node_id
+        self.save_server(srv)
+        log(msg)
+        return msg
+
 # ---------------------------------------------------------------- admin state and actions
 
 LOCATION_PREFIX = "EZXUI-"
@@ -2051,6 +3087,7 @@ def admin_state(app, host):
             "title": cfg.get("title", ""), "label_main": label(cfg, "label_main"),
             "main_location": cfg.get("main_location", ""),
             "show_auto": cfg.get("show_auto", True), "show_main": cfg.get("show_main", True),
+            "auto_mode": cfg.get("auto_mode") or "priority", "probe_url": cfg.get("probe_url", ""),
             "show_deco_any": cfg.get("show_deco_any", True),
             "user_page": cfg.get("user_page", True), "support_url": cfg.get("support_url", ""),
             "announce": cfg.get("announce", ""),
@@ -2086,14 +3123,99 @@ def admin_state(app, host):
         "users": [{k: u[k] for k in ("sub", "name", "emails", "enable", "used", "total", "expiry", "devices",
                                      "inbounds", "online")} for u in users],
         "users_source": source,
+        "net": net_state(app),
     }
+
+
+def public_server(s):
+    out = {k: s.get(k) for k in ("id", "name", "host", "port", "user", "role", "local", "created", "error", "node_id")}
+    f = s.get("facts") or {}
+    out["facts"] = {k: f.get(k) for k in ("hostname", "arch", "os", "ip", "cc", "qdisc", "fwd", "cpus", "mem", "load",
+                                          "uptime", "xui", "xui_port", "tools", "ipv6", "units", "at", "tuned")}
+    return out
+
+
+def net_state(app):
+    net = app.net
+    tunnels = []
+    for t in net.tunnels():
+        tunnels.append({k: t.get(k) for k in ("id", "name", "entry", "exit", "engine", "transport", "ports", "cport", "udp",
+                                               "created", "status", "error", "check", "bench_result", "via_name")})
+    return {"servers": [public_server(s) for s in net.servers()], "tunnels": tunnels,
+            "engines": {k: {"name": v[0], "direction": v[1], "transports": v[2], "note": v[3]} for k, v in ENGINES.items()},
+            "jobs": net.jobs.active(), "paths": net.paths, "trials": net.trials, "probes": net.probes,
+            "iran": [s["id"] for s in net.servers() if s.get("role") == "iran"]}
 
 
 SETTING_BOOLS = ("direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "show_main",
                  "show_deco_any")
-SETTING_TEXTS = {"title": 60, "main_location": 40, "support_url": 300, "announce": 500, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
+SETTING_TEXTS = {"title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("tg_token", "panel_token", "panel_pass")
+
+
+def net_action(app, action, body, host, done, fail):
+    net = app.net
+    jobs = net.jobs
+
+    def job(title, fn):
+        j = jobs.start(title, fn)
+        return 200, {"ok": True, "msg": title + "…", "job": j["id"], "state": admin_state(app, host)}
+
+    if action == "job":
+        j = jobs.get(str(body.get("id", "")))
+        if not j:
+            return fail("job not found", 404)
+        out = {"ok": True, "job": j}
+        if j["status"] != "running":
+            out["state"] = admin_state(app, host)
+        return 200, out
+    if action == "server_add":
+        name, hostname = str(body.get("name", "")), str(body.get("host", ""))
+        port, user, pw, role = _int(body.get("port")) or 22, str(body.get("user") or "root"), str(body.get("password", "")), str(body.get("role", "foreign"))
+        if not hostname or not pw:
+            return fail("آدرس و رمز سرور لازم است")
+        return job("افزودن سرور %s" % (name or hostname), lambda log: public_server(net.add_server(name, hostname, port, user, pw, role, log)))
+    if action == "server_refresh":
+        return job("به‌روزرسانی سرور", lambda log: public_server(net.refresh(str(body.get("id", "")), log)))
+    if action == "server_tune":
+        return job("بهینه‌سازی سرور", lambda log: net.tune(str(body.get("id", "")), log))
+    if action == "server_delete":
+        net.remove_server(str(body.get("id", "")))
+        return done("سرور حذف شد")
+    if action == "server_role":
+        srv = net.server(str(body.get("id", "")))
+        srv["role"] = "iran" if body.get("role") == "iran" else "foreign"
+        if not srv.get("local"):
+            net.save_server(srv)
+        return done("نقش سرور عوض شد")
+    if action == "tunnel_add":
+        return job("ساخت تانل", lambda log: {k: v for k, v in net.create_tunnel(body, log).items() if k not in ("priv", "token")})
+    if action == "tunnel_delete":
+        return job("حذف تانل", lambda log: net.remove_tunnel(str(body.get("id", "")), log))
+    if action == "tunnel_status":
+        net.status_tunnel(str(body.get("id", "")))
+        return done("وضعیت تانل به‌روز شد")
+    if action == "tunnel_apply":
+        t = next((x for x in net.tunnels() if x["id"] == str(body.get("id", ""))), None)
+        if not t:
+            return fail("تانل پیدا نشد")
+        return job("راه‌اندازی دوباره‌ی تانل", lambda log: net.apply_tunnel(t, log) and "ok")
+    if action == "tunnel_bench":
+        return job("بنچمارک تانل", lambda log: net.benchmark(str(body.get("id", "")), log))
+    if action == "path_test":
+        return job("تست مسیر", lambda log: net.path_test(str(body.get("entry", "")), str(body.get("exit", "")), log))
+    if action == "trial":
+        combos = [(c.get("engine"), c.get("transport") or "") for c in body.get("combos") or [] if c.get("engine") in ENGINES]
+        if not combos:
+            combos = [("direct", ""), ("backhaul", "tcpmux"), ("gost", "tls"), ("xray", "reality"), ("wireguard", ""), ("gre", "")]
+        return job("مقایسه‌ی روش‌های تانل", lambda log: net.trial(str(body.get("entry", "")), str(body.get("exit", "")), combos, log))
+    if action == "probe":
+        return job("تست از ایران", lambda log: net.probe(str(body.get("server", "")), str(body.get("sub", "")), log))
+    if action == "node_from_server":
+        return job("ساخت لوکیشن از سرور", lambda log: net.node_from_server(str(body.get("id", "")), str(body.get("name", "")).strip()[:40],
+                                                                        body.get("template"), bool(body.get("attach")), log))
+    return fail("not found", 404)
 
 
 def do_action(app, action, body, host):
@@ -2157,9 +3279,11 @@ def do_action(app, action, body, host):
 
         if action == "sub_layout":
             cfg = load_config()
-            for k in ("show_auto", "show_main", "show_deco_any"):
+            for k in ("show_auto", "show_main", "show_deco_any", "direct_first"):
                 if k in body:
                     cfg[k] = bool(body[k])
+            if body.get("auto_mode") in ("priority", "fastest"):
+                cfg["auto_mode"] = body["auto_mode"]
             for k in ("label_main", "label_deco", "label_auto"):
                 if k in body:
                     cfg[k] = str(body[k] or "").strip()[:30] or DEFAULTS[k]
@@ -2169,6 +3293,7 @@ def do_action(app, action, body, host):
                 if not key:
                     continue
                 stored[key] = {"chain": bool(d.get("chain", True)), "own": bool(d.get("own", False)),
+                               "chain_auto": bool(d.get("chain_auto", True)), "own_auto": bool(d.get("own_auto", False)),
                                "chain_name": str(d.get("chain_name") or "").strip()[:40],
                                "own_name": str(d.get("own_name") or "").strip()[:60]}
             current = {node_key(n) for n in UPSTREAMS.nodes()}
@@ -2176,6 +3301,9 @@ def do_action(app, action, body, host):
             save_config(cfg)
             app.reload()
             return done("محتوای ساب ذخیره شد")
+
+        if action.startswith("net_"):
+            return net_action(app, action[4:], body, host, done, fail)
 
         if action == "password":
             if not check_password(str(body.get("old", "")), Auth.stored()):
@@ -2315,11 +3443,22 @@ ADMIN_HTML = r"""<!doctype html>
 <title>EZ-XUI</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css">
 <style>
-:root{--bg:#0a0f1d;--bg2:#0d1426;--card:#111a2e;--card2:#16213b;--line:#22304f;--fg:#e8edf7;--mut:#8b98b4;--acc:#5b8cff;--acc2:#8b5cff;--ok:#22c55e;--warn:#f5a524;--bad:#f43f5e;--okbg:rgba(34,197,94,.12);--warnbg:rgba(245,165,36,.13);--badbg:rgba(244,63,94,.12);--accbg:rgba(91,140,255,.14);--shadow:0 12px 32px rgba(0,0,0,.35);--r:18px;color-scheme:dark}
-:root[data-theme=light]{--bg:#f2f5fb;--bg2:#e9eef8;--card:#fff;--card2:#f5f7fc;--line:#e1e7f2;--fg:#131a2c;--mut:#62708c;--acc:#3a6df0;--acc2:#7044f0;--okbg:rgba(34,197,94,.12);--accbg:rgba(58,109,240,.1);--shadow:0 8px 24px rgba(20,35,70,.08);color-scheme:light}
+:root{--bg:#0b0d12;--bg2:#10131a;--card:#141821;--card2:#1a1f2a;--line:#232935;--fg:#eceff4;--mut:#8a93a3;--acc:#6d8cff;--acc2:#6d8cff;--ok:#2fd27a;--warn:#f0b43c;--bad:#f45b69;--okbg:rgba(47,210,122,.12);--warnbg:rgba(240,180,60,.13);--badbg:rgba(244,91,105,.12);--accbg:rgba(109,140,255,.14);--shadow:none;--r:16px;color-scheme:dark}
+:root[data-theme=light]{--bg:#f6f7fa;--bg2:#eef0f5;--card:#fff;--card2:#f3f4f8;--line:#e3e6ee;--fg:#14171f;--mut:#6b7384;--acc:#3b5bdb;--acc2:#3b5bdb;--okbg:rgba(47,210,122,.14);--accbg:rgba(59,91,219,.1);--shadow:none;color-scheme:light}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;background:var(--bg);color:var(--fg)}
-body{font:15px/1.65 Vazirmatn,Tahoma,system-ui,sans-serif;min-height:100vh;background:radial-gradient(1200px 500px at 85% -10%,rgba(91,140,255,.16),transparent 60%),radial-gradient(900px 400px at -10% 10%,rgba(139,92,255,.12),transparent 60%),var(--bg);background-attachment:fixed}
+body{font:15px/1.65 Vazirmatn,Tahoma,system-ui,sans-serif;min-height:100vh;background:var(--bg)}
+.mono{width:38px;height:38px;border-radius:11px;display:inline-grid;place-items:center;flex:none;font:800 13px/1 Vazirmatn,system-ui,sans-serif;letter-spacing:.3px;direction:ltr;color:hsl(var(--h) 70% 72%);background:hsl(var(--h) 45% 20%);border:1px solid hsl(var(--h) 40% 28%)}
+:root[data-theme=light] .mono{color:hsl(var(--h) 55% 32%);background:hsl(var(--h) 70% 93%);border-color:hsl(var(--h) 50% 85%)}
+.mono.acc{color:#fff;background:var(--acc);border-color:var(--acc)}
+.mono.sm{width:30px;height:30px;border-radius:9px;font-size:11.5px}
+.pill{font-size:11.5px;padding:1px 8px;border-radius:7px;background:var(--card2);border:1px solid var(--line)}.pill.ir{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,var(--line))}
+.seg.wide{display:flex;width:100%;margin:4px 0 10px}.seg.wide button{flex:1}
+.tbl{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px}.tbl th{text-align:right;color:var(--mut);font-weight:500;padding:6px 4px;border-bottom:1px solid var(--line)}.tbl td{padding:7px 4px;border-bottom:1px dashed var(--line);white-space:nowrap}.tbl td:first-child{white-space:normal}.tbl tr:last-child td{border:0}.tbl tr.best td{color:var(--ok);font-weight:700}.tbl tr.bad td{color:var(--mut)}
+.job{border-color:color-mix(in srgb,var(--acc) 40%,var(--line))}.jh{display:flex;align-items:center;gap:10px}.spin{width:14px;height:14px;border-radius:50%;border:2px solid var(--acc);border-left-color:transparent;animation:spin .8s linear infinite;flex:none}
+.ltr-auto{unicode-bidi:plaintext}
+.loc-chip.ok{color:var(--ok)}.loc-chip.no{color:var(--bad)}
+.note-card{background:var(--card2)}
 button,input,textarea,select{font:inherit;color:inherit}
 input,textarea,select{font-size:16px}/* no zoom on focus in iOS */
 button{touch-action:manipulation}
@@ -2340,14 +3479,14 @@ select.in{appearance:none;-webkit-appearance:none;background-image:linear-gradie
 .top{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 16px;padding-top:max(10px,env(safe-area-inset-top));background:var(--bg);background:color-mix(in srgb,var(--bg) 78%,transparent);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
 .top .inner{max-width:780px;margin:0 auto;width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px}
 .brand{display:flex;align-items:center;gap:10px;min-width:0}
-.logo{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;color:#fff;font:800 15px/1 Vazirmatn,system-ui,sans-serif;letter-spacing:.5px;direction:ltr;background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:0 6px 18px rgba(91,140,255,.35)}
+.logo{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;color:#fff;font:800 14px/1 Vazirmatn,system-ui,sans-serif;letter-spacing:.5px;direction:ltr;background:var(--acc)}
 .brand b{display:block;font-size:16px;line-height:1.2}.brand small{display:block;color:var(--mut);font-size:12px;direction:ltr;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:52vw}
 .hbtns{display:flex;gap:6px}
 .ibtn{width:40px;height:40px;border-radius:12px;border:1px solid var(--line);background:var(--card);display:grid;place-items:center;cursor:pointer;color:var(--fg)}
 .ibtn:active{transform:scale(.96)}
 /* bottom nav */
 .nav{position:fixed;bottom:0;left:0;right:0;z-index:20;padding:8px 12px max(8px,env(safe-area-inset-bottom));background:var(--bg);background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-top:1px solid var(--line)}
-.nav .inner{max-width:560px;margin:0 auto;display:grid;grid-template-columns:repeat(5,1fr);gap:4px}
+.nav .inner{max-width:520px;margin:0 auto;display:grid;grid-template-columns:repeat(4,1fr);gap:4px}
 .nav button{border:0;background:none;color:var(--mut);display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 0;border-radius:14px;cursor:pointer;font-size:11.5px;white-space:nowrap;transition:background .15s,color .15s}
 .nav button.on{color:var(--acc);background:var(--accbg)}
 .nav .i{width:22px;height:22px}
@@ -2358,29 +3497,30 @@ select.in{appearance:none;-webkit-appearance:none;background-image:linear-gradie
 .card p{margin:4px 0 10px}
 .sec-title{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:18px 2px 6px}
 .sec-title h3{font-size:15px;margin:0}
-.hero{position:relative;overflow:hidden;border-radius:22px;padding:18px;margin:12px 0;border:1px solid var(--line);background:var(--card);background:linear-gradient(135deg,color-mix(in srgb,var(--acc) 22%,var(--card)),color-mix(in srgb,var(--acc2) 18%,var(--card)));box-shadow:var(--shadow)}
-.hero.okk{background:linear-gradient(135deg,color-mix(in srgb,var(--ok) 20%,var(--card)),color-mix(in srgb,var(--acc) 14%,var(--card)))}
-.hero.badd{background:linear-gradient(135deg,color-mix(in srgb,var(--bad) 22%,var(--card)),var(--card))}
-.hero.warnn{background:linear-gradient(135deg,color-mix(in srgb,var(--warn) 22%,var(--card)),var(--card))}
+.hero{position:relative;overflow:hidden;border-radius:var(--r);padding:18px;margin:12px 0;border:1px solid var(--line);background:var(--card)}
+.hero.okk{border-color:color-mix(in srgb,var(--ok) 45%,var(--line))}
+.hero.badd{border-color:color-mix(in srgb,var(--bad) 50%,var(--line))}
+.hero.warnn{border-color:color-mix(in srgb,var(--warn) 50%,var(--line))}
 .hero b{font-size:18px;display:block}.hero .mut{font-size:13px}
-.hero .big{position:absolute;left:14px;top:14px;opacity:.18}.hero .big .i{width:76px;height:76px}
+.hero .big{position:absolute;left:14px;top:14px;opacity:.12}.hero .big .i{width:76px;height:76px}
 .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
 @media(min-width:640px){.grid.g4{grid-template-columns:repeat(4,1fr)}}
 .stat{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:12px 14px}
 .stat .k{color:var(--mut);font-size:12.5px;display:flex;align-items:center;gap:6px}.stat .k .i{width:16px;height:16px}
 .stat .v{font-size:22px;font-weight:700;margin-top:2px}.stat .v small{font-size:13px;color:var(--mut);font-weight:500}
 .bar{height:8px;border-radius:99px;background:var(--card2);overflow:hidden;border:1px solid var(--line)}
-.bar i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--acc),var(--acc2));min-width:3px}
+.bar i{display:block;height:100%;border-radius:99px;background:var(--acc);min-width:3px}
 .bar i.warn{background:var(--warn)}.bar i.bad{background:var(--bad)}
 .meter{margin:10px 0}.meter .row{display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px}
 .badge{display:inline-flex;align-items:center;gap:4px;font-size:12px;padding:2px 10px;border-radius:99px;white-space:nowrap;font-weight:600}
 .b-on{background:var(--okbg);color:var(--ok)}.b-off{background:var(--card2);color:var(--mut)}.b-exp,.b-full{background:var(--badbg);color:var(--bad)}.b-wait,.b-soon{background:var(--warnbg);color:var(--warn)}.b-acc{background:var(--accbg);color:var(--acc)}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--line);display:inline-block;flex:none}.dot.on{background:var(--ok);box-shadow:0 0 0 4px var(--okbg)}
 /* buttons */
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:0;border-radius:14px;padding:11px 16px;cursor:pointer;font-weight:600;background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;box-shadow:0 8px 20px rgba(91,140,255,.28);transition:transform .1s,opacity .2s;text-decoration:none}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:0;border-radius:12px;padding:11px 16px;cursor:pointer;font-weight:600;background:var(--acc);color:#fff;box-shadow:none;transition:transform .1s,opacity .2s,filter .15s;text-decoration:none}
+.btn:hover{filter:brightness(1.08)}
 .btn:active{transform:scale(.98)}.btn[disabled]{opacity:.55}
 .btn.ghost{background:var(--card2);color:var(--fg);border:1px solid var(--line);box-shadow:none}
-.btn.danger{background:var(--bad);box-shadow:0 8px 20px rgba(244,63,94,.25)}
+.btn.danger{background:var(--bad)}
 .btn.sm{padding:7px 12px;border-radius:12px;font-size:13.5px}
 .btn.block{width:100%}
 .btn.busy{pointer-events:none;opacity:.7}.btn.busy::after{content:"";width:15px;height:15px;border-radius:50%;border:2px solid currentColor;border-left-color:transparent;animation:spin .7s linear infinite}
@@ -2415,6 +3555,7 @@ textarea.in{min-height:120px;font:14px/1.6 ui-monospace,Menlo,Consolas,monospace
 .chip b{font-weight:700;opacity:.8;margin-inline-start:4px}
 .check{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--line);border-radius:12px;margin:6px 0;cursor:pointer;background:var(--bg2)}
 .check input{width:18px;height:18px;accent-color:var(--acc)}
+.check.small-check{margin:-4px 0 8px;padding:7px 12px;font-size:13px;background:transparent}
 /* search */
 .search{position:relative;flex:1}.search .i{position:absolute;right:12px;top:50%;transform:translateY(-50%);color:var(--mut)}
 .search .in{padding-right:40px}
@@ -2432,7 +3573,7 @@ textarea.in{min-height:120px;font:14px/1.6 ui-monospace,Menlo,Consolas,monospace
 /* decos */
 .dcard{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px;margin:10px 0}
 .dhead{display:flex;gap:10px;align-items:center}
-.prio{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;font-weight:800;background:var(--accbg);color:var(--acc);flex:none}
+.prio{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;font-weight:800;background:var(--accbg);color:var(--acc);flex:none}
 .dtitle{flex:1;min-width:0}.dtitle b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dtitle small{color:var(--mut);font-size:12px}
 .dacts{display:flex;gap:4px}.dacts button{width:34px;height:34px;border-radius:10px;border:1px solid var(--line);background:var(--card2);display:grid;place-items:center;cursor:pointer;color:var(--fg)}
 .dacts button[disabled]{opacity:.35}.dacts .i{width:17px;height:17px}
@@ -2443,7 +3584,7 @@ textarea.in{min-height:120px;font:14px/1.6 ui-monospace,Menlo,Consolas,monospace
 .err{color:var(--bad);font-size:13px;margin-top:6px}
 /* sheet */
 .ov{position:fixed;inset:0;z-index:50;background:rgba(5,8,18,.55);backdrop-filter:blur(3px);display:flex;align-items:flex-end;justify-content:center;animation:fade .15s}
-.sheet{width:100%;max-width:560px;max-height:92vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:24px 24px 0 0;padding:8px 16px max(18px,env(safe-area-inset-bottom));animation:up .22s ease-out}
+.sheet{width:100%;max-width:560px;max-height:92vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:20px 20px 0 0;padding:8px 16px max(18px,env(safe-area-inset-bottom));animation:up .22s ease-out}
 @media(min-width:700px){.ov{align-items:center}.sheet{border-radius:24px}}
 .grab{width:42px;height:5px;border-radius:9px;background:var(--line);margin:4px auto 10px}
 .sheet h3{margin:0 0 4px;font-size:17px;display:flex;align-items:center;gap:8px}
@@ -2455,7 +3596,7 @@ textarea.in{min-height:120px;font:14px/1.6 ui-monospace,Menlo,Consolas,monospace
 .menu button:last-child{border-bottom:0}.menu .danger{color:var(--bad)}
 /* toast */
 #toasts{position:fixed;top:max(12px,env(safe-area-inset-top));left:0;right:0;z-index:80;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;padding:0 16px}
-.toast{pointer-events:auto;max-width:520px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 14px;box-shadow:var(--shadow);display:flex;gap:10px;align-items:center;animation:up .2s}
+.toast{pointer-events:auto;max-width:520px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 14px;box-shadow:0 10px 30px rgba(0,0,0,.25);display:flex;gap:10px;align-items:center;animation:up .2s}
 .toast.ok .i{color:var(--ok)}.toast.bad .i{color:var(--bad)}
 /* auth */
 .auth{min-height:100vh;display:grid;place-items:center;padding:24px 16px}
@@ -2493,7 +3634,7 @@ bell:"M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0",lock
 globe:"M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20",
 zap:"M13 2 3 14h9l-1 8 10-12h-9z",alert:"M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z",
 qr:"M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h3v3h-3zM20 14v.01M14 20h.01M17 20h4v-3",info:"M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 16v-4M12 8h.01",
-text:"M4 6h16M4 12h16M4 18h10",clock:"M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2"
+text:"M4 6h16M4 12h16M4 18h10",chart:"M3 3v18h18M7 15v3M12 10v8M17 6v12",clock:"M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2"
 };
 const ic=(n,c="")=>`<svg class="i ${c}" viewBox="0 0 24 24" aria-hidden="true"><path d="${I[n]}"/></svg>`;
 const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
@@ -2604,7 +3745,9 @@ function bindAuth(){
 }
 
 /* layout */
-const TABS=[["home","home","خانه"],["users","users","کاربرها"],["locations","globe","لوکیشن‌ها"],["decos","link","Decoها"],["settings","sliders","تنظیمات"]];
+const TABS=[["home","home","خانه"],["users","users","کاربرها"],["net","globe","شبکه"],["settings","sliders","تنظیمات"]];
+const TAB_ALIAS={locations:["net","locations"],decos:["net","decos"]};
+if(TAB_ALIAS[S.tab])S.tab="net";
 function render(){
   const app=$("#app");
   if(!S.state){app.innerHTML=S.auth?authView():`<div class="wrap"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>`;bindAuth();return}
@@ -2646,6 +3789,8 @@ VIEWS.home=()=>{
   </div>
   ${!st.panel.configured?`<div class="card"><h2>${ic("info")} پنل 3x-ui وصل نیست</h2><p class="mut">${st.settings.panel_auto&&st.settings.auto_note?esc(st.settings.auto_note):"برای ساخت و مدیریت کاربر از همین‌جا، پنل رو در تنظیمات وصل کن."}</p><button class="btn sm" data-act="goto-panel">رفتن به تنظیمات پنل</button></div>`:""}
   ${attention.length?`<div class="sec-title"><h3>نیاز به تمدید</h3><button class="btn sm ghost" data-act="tab" data-tab="users">همه</button></div><div class="card list-mini">${attention.map(u=>{const s=ustat(u);return `<div class="it" data-act="edit" data-sub="${esc(u.sub)}"><span class="ltr"><b>${esc(u.name)}</b></span><span class="badge b-${s[0]}">${s[0]==="soon"?daysText(u):s[1]}</span></div>`}).join("")}</div>`:""}
+  ${st.net.tunnels.length?`<div class="sec-title"><h3>تانل‌ها</h3><button class="btn sm ghost" data-act="tab" data-tab="net">همه</button></div><div class="card list-mini">${st.net.tunnels.map(t=>`<div class="it" data-act="tab" data-tab="net"><span>${esc(t.name)} <span class="mut small">${esc(srvName(t.entry))} ← ${esc(srvName(t.exit))}</span></span><span class="badge ${t.status==="up"?"b-on":"b-exp"}">${t.status==="up"?"بالا":"پایین"}</span></div>`).join("")}</div>`:""}
+  ${probeCard()}
   <div class="sec-title"><h3>سرور</h3><span class="mut small">${sv.uptime?"روشن از "+uptime(sv.uptime):""}</span></div>
   <div class="card">
    ${load!=null?`<div class="meter"><div class="row"><span>پردازنده</span><span class="mut">${fa(load)}٪</span></div><div class="bar"><i class="${barCls(load)}" style="width:${load}%"></i></div></div>`:""}
@@ -2677,7 +3822,7 @@ function renderUserList(){
   if(!list.length){el.innerHTML=`<div class="empty">${ic("search")}<p>کاربری با این فیلتر پیدا نشد.</p></div>`;return}
   el.innerHTML=list.map(u=>{
     const s=ustat(u),p=pct(u.used,u.total);
-    return `<div class="ucard"><div class="uhead"><div class="uname">${u.online!==null?`<span class="dot ${u.online?"on":""}" title="${u.online?"آنلاین":"آفلاین"}"></span>`:""}<b>${esc(u.name)}</b></div><span class="badge b-${s[0]}">${s[1]}</span></div>
+    return `<div class="ucard"><div class="uhead"><div class="uname">${mono(u.name.slice(0,2).toUpperCase(),u.name,"sm")}<b>${esc(u.name)}</b>${u.online!==null?`<span class="dot ${u.online?"on":""}" title="${u.online?"آنلاین":"آفلاین"}"></span>`:""}</div><span class="badge b-${s[0]}">${s[1]}</span></div>
     ${multiLoc()?`<div class="locs">${userLocs(u).map(l=>`<span class="loc-chip">${esc(l.name)}</span>`).join("")||`<span class="loc-chip">بدون لوکیشن</span>`}</div>`:""}
     <div class="bar"><i class="${barCls(p)}" style="width:${u.total?p:4}%"></i></div>
     <div class="umeta"><span>${usage(u)}</span><span>${daysText(u)}</span></div>
@@ -2767,7 +3912,7 @@ VIEWS.locations=()=>{
   ${st.locations.map(l=>{
     const on=l.status==="online";const n=usersOn(l);
     const ibs=st.inbounds.filter(ib=>l.inbounds.includes(ib.id));
-    return `<div class="lcard"><div class="lhead"><span class="prio">${ic("globe")}</span><div class="t"><b>${esc(l.name)}</b><small>${esc(l.address||"")}</small></div>
+    return `<div class="lcard"><div class="lhead">${mono((l.name.match(/\p{Regional_Indicator}{2}/u)||[l.name.slice(0,2)])[0],l.name,l.main?"acc":"")}<div class="t"><b>${esc(l.name)}</b><small>${esc(l.address||"")}</small></div>
     <span class="badge ${l.main||on?"b-on":l.status==="offline"?"b-exp":"b-off"}">${l.main?"این سرور":on?"آنلاین":l.status==="offline"?"آفلاین":"در حال اتصال"}</span></div>
     <div class="lmeta"><span>${ic("users")} ${fa(n)} کاربر</span>${l.latency!=null&&!l.main?`<span>${ic("zap")} پینگ ${fa(l.latency)}ms</span>`:""}${l.cpu!=null&&!l.main?`<span>CPU ${fa(Math.round(l.cpu))}٪</span>`:""}${l.mem!=null&&!l.main?`<span>رم ${fa(Math.round(l.mem))}٪</span>`:""}</div>
     ${l.error?`<div class="err">${esc(l.error)}</div>`:""}
@@ -2813,11 +3958,186 @@ function locRenameSheet(){
     const f=$("#rnf",el);bindFlags(el,f.lname);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button:not([type=button])",f),"settings",{main_location:f.lname.value.trim()});if(j.ok)closeSheet()}});
 }
 
+/* network: servers, tunnels, tests */
+const SEGS=[["servers","سرورها"],["tunnels","تانل‌ها"],["locations","لوکیشن‌ها"],["decos","Decoها"]];
+S.seg=S.seg||"servers";try{S.seg=localStorage.getItem("xc_seg")||"servers"}catch(e){}
+const srvBy=id=>S.state.net.servers.find(s=>s.id===id);
+const srvName=id=>{const s=srvBy(id);return s?s.name:"؟"};
+const roleName=r=>r==="iran"?"ایران":"خارج";
+const roleFlag=s=>s.local?"⌂":s.role==="iran"?"IR":"EX";
+const hue=str=>{let h=0;for(const c of String(str))h=(h*31+c.charCodeAt(0))>>>0;return h%360};
+const mono=(text,seed,cls="")=>`<span class="mono ${cls}" style="--h:${hue(seed||text)}">${esc(String(text).slice(0,3))}</span>`;
+const fmtAgo=ms=>ms?ago(ms):"—";
+const mb=v=>v==null||v<0?"—":fa(v>=100?Math.round(v):v.toFixed(1))+" Mb";
+const ms_=v=>v==null||v<0?"—":fa(v)+"ms";
+VIEWS.net=()=>`<div class="seg wide">${SEGS.map(([k,l])=>`<button data-act="seg" data-seg="${k}" class="${S.seg===k?"on":""}">${l}</button>`).join("")}</div>${(NETVIEWS[S.seg]||NETVIEWS.servers)()}`;
+const NETVIEWS={locations:()=>VIEWS.locations(),decos:()=>VIEWS.decos()};
+function jobsBox(){
+  const jobs=S.state.net.jobs||[];if(!jobs.length)return "";
+  return jobs.map(j=>`<div class="card job"><div class="jh"><span class="spin"></span><b>${esc(j.title)}</b></div><div class="mut small ltr-auto">${esc((j.log||[]).slice(-1)[0]||"…")}</div></div>`).join("");
+}
+NETVIEWS.servers=()=>{
+  const n=S.state.net,srvs=n.servers;
+  return `${jobsBox()}<div class="card"><h2>${ic("server")} سرورها</h2><p class="mut small">سرور ایران و خارجت رو با یوزر و پس root اضافه کن. رمز فقط یه بار برای نصب کلید استفاده می‌شه و ذخیره نمی‌شه. بعدش همه چیز (تانل، نود، بهینه‌سازی، تست) از همین‌جا انجام می‌شه.</p>
+  <button class="btn block" data-act="srv-add">${ic("plus")} افزودن سرور</button></div>
+  ${srvs.map(s=>{const f=s.facts||{};const on=!s.error&&f.ip;const tuned=f.cc==="bbr";
+    const tools=Object.entries(f.tools||{}).filter(([k,v])=>v).map(([k])=>k);
+    return `<div class="lcard"><div class="lhead">${mono(roleFlag(s),s.id,s.local?"acc":"")}<div class="t"><b>${esc(s.name)}</b><small>${esc(f.ip||s.host||"")}${f.os?" · "+esc(f.os):""}</small></div>
+    <span class="badge ${on?"b-on":s.error?"b-exp":"b-off"}">${s.local?"این پنل":on?"وصل":s.error?"خطا":"؟"}</span></div>
+    <div class="lmeta"><span class="pill ${s.role==="iran"?"ir":""}">${roleName(s.role)}</span>${f.cpus?`<span>${fa(f.cpus)} هسته</span>`:""}${f.mem?`<span>${gb(f.mem)} GB رم</span>`:""}${f.load!=null&&f.cpus?`<span>بار ${fa(Math.round(f.load*100/f.cpus))}٪</span>`:""}${f.cc?`<span class="${tuned?"st-ok":""}">${tuned?"BBR ✓":"TCP "+esc(f.cc)}</span>`:""}${f.xui?`<span>3x-ui ✓</span>`:""}${s.node_id?`<span>لوکیشن ✓</span>`:""}</div>
+    ${s.error?`<div class="err">${esc(s.error)}</div>`:""}
+    ${tools.length?`<div class="locs">${tools.map(t=>`<span class="loc-chip ltr">${esc(t)}</span>`).join("")}</div>`:""}
+    <div class="row-btns">${!tuned?`<button class="btn sm" data-act="srv-tune" data-id="${s.id}">${ic("zap")} بهینه‌سازی</button>`:""}
+    ${!s.local?`<button class="btn sm ghost" data-act="srv-more" data-id="${s.id}">${ic("more")} بیشتر</button>`:`<button class="btn sm ghost" data-act="srv-refresh" data-id="${s.id}">${ic("refresh")}</button>`}</div></div>`}).join("")}
+  ${srvs.length<2?`<div class="card note-card"><div class="note">${ic("info")}<div class="mut small">با یه <b>سرور ایران</b>، کاربرها به آی‌پی ایران وصل می‌شن و فیلتر شدن آی‌پی خارج دیگه اثری نداره. سریع‌ترین و پایدارترین راه همینه؛ Decoها برای وقتی‌ان که سرور ایران نداری.</div></div></div>`:""}`;
+};
+NETVIEWS.tunnels=()=>{
+  const n=S.state.net,ts=n.tunnels,irans=n.servers.filter(s=>s.role==="iran"),others=n.servers.filter(s=>s.role!=="iran");
+  const pair=irans.length&&others.length?irans[0].id+"|"+others[0].id:null;
+  const trial=pair?n.trials[pair]:null;
+  return `${jobsBox()}<div class="card"><h2>${ic("link")} تانل‌ها</h2><p class="mut small">کاربر به سرور ایران وصل می‌شه و ترافیکش از تانل به سرور خارج می‌رسه. ورودی = ایران، خروجی = خارج.</p>
+  ${irans.length&&others.length?`<div class="row-btns"><button class="btn" data-act="tun-add">${ic("plus")} تانل جدید</button><button class="btn ghost" data-act="trial">${ic("chart")} مقایسه‌ی روش‌ها</button><button class="btn ghost icon" data-act="path" title="تست مسیر" aria-label="تست مسیر">${ic("zap")}</button></div>`:
+   `<div class="err">برای تانل یه سرور با نقش «ایران» و یکی «خارج» لازمه. ${irans.length?"":"سرور ایران نداری؛ "}در بخش سرورها اضافه کن.</div>`}</div>
+  ${trial?`<div class="card"><h2>${ic("chart")} مقایسه‌ی روش‌ها</h2><div class="mut small">${esc(srvName(pair.split("|")[0]))} ← ${esc(srvName(pair.split("|")[1]))} · ${fmtAgo(trial.at)}</div>
+   <table class="tbl"><tr><th>روش</th><th>دانلود</th><th>آپلود</th><th>اتصال</th></tr>${trial.results.map(r=>`<tr class="${trial.best&&trial.best.label===r.label?"best":""} ${r.ok?"":"bad"}"><td>${esc(r.label)}${trial.best&&trial.best.label===r.label?" ★":""}</td><td class="ltr">${r.ok?mb(r.down_mbps):"—"}</td><td class="ltr">${r.ok?mb(r.up_mbps):"—"}</td><td class="ltr">${r.ok?ms_(r.connect_ms):esc((r.error||"").slice(0,40))}</td></tr>`).join("")}</table>
+   ${trial.best?`<button class="btn sm" style="margin-top:10px" data-act="tun-add" data-engine="${trial.best.engine}" data-transport="${esc(trial.best.transport||"")}">${ic("plus")} ساخت تانل با ${esc(trial.best.label)}</button>`:""}</div>`:""}
+  ${Object.entries(n.paths).map(([k,p])=>{const [a,b]=k.split("|");return `<div class="card"><h2>${ic("zap")} مسیر ${esc(srvName(a))} ← ${esc(srvName(b))}</h2><div class="lmeta"><span>پینگ ${p.ping_ms>=0?fa(p.ping_ms.toFixed(0))+"ms":"—"}</span><span>افت ${fa(p.loss)}٪</span><span>MTU ${p.mtu==="1380ok"?"✓":"کوچک"}</span></div>
+   <div class="locs">${Object.entries(p.tcp).map(([port,v])=>`<span class="loc-chip ltr ${v>=0?"ok":"no"}">:${port} ${v>=0?fa(v)+"ms":"بسته"}</span>`).join("")}</div><div class="hint">${fmtAgo(p.at)}</div></div>`}).join("")}
+  ${ts.map(t=>{const e=n.engines[t.engine]||{name:t.engine};const b=t.bench_result;const c=t.check||{};
+    return `<div class="lcard"><div class="lhead">${mono(e.name.slice(0,2),t.id)}<div class="t"><b>${esc(t.name)}</b><small>${esc(srvName(t.entry))} ← ${esc(srvName(t.exit))} · ${esc(e.name)}${t.transport?" · "+esc(t.transport):""}${t.via_name?" · از راه "+esc(t.via_name):""}</small></div>
+    <span class="badge ${t.status==="up"?"b-on":t.status==="down"||t.status==="failed"?"b-exp":"b-wait"}">${t.status==="up"?"بالا":t.status==="down"?"پایین":t.status==="failed"?"خطا":"در حال ساخت"}</span></div>
+    <div class="lmeta"><span>پورت‌ها <span class="ltr">${esc(t.ports)}</span></span><span>کنترل <span class="ltr">${fa(t.cport)}</span></span>${b?`<span class="st-ok">↓ ${mb(b.down_mbps)}</span><span>↑ ${mb(b.up_mbps)}</span>`:""}</div>
+    ${t.error?`<div class="err">${esc(t.error)}</div>`:""}
+    ${c.entry&&c.entry.active!=="active"?`<div class="err">ورودی: ${esc(c.entry.active||"")} ${esc((c.entry.log||c.entry.error||"").slice(0,120))}</div>`:""}
+    ${c.exit&&c.exit.active&&c.exit.active!=="active"&&t.engine!=="direct"?`<div class="err">خروجی: ${esc(c.exit.active)} ${esc((c.exit.log||c.exit.error||"").slice(0,120))}</div>`:""}
+    <div class="row-btns"><button class="btn sm ghost" data-act="tun-status" data-id="${t.id}">${ic("refresh")} وضعیت</button><button class="btn sm ghost" data-act="tun-bench" data-id="${t.id}">${ic("chart")} سرعت</button><button class="btn sm ghost icon" data-act="tun-more" data-id="${t.id}">${ic("more")}</button></div></div>`}).join("")}`;
+};
+function srvAddSheet(){
+  sheet(`<h3>${ic("plus")} افزودن سرور</h3><form id="sf2">
+  ${field("sname","اسم","",'placeholder="🇮🇷 ایران ۱"')}${flagChipsAll()}
+  <div class="cols2">${field("shost","آدرس (IP یا دامنه)","",'class="in ltr" required autocomplete="off" placeholder="1.2.3.4"')}${field("sport","پورت SSH","22",'class="in ltr" inputmode="numeric"')}</div>
+  <div class="cols2">${field("suser","یوزر","root",'class="in ltr" autocomplete="off"')}${field("spass","رمز","",'class="in ltr" type="password" required autocomplete="new-password"')}</div>
+  <div class="mut small" style="margin:8px 0 4px">نقش</div><div class="seg"><button type="button" data-role="iran">ایران (ورودی کاربرها)</button><button type="button" data-role="foreign" class="on">خارج (خروجی)</button></div>
+  <div class="hint">رمز فقط برای نصب کلید SSH استفاده می‌شه و ذخیره نمی‌شه.</div>
+  <button class="btn block" style="margin-top:14px">${ic("check")} افزودن</button></form>`,el=>{
+    const f=$("#sf2",el);let role="foreign";bindFlags(el,f.sname);
+    $$("[data-role]",el).forEach(b=>b.onclick=()=>{role=b.dataset.role;$$("[data-role]",el).forEach(x=>x.classList.toggle("on",x===b))});
+    f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"net_server_add",{name:f.sname.value.trim(),host:f.shost.value.trim(),port:f.sport.value,user:f.suser.value.trim(),password:f.spass.value,role});if(j.ok){closeSheet();watchJob(j.job)}};
+  });
+}
+const flagChipsAll=()=>`<div class="chips">${["🇮🇷 ایران","🇩🇪 آلمان","🇳🇱 هلند","🇫🇮 فنلاند","🇫🇷 فرانسه","🇬🇧 انگلیس","🇹🇷 ترکیه","🇦🇪 امارات"].map(f=>`<button type="button" class="chip" data-flag="${esc(f)}">${esc(f)}</button>`).join("")}</div>`;
+function srvMoreSheet(s){
+  const ibs=mainInbounds();
+  sheet(`<h3>${mono(roleFlag(s),s.id)} ${esc(s.name)}</h3><div class="mut small ltr">${esc((s.facts||{}).ip||s.host)} · ${esc(s.user||"root")}@${esc(s.host)}:${fa(s.port||22)}</div><div class="menu">
+  <button data-act="srv-refresh" data-id="${s.id}">${ic("refresh")} به‌روزرسانی مشخصات</button>
+  <button data-act="srv-tune" data-id="${s.id}">${ic("zap")} بهینه‌سازی شبکه (BBR، بافرها)</button>
+  <button data-act="srv-role" data-id="${s.id}" data-role="${s.role==="iran"?"foreign":"iran"}">${ic("globe")} تغییر نقش به ${s.role==="iran"?"خارج":"ایران"}</button>
+  ${S.state.panel.ok&&S.state.panel.version===3&&!s.node_id?`<button data-act="srv-node" data-id="${s.id}">${ic("plus")} تبدیل به لوکیشن (نود 3x-ui)</button>`:""}
+  ${s.role==="iran"?`<button data-act="probe-pick" data-id="${s.id}">${ic("chart")} تست کانفیگ‌ها از این سرور</button>`:""}
+  <button class="danger" data-act="srv-del" data-id="${s.id}">${ic("trash")} حذف سرور</button></div>`);
+}
+function srvNodeSheet(s){
+  sheet(`<h3>${ic("plus")} لوکیشن از ${esc(s.name)}</h3><p class="mut small">روی این سرور 3x-ui نصب می‌شه (اگه نباشه)، به پنل اصلی وصل می‌شه و یه inbound مثل این سرور روش ساخته می‌شه.</p><form id="nf">
+  ${field("lname","اسم لوکیشن",s.name,'autocomplete="off"')}${flagChips()}
+  ${mainInbounds().length?`${sw("setup",true,"inbound مثل این سرور بساز","")}<div id="tplbox">${templateSelect()}</div>${sw("attach",true,"همه‌ی کاربرها رو اضافه کن","")}`:""}
+  <button class="btn block" style="margin-top:12px">${ic("check")} شروع</button></form>`,el=>{
+    const f=$("#nf",el);bindFlags(el,f.lname);const setup=f.elements.namedItem("setup"),attach=f.elements.namedItem("attach");
+    if(setup)setup.onchange=()=>{$("#tplbox",el).style.display=setup.checked?"":"none"};
+    f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"net_node_from_server",{id:s.id,name:f.lname.value.trim(),template:setup&&setup.checked?+f.template.value:0,attach:!!(setup&&setup.checked&&attach&&attach.checked)});if(j.ok){closeSheet();watchJob(j.job)}};
+  });
+}
+function tunAddSheet(engine,transport){
+  const n=S.state.net,irans=n.servers.filter(s=>s.role==="iran"),others=n.servers.filter(s=>s.role!=="iran");
+  const decos=S.state.decos.flatMap(d=>d.nodes);
+  const sel=(name,list,cur)=>`<select class="in" name="${name}">${list.map(s=>`<option value="${s.id}" ${s.id===cur?"selected":""}>${esc(s.name)}</option>`).join("")}</select>`;
+  const eng=engine||"backhaul";
+  const engOpts=Object.entries(n.engines).map(([k,e])=>`<option value="${k}" ${k===eng?"selected":""}>${esc(e.name)}</option>`).join("");
+  const trOpts=k=>{const e=n.engines[k];return e.transports.length?`<select class="in" name="transport">${e.transports.map(t=>`<option value="${t}" ${t===transport?"selected":""}>${t}</option>`).join("")}</select>`:`<div class="hint">ترنسپورت ندارد</div>`};
+  sheet(`<h3>${ic("plus")} تانل جدید</h3><form id="tf">
+  <div class="cols2"><label class="f"><span>ورودی (ایران)</span>${sel("entry",irans,irans[0]&&irans[0].id)}</label><label class="f"><span>خروجی (خارج)</span>${sel("exit",others,(others.find(s=>s.local)||others[0]).id)}</label></div>
+  <label class="f"><span>روش</span><select class="in" name="engine">${engOpts}</select></label><div id="engnote" class="hint"></div>
+  <div id="trbox">${trOpts(eng)}</div>
+  ${field("ports","پورت‌ها (ایران ← خارج)","443",'class="in ltr" placeholder="443, 2053=8443, 10000-10050"',"هر پورتی که کاربرها بهش وصل می‌شن. «2053=8443» یعنی پورت ۲۰۵۳ ایران به ۸۴۴۳ خارج.")}
+  ${field("tname","اسم (اختیاری)","",'autocomplete="off"')}
+  <details><summary class="mut">پیشرفته</summary>${field("cport","پورت کنترل تانل (خالی = تصادفی)","",'class="in ltr" inputmode="numeric"')}
+  ${sw("udp",false,"UDP هم رد شود","برای Backhaul با ترنسپورت tcp")}
+  ${decos.length?`<label class="f"><span>فقط Xray: رسیدن به خروجی از راه یک Deco</span><select class="in" name="via"><option value="">مستقیم</option>${decos.map(d=>`<option value="${esc(d.key)}">${esc(d.name)}</option>`).join("")}</select></label>`:""}</details>
+  <button class="btn block" style="margin-top:14px">${ic("check")} ساخت تانل</button></form>`,el=>{
+    const f=$("#tf",el);const note=()=>{const e=n.engines[f.engine.value];$("#engnote",el).textContent=e?e.note:"";$("#trbox",el).innerHTML=trOpts(f.engine.value)};note();f.engine.onchange=note;
+    f.onsubmit=async e=>{e.preventDefault();const tr=f.elements.namedItem("transport");const via=f.elements.namedItem("via");
+      const j=await act($("button.btn",f),"net_tunnel_add",{entry:f.entry.value,exit:f.exit.value,engine:f.engine.value,transport:tr?tr.value:"",ports:f.ports.value,name:f.tname.value,cport:f.cport.value,udp:f.udp.checked,via:via?via.value:""});
+      if(j.ok){closeSheet();watchJob(j.job)}};
+  });
+}
+function tunMoreSheet(t){
+  sheet(`<h3>${esc(t.name)}</h3><div class="menu">
+  <button data-act="tun-status" data-id="${t.id}">${ic("refresh")} بررسی وضعیت</button>
+  <button data-act="tun-bench" data-id="${t.id}">${ic("chart")} تست سرعت (iperf3)</button>
+  <button data-act="tun-apply" data-id="${t.id}">${ic("zap")} راه‌اندازی دوباره</button>
+  <button class="danger" data-act="tun-del" data-id="${t.id}">${ic("trash")} حذف تانل</button></div>`);
+}
+function trialSheet(){
+  const n=S.state.net,irans=n.servers.filter(s=>s.role==="iran"),others=n.servers.filter(s=>s.role!=="iran");
+  const sel=(name,list)=>`<select class="in" name="${name}">${list.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select>`;
+  const combos=[["direct","","انتقال مستقیم"],["backhaul","tcpmux","Backhaul tcpmux"],["backhaul","wssmux","Backhaul wssmux"],["gost","tls","GOST tls"],["xray","reality","Xray Reality"],["wireguard","","WireGuard"],["gre","","GRE"]];
+  sheet(`<h3>${ic("chart")} مقایسه‌ی روش‌های تانل</h3><p class="mut small">هر روش موقتاً با یه پورت تست راه‌اندازی می‌شه، سرعتش با iperf3 اندازه گرفته می‌شه و پاک می‌شه. حدود ۱ تا ۲ دقیقه برای هر روش. تانل‌های فعلی دست نمی‌خورن.</p><form id="trf">
+  <div class="cols2"><label class="f"><span>ایران</span>${sel("entry",irans)}</label><label class="f"><span>خارج</span>${sel("exit",others)}</label></div>
+  ${combos.map(([e,t,l],i)=>`<label class="check"><input type="checkbox" name="c" value="${e}|${t}" ${i<5?"checked":""}><span>${l}</span></label>`).join("")}
+  <button class="btn block" style="margin-top:12px">${ic("check")} شروع مقایسه</button></form>`,el=>{
+    const f=$("#trf",el);f.onsubmit=async e=>{e.preventDefault();const cs=$$("input[name=c]:checked",f).map(x=>{const [engine,transport]=x.value.split("|");return {engine,transport}});
+      const j=await act($("button.btn",f),"net_trial",{entry:f.entry.value,exit:f.exit.value,combos:cs});if(j.ok){closeSheet();watchJob(j.job)}}});
+}
+function probeSheet(serverId){
+  const irans=S.state.net.servers.filter(s=>s.role==="iran");if(!irans.length){toast("برای تست از ایران یه سرور با نقش ایران اضافه کن","bad");return}
+  const users=S.state.users.filter(u=>u.sub);
+  sheet(`<h3>${ic("chart")} تست از ایران</h3><p class="mut small">از سرور ایران، به هر مسیر (Main، Decoها، کانفیگ خود Decoها) وصل می‌شه و پینگ، زمان پاسخ و سرعت دانلود واقعی رو اندازه می‌گیره؛ همون چیزی که کاربر می‌بینه.</p><form id="pf">
+  <label class="f"><span>از سرور</span><select class="in" name="server">${irans.map(s=>`<option value="${s.id}" ${s.id===serverId?"selected":""}>${esc(s.name)}</option>`).join("")}</select></label>
+  <label class="f"><span>کانفیگ‌های کدام کاربر</span><select class="in" name="sub"><option value="">فقط Decoها (بدون سرور خودم)</option>${users.slice(0,50).map(u=>`<option value="${esc(u.sub)}">${esc(u.name)}</option>`).join("")}</select></label>
+  <button class="btn block" style="margin-top:12px">${ic("check")} شروع تست</button></form>`,el=>{
+    const f=$("#pf",el);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"net_probe",{server:f.server.value,sub:f.sub.value});if(j.ok){closeSheet();watchJob(j.job)}}});
+}
+function probeCard(){
+  const probes=Object.values(S.state.net.probes||{});if(!probes.length)return "";
+  const p=probes.sort((a,b)=>b.at-a.at)[0];
+  const best=p.rows.filter(r=>r.ok&&r.mbps).sort((a,b)=>b.mbps-a.mbps)[0];
+  return `<div class="card"><h2>${ic("chart")} تست از ایران</h2><div class="mut small">از ${esc(p.server)} · ${fmtAgo(p.at)}${p.sub?" · کاربر "+esc((userBy(p.sub)||{}).name||"")	:""}</div>
+  <table class="tbl"><tr><th>مسیر</th><th>پینگ</th><th>پاسخ</th><th>دانلود</th></tr>${p.rows.map(r=>`<tr class="${best&&r===best?"best":""} ${r.ok?"":"bad"}"><td>${esc(r.name)}${best&&r===best?" ★":""}</td><td class="ltr">${ms_(r.tcp_ms)}</td><td class="ltr">${r.ok?ms_(r.ttfb_ms):"قطع"}</td><td class="ltr">${r.ok?mb(r.mbps):"—"}</td></tr>`).join("")}</table></div>`;
+}
+let jobTimer=null;
+function watchJob(id){
+  clearInterval(jobTimer);
+  const tick=async()=>{try{const r=await fetch("api/net_job",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json","X-XC":"1"},body:JSON.stringify({id})});const j=await r.json();
+    if(j.state){S.state=j.state}
+    if(j.job&&j.job.status!=="running"){clearInterval(jobTimer);jobTimer=null;toast(j.job.status==="done"?(j.job.log.slice(-1)[0]||j.job.title+" انجام شد"):j.job.error||"خطا",j.job.status==="done"?"ok":"bad");render();return}
+    render()}catch(e){}};
+  jobTimer=setInterval(tick,2500);tick();
+}
+const NET_ACTS={
+  seg:b=>{S.seg=b.dataset.seg;try{localStorage.setItem("xc_seg",S.seg)}catch(e){}render()},
+  "srv-add":()=>srvAddSheet(),
+  "srv-more":b=>{const s=srvBy(b.dataset.id);if(s)srvMoreSheet(s)},
+  "srv-refresh":b=>{closeSheet();act(b,"net_server_refresh",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
+  "srv-tune":async b=>{const s=srvBy(b.dataset.id);closeSheet();if(await confirmSheet("بهینه‌سازی شبکه","روی "+esc(s.name)+": BBR و fq، بافرهای TCP بزرگ‌تر، TCP Fast Open، و بالا بردن محدودیت فایل‌ها. برگشت‌پذیره (فایل /etc/sysctl.d/99-ez-xui.conf).","انجام بده")){const j=await act(null,"net_server_tune",{id:s.id});if(j.ok)watchJob(j.job)}},
+  "srv-role":b=>{closeSheet();act(null,"net_server_role",{id:b.dataset.id,role:b.dataset.role})},
+  "srv-node":b=>{const s=srvBy(b.dataset.id);if(s)srvNodeSheet(s)},
+  "srv-del":async b=>{const s=srvBy(b.dataset.id);if(await confirmSheet("حذف سرور",esc(s.name)+" از فهرست حذف می‌شه. چیزی روی خود سرور پاک نمی‌شه.","حذف کن",true))act(null,"net_server_delete",{id:s.id})},
+  "tun-add":b=>tunAddSheet(b.dataset.engine,b.dataset.transport),
+  "tun-more":b=>{const t=S.state.net.tunnels.find(x=>x.id===b.dataset.id);if(t)tunMoreSheet(t)},
+  "tun-status":b=>{closeSheet();act(b,"net_tunnel_status",{id:b.dataset.id})},
+  "tun-bench":b=>{closeSheet();act(b,"net_tunnel_bench",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
+  "tun-apply":b=>{closeSheet();act(b,"net_tunnel_apply",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
+  "tun-del":async b=>{const t=S.state.net.tunnels.find(x=>x.id===b.dataset.id);if(await confirmSheet("حذف تانل",esc(t.name)+" از هر دو سرور پاک می‌شه.","حذف کن",true)){const j=await act(null,"net_tunnel_delete",{id:t.id});if(j.ok)watchJob(j.job)}},
+  trial:()=>trialSheet(),
+  path:b=>{const n=S.state.net,i=n.servers.find(s=>s.role==="iran"),o=n.servers.find(s=>s.role!=="iran");act(b,"net_path_test",{entry:i.id,exit:o.id}).then(j=>j.ok&&watchJob(j.job))},
+  "probe-pick":b=>probeSheet(b.dataset.id),
+  probe:()=>probeSheet(),
+};
+
 /* decos */
 VIEWS.decos=()=>{
   const st=S.state,ds=st.decos,lab=st.settings.label_deco;
   return `<div class="card"><h2>${ic("link")} Decoها</h2><p class="mut small">کانفیگ‌های بقیه که کاربر از راه اون‌ها به سرورت می‌رسه. ترتیب = اولویت: اول ${esc(lab)}۱ امتحان می‌شه، اگه قطع بود بعدی. لینک ساب بذاری، حجم و انقضاش هم دیده می‌شه.</p>
-  <div class="row-btns"><button class="btn" data-act="deco-add">${ic("plus")} افزودن</button><button class="btn ghost" data-act="layout">${ic("text")} محتوای ساب</button><button class="btn ghost icon" data-act="test" title="تست" aria-label="تست">${ic("refresh")}</button><button class="btn ghost icon" data-act="deco-raw" title="ویرایش متنی" aria-label="ویرایش متنی">${ic("edit")}</button></div>
+  <div class="row-btns"><button class="btn" data-act="deco-add">${ic("plus")} افزودن</button><button class="btn ghost" data-act="layout">${ic("text")} محتوای ساب</button><button class="btn ghost icon" data-act="test" title="تست از سرور" aria-label="تست">${ic("refresh")}</button><button class="btn ghost icon" data-act="probe" title="تست از ایران" aria-label="تست از ایران">${ic("chart")}</button><button class="btn ghost icon" data-act="deco-raw" title="ویرایش متنی" aria-label="ویرایش متنی">${ic("edit")}</button></div>
   <div class="hint">آخرین تست: ${ago(st.monitor.last_run)}${st.monitor.xray?"، تست واقعی با هسته‌ی Xray پنل":""}</div>${st.monitor.note?`<div class="hint">${ic("info")} ${esc(st.monitor.note)}</div>`:""}</div>
   ${ds.length?ds.map((d,i)=>{
     const q=d.quota;let qh="";
@@ -2853,19 +4173,27 @@ function layoutSheet(){
   const nodes=ds.flatMap(d=>d.nodes);
   sheet(`<h3>${ic("text")} محتوای ساب کاربرها</h3><p class="mut small">هر چیزی که کاربر توی اپش می‌بینه. خاموشش کنی توی ساب نمیاد. اسم هر کدوم رو هم می‌تونی عوض کنی.</p>
   <form id="lof">
-  ${lrow('name="show_auto"',s.show_auto,'name="label_auto"',s.label_auto,"Auto","⚡ خودکار","بهترین مسیر سالم رو خودش انتخاب می‌کنه")}
+  <div class="mut small" style="margin:6px 0">رفتار ⚡ خودکار</div>
+  <div class="seg wide"><button type="button" data-mode="priority" class="${s.auto_mode!=="fastest"?"on":""}">به ترتیب اولویت</button><button type="button" data-mode="fastest" class="${s.auto_mode==="fastest"?"on":""}">سریع‌ترین</button></div>
+  <div class="hint" id="modehint"></div>
+  ${sw("direct_first",s.direct_first,"سرور خودم اول","خاموش: سرور خودم آخرین گزینه می‌شه و اول واسط‌ها امتحان می‌شن")}
+  ${lrow('name="show_auto"',s.show_auto,'name="label_auto"',s.label_auto,"Auto","⚡ خودکار","")}
   ${lrow('name="show_main"',s.show_main,'name="label_main"',s.label_main,"Main","مستقیم به سرور خودت","تا آی‌پی سرورت فیلتر نیست، سریع‌ترین مسیره")}
   ${nodes.length?lrow('name="show_deco_any"',s.show_deco_any,'name="label_deco"',s.label_deco,"Deco","سرور خودت از اولین واسط سالم","فقط در FlClash و Clash. شماره‌ی واسط‌ها هم با همین اسم ساخته می‌شه (Deco1، Deco2…)"):""}
   ${nodes.map(n=>{const o=n.opt||{chain:true,own:false,chain_name:lab+n.n,own_name:n.name};return `<div class="lgroup"><span class="tag">${esc(lab)}${n.n}</span>${esc(n.name)}</div>
-   ${lrow(`data-key="${esc(n.key)}" data-k="chain"`,o.chain,`data-key="${esc(n.key)}" data-k="chain_name"`,o.chain_name,lab+n.n,"سرور خودت از راه این واسط","اگه آی‌پی سرورت فیلتر بشه، کاربر از این راه به سرورت می‌رسه")}
-   ${lrow(`data-key="${esc(n.key)}" data-k="own"`,o.own,`data-key="${esc(n.key)}" data-k="own_name"`,o.own_name,n.name,"خود این کانفیگ، همون‌طور که هست","بدون سرور تو؛ ترافیک کاربرها مستقیم از حجم این کانفیگ کم می‌شه")}`}).join("")}
+   ${lrow(`data-key="${esc(n.key)}" data-k="chain"`,o.chain,`data-key="${esc(n.key)}" data-k="chain_name"`,o.chain_name,lab+n.n,"سرور خودت از راه این واسط","دو مرحله‌ای، کندتر؛ ولی حجم و حساب کاربر روی سرور خودته")}
+   <label class="check small-check"><input type="checkbox" data-key="${esc(n.key)}" data-k="chain_auto" ${o.chain_auto!==false?"checked":""}><span>توی ⚡ خودکار هم باشه</span></label>
+   ${lrow(`data-key="${esc(n.key)}" data-k="own"`,o.own,`data-key="${esc(n.key)}" data-k="own_name"`,o.own_name,n.name,"خود این کانفیگ، همون‌طور که هست","یک مرحله‌ای و سریع‌تر؛ ترافیک مستقیم از حجم این کانفیگ کم می‌شه")}
+   <label class="check small-check"><input type="checkbox" data-key="${esc(n.key)}" data-k="own_auto" ${o.own_auto?"checked":""}><span>توی ⚡ خودکار هم باشه</span></label>`}).join("")}
   <div class="hint">برای کاربرهایی که چند لوکیشن دارن، اول اسم لوکیشن میاد، مثلاً «🇩🇪 آلمان · Main».</div>
   <button class="btn block" style="margin-top:12px">${ic("check")} ذخیره</button></form>`,el=>{
-    const f=$("#lof",el);
+    const f=$("#lof",el);let mode=s.auto_mode||"priority";
+    const hint=()=>{$("#modehint",el).textContent=mode==="fastest"?"اپ هر چند دقیقه همه رو تست می‌کنه و سریع‌ترین رو برمی‌داره (url-test / leastPing).":"اپ به ترتیب لیست می‌ره: اولی که سالم بود. ارزون‌ترها رو بالاتر بذار."};hint();
+    $$("[data-mode]",el).forEach(b=>b.onclick=()=>{mode=b.dataset.mode;$$("[data-mode]",el).forEach(x=>x.classList.toggle("on",x===b));hint()});
     $$(".tg input",el).forEach(x=>x.onchange=()=>x.closest(".lrow").classList.toggle("off",!x.checked));
     f.onsubmit=async e=>{e.preventDefault();
-      const g=n=>f.elements.namedItem(n);const body={};
-      ["show_auto","show_main","show_deco_any"].forEach(k=>{if(g(k))body[k]=g(k).checked});
+      const g=n=>f.elements.namedItem(n);const body={auto_mode:mode};
+      ["show_auto","show_main","show_deco_any","direct_first"].forEach(k=>{if(g(k))body[k]=g(k).checked});
       ["label_auto","label_main","label_deco"].forEach(k=>{if(g(k))body[k]=g(k).value.trim()});
       const decos={};$$("[data-key]",f).forEach(x=>{const k=x.dataset.key;decos[k]=decos[k]||{key:k};decos[k][x.dataset.k]=x.type==="checkbox"?x.checked:x.value.trim()});
       body.decos=Object.values(decos);
@@ -2885,8 +4213,8 @@ VIEWS.settings=()=>{
   const ph=(set,txt)=>set?"ذخیره شده":txt;
   return `
   <form class="card" data-sec="conn"><h2>${ic("zap")} رفتار اتصال</h2>
-   ${sw("direct_first",s.direct_first,"اول مستقیم به سرور خودم","تا آی‌پی سرور فیلتر نیست، کاربر مستقیم و سریع‌تر وصل می‌شه")}
    ${sw("iran_direct",s.iran_direct,"سایت‌های ‎.ir بدون تونل","سایت‌های ایرانی مستقیم باز می‌شن")}
+   ${field("probe_url","لینک تست سرعت از ایران",s.probe_url,'class="in ltr" placeholder="https://speed.cloudflare.com/__down?bytes=10000000"',"فایلی که برای اندازه‌گیری سرعت دانلود می‌شه")}
    <div class="hint" style="margin-top:10px">${ic("info")} اینکه چه چیزهایی توی ساب کاربرها باشه و اسم هر کدوم: Decoها ← محتوای ساب</div>
    ${field("title","اسم پروفایل در اپ",s.title,'placeholder="EZ-XUI"')}
    <button class="btn block">${ic("check")} ذخیره</button></form>
@@ -2947,7 +4275,7 @@ document.addEventListener("submit",async e=>{
 
 /* actions */
 const ACTS={
-  tab:b=>{if(S.tab===b.dataset.tab&&!$("#ov")){scrollTo({top:0,behavior:"smooth"});return}S.tab=b.dataset.tab;S.fade=true;try{localStorage.setItem("xc_tab",S.tab)}catch(e){}closeSheet();render();scrollTo(0,0)},
+  tab:b=>{let t=b.dataset.tab;if(TAB_ALIAS[t]){S.seg=TAB_ALIAS[t][1];try{localStorage.setItem("xc_seg",S.seg)}catch(e){}t="net"}if(S.tab===t&&!$("#ov")){scrollTo({top:0,behavior:"smooth"});return}S.tab=t;S.fade=true;try{localStorage.setItem("xc_tab",S.tab)}catch(e){}closeSheet();render();scrollTo(0,0)},
   theme:()=>{const dark=document.documentElement.dataset.theme==="dark";S.theme=dark?"light":"dark";try{localStorage.setItem("xc_theme",S.theme)}catch(e){}applyTheme();render()},
   refresh:b=>act(b,"state",{}),
   test:b=>act(b,"test",{}),
@@ -2980,10 +4308,12 @@ const ACTS={
 };
 document.addEventListener("click",e=>{const b=e.target.closest("[data-act]");if(!b||b.disabled)return;const f=ACTS[b.dataset.act];if(f){e.preventDefault();f(b)}});
 
+Object.assign(ACTS,NET_ACTS);
 /* start + auto refresh */
 async function boot(){render();try{await api("state",{},true);render()}catch(e){}}
 boot();
-setInterval(()=>{if(S.state&&document.visibilityState==="visible"&&!$("#ov")&&document.activeElement?.tagName!=="INPUT"&&document.activeElement?.tagName!=="TEXTAREA")api("state",{},true).then(()=>render()).catch(()=>{})},30000);
+setInterval(()=>{if(S.state&&document.visibilityState==="visible"&&!$("#ov")&&!jobTimer&&document.activeElement?.tagName!=="INPUT"&&document.activeElement?.tagName!=="TEXTAREA")api("state",{},true).then(()=>render()).catch(()=>{})},30000);
+boot2();function boot2(){const t=setInterval(()=>{if(S.state){clearInterval(t);const j=(S.state.net.jobs||[])[0];if(j)watchJob(j.id)}},500)}
 </script>
 </body>
 </html>
@@ -3000,6 +4330,7 @@ class App:
         self.panel = PanelAPI(self)
         self.auth = Auth()
         self.usage = UsageStore()
+        self.net = Net(self)
 
     def reload(self):
         self.cfg = load_config()

@@ -23,6 +23,17 @@ fi
 
 [ -f /etc/x-ui/x-ui.db ] || echo "Note: /etc/x-ui/x-ui.db not found; set the 3x-ui subscription URL on the admin page."
 
+# ssh client (managing other servers), curl, sqlite3 (reading the panel settings in scripts)
+NEED=""
+command -v ssh >/dev/null || NEED="$NEED openssh-client"
+command -v curl >/dev/null || NEED="$NEED curl"
+if [ -n "$NEED" ]; then
+  echo "Installing:$NEED"
+  if command -v apt-get >/dev/null; then apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y -qq $NEED >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null; then dnf install -y -q ${NEED//openssh-client/openssh-clients} >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null; then yum install -y -q ${NEED//openssh-client/openssh-clients} >/dev/null 2>&1 || true; fi
+fi
+
 mkdir -p "$APP_DIR" "$CONF_DIR"
 chmod 700 "$CONF_DIR"
 echo "Downloading EZ-XUI..."

@@ -106,14 +106,15 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(len(groups[xc.G_UP]["proxies"]), 5)
         self.assertTrue(groups[xc.G_UP]["proxies"][0] == "Deco1 · friend-a")
         auto = groups["⚡ Auto"]["proxies"]
-        self.assertTrue(auto == ["user1-reality · Main", "user1-ws · Main", "user1-reality · Deco", "user1-ws · Deco"])
+        self.assertEqual(auto[:4], ["user1-reality · Main", "user1-ws · Main", "user1-reality · Deco1", "user1-ws · Deco1"])
+        self.assertEqual(len(auto), 2 + 2 * 5)  # Main first, then every Deco in priority order
         chained = [p for p in prof["proxies"] if p.get("dialer-proxy") == xc.G_UP]
         self.assertEqual(len(chained), 2)
         single = [p for p in prof["proxies"] if p.get("dialer-proxy") not in (None, xc.G_UP)]
         self.assertEqual(len(single), 2 * 5)
         self.assertEqual(single[0]["name"], "user1-reality · Deco1")
         self.assertEqual(single[0]["dialer-proxy"], "Deco1 · friend-a")
-        self.assertEqual(len(auto), 4)
+        self.assertEqual(len(auto), 2 + 2 * 5)
         self.assertEqual(len(groups[xc.G_MAIN]["proxies"]), 1 + 2 + 2 + 10)
         reality = next(p for p in prof["proxies"] if p["name"] == "user1-reality · Main")
         self.assertEqual(reality["reality-opts"], {"public-key": PBK, "short-id": "ab12"})
@@ -134,7 +135,7 @@ class ProfileTests(unittest.TestCase):
         cfg = dict(self.cfg, direct_first=False, iran_direct=False)
         prof = yaml.safe_load(xc.build_mihomo(self.own, self.ups, cfg)[0])
         auto = next(g for g in prof["proxy-groups"] if g["name"] == "⚡ Auto")["proxies"]
-        self.assertTrue(auto and all(n.endswith("Deco") for n in auto))
+        self.assertTrue(all(n.endswith("Main") for n in auto[-2:]) and all(re.search(r"Deco\d$", n) for n in auto[:-2]))  # Main last
         self.assertEqual(prof["rules"], ["MATCH," + xc.G_MAIN])
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
@@ -211,7 +212,18 @@ class ProfileTests(unittest.TestCase):
         groups = {g["name"]: g for g in prof["proxy-groups"]}
         self.assertEqual(groups[xc.G_MAIN]["proxies"], ["⚡ Best", "Deco", "Via B", "Friend A", "friend-b"])
         self.assertEqual(groups[xc.G_UP]["proxies"], ["Deco2 · friend-b"])
-        self.assertEqual(groups["⚡ Best"]["proxies"], ["Main", "Deco"])  # hidden Main still backs Auto
+        self.assertEqual(groups["⚡ Best"]["proxies"], ["Main", "Via B"])  # hidden Main still backs Auto
+        self.assertEqual(groups["⚡ Best"]["type"], "fallback")
+        cfg_fast = dict(cfg, auto_mode="fastest", deco_opts=dict(cfg["deco_opts"], **{ka: {"chain": False, "own": True, "own_auto": True, "own_name": "Friend A"}}))
+        prof2 = yaml.safe_load(xc.build_mihomo(own, ups, cfg_fast)[0])
+        g2 = {g["name"]: g for g in prof2["proxy-groups"]}
+        self.assertEqual(g2["⚡ Best"]["type"], "url-test")
+        self.assertEqual(g2["⚡ Best"]["proxies"], ["Main", "Friend A", "Via B"])  # Deco order, own config of A before chain of B
+        confs2 = json.loads(xc.build_xray(own, ups, cfg_fast, "t")[0])
+        tags = [o["tag"] for o in confs2[0]["outbounds"]]
+        self.assertEqual(tags[:3], ["me-1-direct", "me-own-up-1", "me-1-via-up-2"])
+        self.assertEqual(confs2[0]["routing"]["balancers"][0]["strategy"]["type"], "leastPing")
+        self.assertEqual(confs[0]["routing"]["balancers"][0]["strategy"]["type"], "leastLoad")
         friend_a = next(p for p in prof["proxies"] if p["name"] == "Friend A")
         self.assertNotIn("dialer-proxy", friend_a)
         # nothing chained and Auto hidden: only the chosen entries
@@ -456,7 +468,7 @@ class EndToEnd(unittest.TestCase):
         if yaml:
             prof = yaml.safe_load(body)
             auto = next(g for g in prof["proxy-groups"] if g["name"] == "⚡ Auto")["proxies"]
-            self.assertTrue(auto and all(n.endswith("Deco") for n in auto))
+            self.assertTrue(all(n.endswith("Main") for n in auto[-2:]) and all(re.search(r"Deco\d$", n) for n in auto[:-2]))
         self.admin("decos", {"lines": UPS[1:3]})
         self.admin("settings", {"title": "", "direct_first": True})
         self.assertFalse(self.admin("user_add", {"name": "x", "inbounds": [1]})[1]["ok"])  # no panel connected
