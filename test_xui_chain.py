@@ -93,7 +93,7 @@ class ProfileTests(unittest.TestCase):
     def setUp(self):
         self.own = xc.parse_nodes(OWN)
         self.ups = xc.parse_nodes(UPS)
-        self.cfg = dict(xc.DEFAULTS)
+        self.cfg = dict(xc.DEFAULTS, label_deco="Deco")  # Latin names here; the Persian default has its own test
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
     def test_mihomo_chain_and_priority(self):
@@ -345,10 +345,11 @@ class ProfileTests(unittest.TestCase):
         own, ups = self.own[:1], self.ups[:2]
         ka, kb = xc.node_key(ups[0]), xc.node_key(ups[1])
         cfg = dict(self.cfg, routes_custom=[{"id": "c1", "entry": "deco:" + ka, "via": "deco:" + kb, "exit": "main"},
-                                            {"id": "c2", "entry": "deco:" + kb, "via": "", "exit": "x:nope"},
+                                            {"id": "c2", "entry": "deco:" + kb, "via": "deco:" + ka, "exit": "x:nope"},
+                                            {"id": "c4", "entry": "deco:" + kb, "via": "", "exit": "main"},
                                             {"id": "c3", "entry": "deco:" + ka, "via": "deco:" + kb, "exit": "self"}])
         customs = [r for r in xc.routes(cfg, ups) if r["kind"] == "custom"]
-        self.assertEqual([r["key"] for r in customs], ["custom:c1", "custom:c3"])  # c2's exit does not exist
+        self.assertEqual([r["key"] for r in customs], ["custom:c1", "custom:c3"])  # c2's exit does not exist, c4 is a generated route
         self.assertEqual([r["name"] for r in customs], ["Deco1 · Deco2", "Deco1 · friend-b"])
         self.assertEqual((customs[0]["entry"]["name"], customs[0]["via"]["name"], customs[0]["exit"]["id"]), ("friend-a", "friend-b", "main"))
         prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])
@@ -364,6 +365,52 @@ class ProfileTests(unittest.TestCase):
         chain = {o["tag"]: o.get("streamSettings", {}).get("sockopt", {}).get("dialerProxy") for o in cc["outbounds"]}
         self.assertEqual((chain["proxy"], chain["up-2-via-up-1"], chain["up-1"]), ("up-2-via-up-1", "up-1", None))
         self.assertIn("me-c-c1-1", [o["tag"] for o in confs[0]["outbounds"]])
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_persian_deco_label(self):
+        cfg = dict(xc.DEFAULTS)
+        self.assertEqual(xc.label(cfg, "label_deco"), "واسط")
+        self.assertEqual([xc.deco_label(cfg, i) for i in (1, 12)], ["واسط ۱", "واسط ۱۲"])
+        self.assertEqual(xc.deco_label(dict(cfg, label_deco="Deco"), 3), "Deco3")
+        prof = yaml.safe_load(xc.build_mihomo(self.own[:1], self.ups[:2], cfg)[0])
+        self.assertEqual([p["name"] for p in prof["proxies"]], ["Main", "واسط ۱", "واسط ۲", "واسط ۱ · friend-a", "واسط ۲ · friend-b"])
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_templates_and_user_view(self):
+        own, ups = self.own[:1], self.ups[:2]
+        ka, kb = xc.node_key(ups[0]), xc.node_key(ups[1])
+        cfg = dict(self.cfg, sub_templates=[{"id": "t1", "name": "ارزون", "order_mode": "manual", "include_new": False, "items": [
+            {"key": "deco:%s>self" % kb, "name": "B خودش", "show": True, "auto": True},
+            {"key": "deco:%s>main" % ka, "name": "", "show": True, "auto": False},
+            {"key": "direct>main", "name": "", "show": False, "auto": True},
+            {"key": "gone", "name": "x"}]}],
+            user_subs={"u1": {"template": "t1"}, "u2": {"template": "custom", "items": [{"key": "direct>main", "name": "فقط مستقیم"}]},
+                       "u3": {"template": "nope"}})
+        self.assertIsNone(xc.sub_view(cfg, "someone"))
+        self.assertIsNone(xc.sub_view(cfg, "u3"))  # deleted template: default
+        rts = xc.apply_view(xc.routes(cfg, ups), xc.sub_view(cfg, "u1"))
+        self.assertEqual([(r["key"], r["name"], r["show"], r["auto"]) for r in xc.active_routes(rts)],
+                         [("deco:%s>self" % kb, "B خودش", True, True), ("deco:%s>main" % ka, "Deco1", True, False), ("direct>main", "Main", False, True)])
+        prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg, rts)[0])
+        groups = {g["name"]: g for g in prof["proxy-groups"]}
+        self.assertEqual(groups[xc.G_MAIN]["proxies"], ["⚡ Auto", "B خودش", "Deco1"])
+        self.assertEqual(groups["⚡ Auto"]["proxies"], ["B خودش", "Main"])  # hidden Main still backs Auto
+        confs = json.loads(xc.build_xray(own, ups, cfg, "t", xc.apply_view(xc.routes(cfg, ups), xc.sub_view(cfg, "u2")))[0])
+        self.assertEqual([c["remarks"] for c in confs], ["فقط مستقیم"])
+        # include_new: routes added after the template was saved come along, after its own items
+        cfg2 = dict(cfg, sub_templates=[dict(cfg["sub_templates"][0], include_new=True)])
+        rts = xc.active_routes(xc.apply_view(xc.routes(cfg2, ups), xc.sub_view(cfg2, "u1")))
+        self.assertEqual([r["key"] for r in rts][3:], ["deco:%s>main" % kb])
+        # price order inside a template
+        cfg3 = dict(cfg, routes_cfg={"deco:%s>self" % kb: {"price": 900, "unit": "gb"}, "deco:%s>main" % ka: {"price": 100, "unit": "gb"}},
+                    sub_templates=[dict(cfg["sub_templates"][0], order_mode="price")])
+        rts = xc.active_routes(xc.apply_view(xc.routes(cfg3, ups), xc.sub_view(cfg3, "u1")))
+        self.assertEqual([r["key"] for r in rts], ["direct>main", "deco:%s>main" % ka, "deco:%s>self" % kb])  # Main costs 0
+        pub = xc.templates_public(cfg, xc.routes(cfg, ups), [{"sub": "u1"}, {"sub": "u2"}, {"sub": "u3"}, {"sub": "u4"}])
+        self.assertEqual([(t["id"], t["users"]) for t in pub], [("default", 2), ("t1", 1)])
+        self.assertEqual(pub[0]["items"][0], {"key": "direct>main", "name": "Main", "show": True, "auto": True})
+        self.assertEqual(xc.user_sub_public(cfg, "u2")["custom"]["items"][0]["name"], "فقط مستقیم")
+        self.assertEqual(xc.user_sub_public(cfg, "u3"), {"tpl": "default"})
 
     def test_format_detection(self):
         self.assertEqual(xc.pick_format("", "FlClash/v0.8 clash-verge"), "clash")
@@ -516,7 +563,7 @@ class EndToEnd(unittest.TestCase):
         st = self.admin("state")[1]["state"]
         keys = [r["key"] for r in st["routes"]]
         self.assertEqual(keys[0], "direct>main")
-        self.assertEqual([r["name"] for r in st["routes"]][:3], ["Main", "Deco1", "friend-b"])
+        self.assertEqual([r["name"] for r in st["routes"]][:3], ["Main", "واسط ۱", "friend-b"])
         chain = [k for k in keys if k.startswith("deco:") and k.endswith(">main")]
         owns = [k for k in keys if k.endswith(">self")]
         self.assertEqual([e["id"] for e in st["exits"]], ["main"])
@@ -550,12 +597,74 @@ class EndToEnd(unittest.TestCase):
         two = next(c for c in json.loads(body) if c["remarks"] == "دو پله · user1-reality")
         self.assertEqual(len(two["outbounds"]), 5)  # target, two hops, direct, block
         self.assertFalse(self.admin("route_add", {"entry": "deco:x", "exit": "main"})[1]["ok"])
+        out = self.admin("route_add", {"entry": "deco:" + owns[1][5:-5], "exit": "self", "name": "خودش"})[1]  # no middle hop
+        self.assertEqual(out["key"], owns[1])
+        self.assertEqual(len(xc.load_config()["routes_custom"]), 1)
+        r = next(r for r in out["state"]["routes"] if r["key"] == owns[1])
+        self.assertEqual((r["name"], r["show"], r["auto"]), ("خودش", True, True))
         self.assertFalse(self.admin("route_add", {"entry": "deco:" + chain[0][5:-5], "via": "deco:" + chain[1][5:-5], "exit": "main"})[1]["ok"])  # twice
         self.assertFalse(self.admin("route_delete", {"key": "direct>main"})[1]["ok"])
         self.assertTrue(self.admin("route_delete", {"key": key})[1]["ok"])
         self.assertNotIn(key, [r["key"] for r in self.admin("state")[1]["state"]["routes"]])
         self.admin("routes_save", {"order_mode": "manual", "skip_down": True, "routes": [
             {"key": "direct>main", "name": ""}, {"key": chain[0], "name": ""}, {"key": owns[1], "name": "", "show": False, "auto": False}]})
+
+    def test_templates_and_user_subs(self):
+        self.login()
+        st = self.admin("state")[1]["state"]
+        keys = [r["key"] for r in st["routes"]]
+        self.assertEqual([t["id"] for t in st["templates"]], ["default"])
+        self.assertEqual((st["templates"][0]["users"], st["users"][0]["tpl"]), (1, "default"))
+        own_b = [k for k in keys if k.endswith(">self")][1]
+        # a named template: only friend-b's own config and this server (hidden, in Auto)
+        out = self.admin("template_save", {"name": "اقتصادی", "items": [
+            {"key": own_b, "name": "B", "show": True, "auto": True}, {"key": "direct>main", "show": False, "auto": True},
+            {"key": "nope", "name": "x"}]})[1]
+        self.assertTrue(out["ok"], out)
+        tid = out["id"]
+        self.assertEqual([t["name"] for t in out["state"]["templates"]], ["پیش‌فرض", "اقتصادی"])
+        self.assertEqual(len(xc.load_config()["sub_templates"][0]["items"]), 2)  # unknown route dropped
+        self.assertFalse(self.admin("template_save", {"name": "اقتصادی", "items": [{"key": own_b}]})[1]["ok"])  # same name
+        self.assertFalse(self.admin("template_save", {"name": "خالی", "items": [{"key": own_b, "show": False, "auto": False}]})[1]["ok"])
+        self.assertFalse(self.admin("template_save", {"name": "", "items": [{"key": own_b}]})[1]["ok"])
+        # the user gets the template
+        out = self.admin("user_sub", {"sub": "abc", "template": tid})[1]
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["state"]["users"][0]["tpl"], tid)
+        self.assertEqual([t["users"] for t in out["state"]["templates"]], [0, 1])
+        status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
+        self.assertEqual([c["remarks"] for c in json.loads(body)], ["⚡ Auto", "B"])
+        # ... or a choice of its own
+        out = self.admin("user_sub", {"sub": "abc", "template": "custom", "order_mode": "manual", "items": [
+            {"key": keys[1], "name": "فقط این", "show": True, "auto": False}]})[1]
+        self.assertTrue(out["ok"], out)
+        self.assertEqual((out["state"]["users"][0]["tpl"], out["state"]["users"][0]["custom"]["items"][0]["name"]), ("custom", "فقط این"))
+        status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
+        self.assertEqual([c["remarks"] for c in json.loads(body)], ["فقط این · user1-reality", "فقط این · user1-ws"])
+        self.assertFalse(self.admin("user_sub", {"sub": "abc", "template": "custom", "items": []})[1]["ok"])
+        self.assertFalse(self.admin("user_sub", {"sub": "abc", "template": "zzz"})[1]["ok"])
+        self.assertFalse(self.admin("user_sub", {"sub": "nobody", "template": "default"})[1]["ok"])
+        # the default template edits the routes themselves
+        out = self.admin("template_save", {"id": "default", "order_mode": "manual", "items": [
+            {"key": keys[1], "name": "اول", "show": True, "auto": True}, {"key": "direct>main", "name": "", "show": True, "auto": True}]})[1]
+        self.assertTrue(out["ok"], out)
+        rts = {r["key"]: r for r in out["state"]["routes"]}
+        self.assertEqual([r["key"] for r in out["state"]["routes"]][:2], [keys[1], "direct>main"])
+        self.assertEqual((rts[keys[1]]["name"], rts[keys[2]]["show"], rts[keys[2]]["auto"]), ("اول", False, False))
+        # deleting a template moves its users back to the default
+        self.admin("user_sub", {"sub": "abc", "template": tid})
+        out = self.admin("template_delete", {"id": tid})[1]
+        self.assertTrue(out["ok"], out)
+        self.assertIn("۱", out["msg"].translate(xc.FA_DIGITS))
+        self.assertEqual((out["state"]["users"][0]["tpl"], len(out["state"]["templates"])), ("default", 1))
+        self.assertFalse(self.admin("template_delete", {"id": "default"})[1]["ok"])
+        self.admin("user_sub", {"sub": "abc", "template": "default"})
+        cfg = xc.load_config()
+        self.assertEqual(cfg["user_subs"], {})
+        cfg.pop("routes_cfg", None)
+        cfg["order_mode"] = "manual"
+        xc.save_config(cfg)
+        self.app.reload()
 
     def test_route_ping(self):
         d = tempfile.mkdtemp()
@@ -576,8 +685,8 @@ class EndToEnd(unittest.TestCase):
         rows = {r["name"]: r for r in res["rows"]}
         self.assertEqual([r["name"] for r in res["rows"]][:2], ["Main · user1-reality", "Main · user1-ws"])
         self.assertTrue(rows["Main · user1-reality"]["ok"] and isinstance(rows["Main · user1-reality"]["ms"], int))
-        self.assertTrue(rows["Deco1 · user1-ws"]["ok"])
-        self.assertEqual((rows["Deco2 · user1-ws"]["ok"], rows["Deco2 · user1-ws"]["tcp_ms"], rows["Deco2 · user1-ws"]["error"]), (False, None, "پورت بسته است"))
+        self.assertTrue(rows["واسط ۱ · user1-ws"]["ok"])
+        self.assertEqual((rows["واسط ۲ · user1-ws"]["ok"], rows["واسط ۲ · user1-ws"]["tcp_ms"], rows["واسط ۲ · user1-ws"]["error"]), (False, None, "پورت بسته است"))
         self.assertTrue(res["xray"])
         self.assertTrue(self.app.net.ping_by_key["direct>main"]["ok"])
         st = xc.admin_state(self.app, "h")
@@ -655,7 +764,7 @@ class EndToEnd(unittest.TestCase):
         if yaml:
             prof = yaml.safe_load(body)
             auto = next(g for g in prof["proxy-groups"] if g["name"] == "⚡ Auto")["proxies"]
-            self.assertTrue(all(n.startswith("Main") for n in auto[-2:]) and all(re.match(r"Deco\d", n) for n in auto[:-2]))  # Main last
+            self.assertTrue(all(n.startswith("Main") for n in auto[-2:]) and all(n.startswith("واسط ") for n in auto[:-2]))  # Main last
         self.admin("decos", {"lines": UPS[1:3]})
         self.admin("settings", {"title": "", "direct_first": True})
         self.assertFalse(self.admin("user_add", {"name": "x", "inbounds": [1]})[1]["ok"])  # no panel connected
@@ -848,15 +957,15 @@ class MonitorTests(unittest.TestCase):
         mon.run_once()
         text = Telegram.sent[0][1]["text"][0]
         self.assertIn("vpn.example", text)
-        self.assertIn("🔴 Deco1 (friend-b) قطع شد", text)
-        self.assertIn("🔴 Deco2 (friend-c) قطع شد", text)
+        self.assertIn("🔴 واسط ۱ (friend-b) قطع شد", text)
+        self.assertIn("🔴 واسط ۲ (friend-c) قطع شد", text)
         self.assertIn("🚨", text)
         mon.run_once()
         self.assertEqual(len(Telegram.sent), 2)  # no repeats (two chats)
         os.environ.pop("FAKE_DEAD")
         mon.run_once()
         text = Telegram.sent[-1][1]["text"][0]
-        self.assertIn("🟢 Deco1 (friend-b) دوباره وصل شد", text)
+        self.assertIn("🟢 واسط ۱ (friend-b) دوباره وصل شد", text)
         self.assertNotIn("🚨", text)
 
     def test_quota_alerts(self):
@@ -1235,7 +1344,7 @@ class PanelTests(unittest.TestCase):
         self.assertEqual([xc.location_label(n, rt) for n in own], ["🇫🇮 فنلاند", "🇩🇪 آلمان"])
         # every exit is its own route; a config name carries no location prefix
         confs = json.loads(xc.build_xray(own, xc.parse_nodes(UPS[1:2]), rt, "t")[0])
-        self.assertEqual([c["remarks"] for c in confs], ["⚡ Auto", "Main", "🇩🇪 آلمان", "Deco1", "Deco1 · 🇩🇪 آلمان"])
+        self.assertEqual([c["remarks"] for c in confs], ["⚡ Auto", "Main", "🇩🇪 آلمان", "واسط ۱", "واسط ۱ ← 🇩🇪 آلمان"])
         self.assertEqual([e["name"] for e in xc.exits_of(rt)], ["🇫🇮 فنلاند", "🇩🇪 آلمان"])
 
     def test_admin_api_user_management(self):
@@ -1334,6 +1443,31 @@ class ReadClientsTests(unittest.TestCase):
         xc.set_password("hello999")
         self.assertFalse(auth.valid(token))
         xc.set_password("secret1")
+
+
+class ConfigTests(unittest.TestCase):
+    def test_old_deco_label_migrates_once(self):
+        path = xc.conf_path("config.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        keep = open(path, encoding="utf-8").read() if os.path.exists(path) else None
+        try:
+            for stored, expect in (("Deco", "واسط"), ("Relay", "Relay"), (None, "واسط")):
+                raw = {"admin_path": "x"}
+                if stored is not None:
+                    raw["label_deco"] = stored
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(raw, f)
+                cfg = xc.load_config()
+                self.assertEqual((cfg["label_deco"], cfg["schema"]), (expect, xc.CONFIG_SCHEMA))
+                self.assertEqual(json.load(open(path, encoding="utf-8"))["schema"], xc.CONFIG_SCHEMA)
+            xc.save_config(dict(xc.load_config(), label_deco="Deco"))  # chosen again after the migration: kept
+            self.assertEqual(xc.load_config()["label_deco"], "Deco")
+        finally:
+            if keep is None:
+                os.unlink(path)
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(keep)
 
 
 class UsageTests(unittest.TestCase):

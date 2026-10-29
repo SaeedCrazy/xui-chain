@@ -344,7 +344,7 @@ class NetTests(unittest.TestCase):
         j = self.job("probe", lambda log: self.net.probe(iran["id"], "abc", log))
         self.assertEqual(j["status"], "done", j)
         rows = j["result"]["rows"]
-        self.assertEqual([(r["name"], r["key"][:5]) for r in rows], [("Main", "direc"), ("Deco1", "deco:")])
+        self.assertEqual([(r["name"], r["key"][:5]) for r in rows], [("Main", "direc"), ("واسط ۱", "deco:")])
         self.assertEqual((rows[0]["tcp_ms"], rows[0]["ttfb_ms"], rows[0]["mbps"]), (50, 400, 10.0))
         self.assertEqual(rows[1]["mbps"], 20.0)
         probe_script = [s for s in scripts("iran.example") if "run_one" in s][0]
