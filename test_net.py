@@ -64,7 +64,10 @@ if "echo EZ_SETUP_OK" in script:
 if "echo EZ_REMOVE_OK" in script:
     out += ["EZ_REMOVE_OK"]
 if "systemctl is-active" in script:
-    out += ["active=active", "since=now", "listening=1/1", "log="]
+    down = os.path.exists(os.path.join(log, "DOWN"))
+    out += ["active=" + ("inactive" if down else "active"), "since=now", "listening=" + ("0/1" if down else "1/1"), "log="]
+if "statistics/rx_bytes" in script:
+    out += ["iface=eth0", "rx=%d" % (1000000 * (n + 1)), "tx=%d" % (500000 * (n + 1))]
 if "EZ_BENCH_SERVER_OK" in script:
     out += ["EZ_BENCH_SERVER_OK"]
 if "echo EZ_BENCH_OK" in script:
@@ -386,6 +389,50 @@ class NetTests(unittest.TestCase):
         self.assertEqual(self.net.server(nl["id"])["role"], "iran")
         status, out = xc.do_action(self.app, "net_server_delete", {"id": nl["id"]}, "h")
         self.assertTrue(out["ok"])
+
+    def test_08_traffic_and_tunnel_alerts(self):
+        iran = next(s for s in self.net.servers() if s["role"] == "iran")
+        de = next(s for s in self.net.servers() if s["host"] == "de.example")
+        # the users' subscription offers the Iran server once a tunnel to this server is up
+        self.net.save_tunnel({"id": "tt1", "name": "تانل ایران", "entry": iran["id"], "exit": "main", "engine": "backhaul",
+                              "ports": "443", "cport": 4000, "created": 1, "status": "up"})
+        status, hdrs, text = xc.build_subscription("abc", "clash", self.app.rt, self.app)
+        self.assertEqual(status, 200, text)
+        self.assertIn('name: "تانل ایران"', text)
+        self.assertIn('server: "5.6.7.8"', text)
+        self.assertNotIn('name: "DE1"', text)  # a Deco's own config that is neither shown nor in Auto is not sent
+        self.net.drop_tunnel("tt1")
+        # traffic sampling: counters of every server, volume of this billing period
+        clear()
+        self.net.sample_traffic()
+        self.net.sample_traffic()
+        self.assertTrue(all("statistics/rx_bytes" in s for s in scripts("iran.example")))
+        total = self.app.usage.period_total("srv:%s" % iran["id"], 1, "both")
+        self.assertTrue(total and total > 0, total)
+        self.assertEqual(self.app.usage.period_total("srv:%s" % iran["id"], 1, "out"), total // 3)  # tx is half of rx
+        # tunnel alerts: down after two failed checks, one message each way
+        body = {"entry": iran["id"], "exit": de["id"], "engine": "gost", "transport": "tls", "ports": "443", "name": "تانل"}
+        j = self.job("tunnel", lambda log: self.net.create_tunnel(body, log))
+        self.assertEqual(j["status"], "done", j)
+        t = j["result"]
+        self.assertEqual(self.net.check_tunnels(), [])
+        open(os.path.join(LOG_DIR, "DOWN"), "w").close()
+        try:
+            self.assertEqual(self.net.check_tunnels(), [])  # first failure: wait for the next check
+            msgs = self.net.check_tunnels()
+            self.assertEqual(len(msgs), 1, msgs)
+            self.assertIn("قطع شد", msgs[0])
+            self.assertEqual(self.net.check_tunnels(), [])  # no repeat
+            self.assertEqual(next(x for x in self.net.tunnels() if x["id"] == t["id"])["status"], "down")
+            e = next(x for x in xc.live_entries(self.app, self.app.rt, []) if x["key"] == "tunnel:" + t["id"])
+            self.assertTrue(e["down"] and e["skip"])
+            self.assertEqual(e["used"], total)
+        finally:
+            os.unlink(os.path.join(LOG_DIR, "DOWN"))
+        msgs = self.net.check_tunnels()
+        self.assertEqual(len(msgs), 1, msgs)
+        self.assertIn("بالا اومد", msgs[0])
+        self.job("remove", lambda log: self.net.remove_tunnel(t["id"], log))
 
 
 if __name__ == "__main__":

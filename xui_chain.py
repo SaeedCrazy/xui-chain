@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -75,7 +75,12 @@ DEFAULTS = {
     "show_auto": True,         # which entries the users' apps list
     "show_main": True,
     "show_deco_any": True,     # Clash: "Deco" = your server through the first working Deco
-    "deco_opts": {},           # per Deco (by node key): chain, own, chain_name, own_name
+    "deco_opts": {},           # per Deco (by node key): chain, own, chain_name, own_name (older panels)
+    "entries_cfg": {},         # per subscription entry (main, tunnel:<id>, chain:<key>, own:<key>, chain_any):
+                               #   name, show, auto, price, unit, quota_gb, bill_day, order, count
+    "order_mode": "manual",    # priority of the entries: "manual" order, or cheapest first ("price")
+    "skip_down": True,         # leave an entry out of the subscription while its tunnel / Deco is down
+    "skip_exhausted": True,    # ... and while its volume quota is used up
     "user_page": True,         # subscription link opened in a browser shows the user's account page
     "support_url": "",         # support / renewal link on the user page (e.g. https://t.me/...)
     "announce": "",            # message shown on every user page
@@ -641,78 +646,245 @@ def route_name(cfg, node, single_own, text):
     return text if single_own else "%s · %s" % (node["name"], text)
 
 
-def deco_options(cfg, ups):
-    """[(index, node, options)] for the Decos: whether the user's server is offered through it
-    ("chain"), whether the Deco's own config is offered as it is ("own"), and both names."""
-    stored = cfg.get("deco_opts") or {}
-    deco = label(cfg, "label_deco")
+# ---------------------------------------------------------------- subscription entries
+#
+# Everything a user's subscription can offer is an "entry": this server (main), an Iran server
+# with a tunnel to it (tunnel), this server reached through a Deco (chain), a Deco's own config
+# (own), or "this server through whichever Deco works" (chain_any, Clash only). Entries have a
+# priority order (manual or by price), a price, a volume quota and a live state.
+
+GB_BYTES = 1024 ** 3
+DEFAULT_MONTH_GB = 500  # assumed monthly volume of a priced-per-month entry without a quota
+
+
+def entry_store(cfg):
+    return cfg.get("entries_cfg") or {}
+
+
+def entry_name_default(kind, cfg, idx=0, node=None, tunnel=None):
+    if kind == "main":
+        return label(cfg, "label_main")
+    if kind == "tunnel":
+        return (tunnel or {}).get("name") or "ایران"
+    if kind == "chain":
+        return "%s%d" % (label(cfg, "label_deco"), idx)
+    if kind == "own":
+        return (node or {}).get("name") or "Deco"
+    return label(cfg, "label_deco")
+
+
+def entry_settings(cfg, key, kind, idx=0, node=None, tunnel=None):
+    """Stored settings of one entry with defaults (and the older deco_opts flags as a fallback)."""
+    st = entry_store(cfg).get(key) or {}
+    show, auto, price = True, True, None
+    if kind == "own":
+        show, auto = False, False
+    if kind == "chain_any":
+        show, auto = cfg.get("show_deco_any", True), False
+    if kind == "main":
+        show, price = cfg.get("show_main", True), 0
+    legacy_name = ""
+    if kind in ("chain", "own") and node is not None:
+        o = (cfg.get("deco_opts") or {}).get(node_key(node)) or {}
+        show = o.get(kind, show)
+        auto = show and o.get(kind + "_auto", auto)
+        legacy_name = (o.get(kind + "_name") or "").strip()
+    name = (st.get("name") or "").strip() or legacy_name or entry_name_default(kind, cfg, idx, node, tunnel)
+    return {"name": name, "show": bool(st.get("show", show)), "auto": bool(st.get("auto", auto)),
+            "price": st.get("price", price), "unit": st.get("unit") or "month",
+            "quota_gb": float(st.get("quota_gb") or 0), "bill_day": int(st.get("bill_day") or 1),
+            "count": st.get("count") or "both", "order": st.get("order")}
+
+
+def entry_cost(e):
+    """Toman per GB for sorting by price; None when unknown."""
+    price = e.get("price")
+    if price in (None, ""):
+        return None
+    price = float(price)
+    if e.get("unit") == "gb":
+        return price
+    return price / (e.get("quota_gb") or DEFAULT_MONTH_GB)
+
+
+def tunnel_port_map(t):
+    try:
+        return dict((xp, ep) for ep, xp in expand_ports(parse_ports(t.get("ports", ""))))
+    except ValueError:
+        return {}
+
+
+def tunnel_applies(n, tunnel, exit_srv, cfg):
+    """Does the user's config n live on the tunnel's exit server?"""
+    if not exit_srv:
+        return False
+    if exit_srv.get("local"):
+        return n["server"] not in (cfg.get("locations") or {})  # not one of the other locations
+    facts = exit_srv.get("facts") or {}
+    return n["server"] in (facts.get("ip"), exit_srv.get("host"))
+
+
+def rewrite_for_tunnel(n, entry_ip, port_map):
+    port = port_map.get(n["port"])
+    if not port or not entry_ip:
+        return None
+    m = dict(n, server=entry_ip, port=port)
+    return m
+
+
+def sub_entries(cfg, ups, usage=None, statuses=None, deco_down=None):
+    """Ordered entries of the subscription. usage: {"srv:<id>" | "main": used bytes this period};
+    statuses: {tunnel id: "up"|"down"}; deco_down: {node_key: True}."""
+    statuses, deco_down = statuses or {}, deco_down or {}
+    if usage is None:
+        usage = {}
+    used_of = usage if callable(usage) else (lambda key, e: usage.get(key))
+    servers = {s["id"]: s for s in (cfg.get("servers") or [])}
+    servers["main"] = {"id": "main", "local": True, "facts": cfg.get("main_facts") or {}, "host": cfg.get("public_host", "")}
     out = []
+
+    def add(key, kind, idx=0, node=None, tunnel=None, default_order=0, **extra):
+        st = entry_settings(cfg, key, kind, idx, node, tunnel)
+        e = dict(st, key=key, kind=kind, idx=idx, node=node, tunnel=tunnel, default_order=default_order,
+                 used=None, remaining=None, down=False, exhausted=False, **extra)
+        out.append(e)
+        return e
+
+    main = add("main", "main", default_order=0 if cfg.get("direct_first", True) else 10 ** 6, server_id="main")
+    main["used"] = used_of("main", main)
+    for k, t in enumerate(cfg.get("tunnels") or [], 1):
+        if t.get("status") in ("failed", "setting-up"):
+            continue
+        entry_srv, exit_srv = servers.get(t.get("entry")), servers.get(t.get("exit"))
+        ip = ((entry_srv or {}).get("facts") or {}).get("ip") or (entry_srv or {}).get("host") or ""
+        e = add("tunnel:" + t["id"], "tunnel", k, tunnel=t, default_order=100 + k, entry_ip=ip, exit_srv=exit_srv,
+                port_map=tunnel_port_map(t), server_id=t.get("entry"), server_name=(entry_srv or {}).get("name", ""))
+        e["down"] = statuses.get(t["id"], t.get("status")) == "down"
+        e["used"] = used_of("srv:%s" % t.get("entry"), e)
+    if ups:
+        add("chain_any", "chain_any", default_order=500)
+    base = 1000
     for i, n in enumerate(ups, 1):
-        o = stored.get(node_key(n)) or {}
-        out.append((i, n, {"chain": o.get("chain", True), "own": o.get("own", False),
-                           "chain_auto": o.get("chain_auto", True), "own_auto": o.get("own_auto", False),
-                           "chain_name": (o.get("chain_name") or "").strip() or "%s%d" % (deco, i),
-                           "own_name": (o.get("own_name") or "").strip() or n["name"]}))
+        key = node_key(n)
+        info = UPSTREAMS.info.get(n.get("src", "")) if n.get("src") else None
+        for kind, off in (("chain", 0), ("own", 1)):
+            e = add("%s:%s" % (kind, key), kind, i, node=n, default_order=base + i * 10 + off)
+            e["down"] = bool(deco_down.get(key))
+            if info:
+                e["used"] = info.get("upload", 0) + info.get("download", 0)
+                if info.get("total"):
+                    e["quota_gb"] = e["quota_gb"] or info["total"] / GB_BYTES
+                    e["quota_from_sub"] = True
+
+    for e in out:
+        if e["quota_gb"] and e["used"] is not None:
+            e["remaining"] = max(0, e["quota_gb"] * GB_BYTES - e["used"])
+            e["exhausted"] = e["remaining"] <= 0
+        e["cost"] = entry_cost(e)
+        e["skip"] = (e["kind"] != "main") and ((e["down"] and cfg.get("skip_down", True)) or
+                                               (e["exhausted"] and cfg.get("skip_exhausted", True)))
+    if (cfg.get("order_mode") or "manual") == "price":
+        out.sort(key=lambda e: (e["cost"] is None, e["cost"] or 0, e["default_order"]))
+    else:
+        out.sort(key=lambda e: (e["order"] if e["order"] is not None else e["default_order"], e["default_order"]))
     return out
 
 
-def build_mihomo(own, ups, cfg):
+def entries_public(entries):
+    """Entries for the admin page (no node or tunnel objects)."""
+    keep = ("key", "kind", "idx", "name", "show", "auto", "price", "unit", "quota_gb", "bill_day", "order",
+            "used", "remaining", "down", "exhausted", "skip", "cost", "quota_from_sub", "server_name", "entry_ip",
+            "server_id", "count")
+    out = []
+    for e in entries:
+        d = {k: e.get(k) for k in keep}
+        d["period"] = period_label(e["bill_day"]) if e["kind"] in ("main", "tunnel") else ""
+        d["label"] = e["node"]["name"] if e.get("node") is not None else (e["tunnel"] or {}).get("name", "") if e.get("tunnel") else ""
+        d["ports"] = (e.get("tunnel") or {}).get("ports", "") if e.get("tunnel") else ""
+        out.append(d)
+    return out
+
+
+def deco_options(cfg, ups):
+    """[(index, node, options)]: the chain/own flags of each Deco, derived from the entries."""
+    out = []
+    for i, n in enumerate(ups, 1):
+        key = node_key(n)
+        c = entry_settings(cfg, "chain:" + key, "chain", i, n)
+        o = entry_settings(cfg, "own:" + key, "own", i, n)
+        out.append((i, n, {"chain": c["show"], "own": o["show"], "chain_auto": c["auto"], "own_auto": o["auto"],
+                           "chain_name": c["name"], "own_name": o["name"]}))
+    return out
+
+
+def build_mihomo(own, ups, cfg, entries=None):
     """own, ups: lists of neutral nodes. Returns (yaml_text, skipped_messages)."""
     g_auto = auto_name(cfg)
-    main, deco = label(cfg, "label_main"), label(cfg, "label_deco")
+    deco = label(cfg, "label_deco")
     names = {G_MAIN, g_auto, G_UP, "DIRECT", "REJECT"}
     skipped = []
-    hops, owns, auto_order = [], [], []
-    for i, n, o in deco_options(cfg, ups):
+    entries = entries if entries is not None else sub_entries(cfg, ups)
+    one = len(own) == 1
+    hops = {}
+    for i, n in enumerate(ups, 1):
         try:
-            if o["chain"]:
-                hops.append((o, to_mihomo(n, unique(names, "%s%d · %s" % (deco, i, n["name"])))))
-            if o["own"]:
-                p = to_mihomo(n, unique(names, o["own_name"]))
-                owns.append(p)
-                if o["own_auto"]:
-                    auto_order.append(("own", i, p["name"]))
+            hops[i] = to_mihomo(n, unique(names, "%s%d · %s" % (deco, i, n["name"])))
         except ValueError as e:
             skipped.append("upstream %d: %s" % (i, e))
-    up_proxies = [p for _, p in hops]
-    direct, chained, single = [], [], []
-    one = len(own) == 1
-    for n in own:
+    proxies, visible, auto, used_hops = [], [], [], []
+    for e in entries:
+        if e["skip"] or not (e["show"] or e["auto"]):
+            continue
+        made = []
         try:
-            direct.append(to_mihomo(n, unique(names, route_name(cfg, n, one, main))))
-            if up_proxies:
-                # through the Decos group: the first working Deco, in priority order
-                p = to_mihomo(n, unique(names, route_name(cfg, n, one, deco)))
-                p["dialer-proxy"] = G_UP
-                chained.append(p)
-                for o, u in hops:
-                    p = to_mihomo(n, unique(names, route_name(cfg, n, one, o["chain_name"])))
-                    p["dialer-proxy"] = u["name"]
-                    single.append(p)
-                    if o["chain_auto"]:
-                        auto_order.append(("chain", int(u["name"].split(" ")[0][len(deco):] or 0), p["name"]))
-        except ValueError as e:
-            skipped.append("%s: %s" % (n["name"], e))
-    if not direct and not owns:
+            if e["kind"] in ("main", "tunnel"):
+                for n in own:
+                    m = n if e["kind"] == "main" else rewrite_for_tunnel(n, e["entry_ip"], e["port_map"]) \
+                        if tunnel_applies(n, e["tunnel"], e["exit_srv"], cfg) else None
+                    if m is None:
+                        continue
+                    made.append(to_mihomo(m, unique(names, route_name(cfg, n, one, e["name"]))))
+            elif e["kind"] == "chain":
+                hop = hops.get(e["idx"])
+                if hop is None or not (e["show"] or e["auto"]):
+                    continue
+                for n in own:
+                    p = to_mihomo(n, unique(names, route_name(cfg, n, one, e["name"])))
+                    p["dialer-proxy"] = hop["name"]
+                    made.append(p)
+                if made and hop not in used_hops:
+                    used_hops.append(hop)
+            elif e["kind"] == "own":
+                made.append(to_mihomo(e["node"], unique(names, e["name"])))
+            elif e["kind"] == "chain_any":
+                if not any(x["kind"] == "chain" and not x["skip"] and (x["show"] or x["auto"]) and x["idx"] in hops for x in entries):
+                    continue
+                for n in own:
+                    p = to_mihomo(n, unique(names, route_name(cfg, n, one, e["name"])))
+                    p["dialer-proxy"] = G_UP
+                    made.append(p)
+        except ValueError as ex:
+            skipped.append("%s: %s" % (e["name"], ex))
+            continue
+        proxies += made
+        if e["show"]:
+            visible += [p["name"] for p in made]
+        if e["auto"] and e["kind"] != "chain_any":
+            auto += [p["name"] for p in made]
+    if not proxies:
         raise ValueError("no usable config for this user")
-    # Auto: Main first (or last), then every chosen entry in Deco priority order
-    ordered = [name for _, _, name in sorted(auto_order, key=lambda x: (x[1], 0 if x[0] == "chain" else 1))]
-    mains = [p["name"] for p in direct]
-    auto = (mains + ordered) if cfg.get("direct_first", True) else (ordered + mains)
-    auto = auto or [p["name"] for p in owns]
+    group_hops = used_hops
+    auto = auto or visible or [p["name"] for p in proxies]
     fastest = (cfg.get("auto_mode") or "priority") == "fastest"
-    visible = ([g_auto] if cfg.get("show_auto", True) else []) + [p["name"] for p in (
-        (direct if cfg.get("show_main", True) else []) + (chained if cfg.get("show_deco_any", True) else [])
-        + single + owns)]
     test = {"url": cfg.get("test_url") or DEFAULTS["test_url"], "interval": int(cfg.get("test_interval") or 120),
             "timeout": 5000, "lazy": False}
     groups = [
-        {"name": G_MAIN, "type": "select", "proxies": visible or [g_auto]},
+        {"name": G_MAIN, "type": "select", "proxies": ([g_auto] if cfg.get("show_auto", True) else []) + visible or [g_auto]},
         dict({"name": g_auto, "type": "url-test" if fastest else "fallback", "proxies": auto},
              **(dict(test, tolerance=60) if fastest else test)),
     ]
-    if up_proxies:
-        groups.append(dict({"name": G_UP, "type": "fallback", "proxies": [p["name"] for p in up_proxies]}, **test))
+    if group_hops:
+        groups.append(dict({"name": G_UP, "type": "fallback", "proxies": [p["name"] for p in group_hops]}, **test))
     rules = []
     if cfg.get("iran_direct", True):
         rules.append("DOMAIN-SUFFIX,ir,DIRECT")
@@ -723,7 +895,7 @@ def build_mihomo(own, ups, cfg):
         "mode": "rule",
         "log-level": "warning",
         "unified-delay": True,
-        "proxies": direct + chained + single + up_proxies + owns,
+        "proxies": proxies + [h for h in hops.values() if h in group_hops],
         "proxy-groups": groups,
         "rules": rules,
     }
@@ -755,22 +927,18 @@ def xray_config(remarks, outbounds, cfg, route):
     }
 
 
-def build_xray(own, ups, cfg, remarks):
-    """List of Xray client configs (one app entry each): an automatic one (balancer over
-    every route), then each own config directly, through each chosen Deco, and the
-    Decos' own configs that were chosen to be offered as they are."""
+def build_xray(own, ups, cfg, remarks, entries=None):
+    """List of Xray client configs (one app entry each): an automatic one over every entry in
+    Auto, then every visible entry on its own (per own config)."""
     skipped = []
-    chain_ups, own_decos = [], []
-    for i, n, o in deco_options(cfg, ups):
+    entries = entries if entries is not None else sub_entries(cfg, ups)
+    one = len(own) == 1
+    hops = {}
+    for i, n in enumerate(ups, 1):
         try:
-            to_xray(n, "up")
+            hops[i] = to_xray(n, "up-%d" % i)
         except ValueError as e:
             skipped.append("upstream %d: %s" % (i, e))
-            continue
-        if o["chain"]:
-            chain_ups.append((i, n, o))
-        if o["own"]:
-            own_decos.append((i, n, o))
     own_ok = []
     for n in own:
         try:
@@ -778,54 +946,63 @@ def build_xray(own, ups, cfg, remarks):
             own_ok.append(n)
         except ValueError as e:
             skipped.append("%s: %s" % (n["name"], e))
-    if not own_ok and not own_decos:
-        raise ValueError("no usable config for this user")
 
     def chained(n, i, tag):
         o = to_xray(n, tag)
         o["streamSettings"]["sockopt"] = {"dialerProxy": "up-%d" % i}
         return o
 
-    one = len(own_ok) == 1
-    main = label(cfg, "label_main")
-    direct = [xray_config(route_name(cfg, n, one, main), [to_xray(n, "proxy")], cfg, {"outboundTag": "proxy"})
-              for n in own_ok]
-    singles = list(direct) if cfg.get("show_main", True) else []
-    for i, u, o in chain_ups:
-        for n in own_ok:
-            singles.append(xray_config(route_name(cfg, n, one, o["chain_name"]),
-                                       [chained(n, i, "proxy"), to_xray(u, "up-%d" % i)],
-                                       cfg, {"outboundTag": "proxy"}))
-    for i, u, o in own_decos:
-        singles.append(xray_config(o["own_name"], [to_xray(u, "proxy")], cfg, {"outboundTag": "proxy"}))
-    singles = singles or direct
-    auto_chains = [(i, u, o) for i, u, o in chain_ups if o["chain_auto"]]
-    auto_owns = [(i, u, o) for i, u, o in own_decos if o["own_auto"]]
-    if not (auto_chains or auto_owns) or not cfg.get("show_auto", True):
-        return json.dumps(singles, ensure_ascii=False, indent=2), skipped
-
-    # members of Auto in priority order: Main, then each Deco (its chain, then its own config)
-    mine, prio = [], []
-    mains = [to_xray(n, "me-%d-direct" % k) for k, n in enumerate(own_ok, 1)]
-    if cfg.get("direct_first", True):
-        mine += mains
-    for i, u, o in sorted(auto_chains + auto_owns, key=lambda x: x[0]):
-        if o in [x[2] for x in auto_chains] and (i, u, o) in auto_chains:
-            for k, n in enumerate(own_ok, 1):
-                mine.append(chained(n, i, "me-%d-via-up-%d" % (k, i)))
-        if (i, u, o) in auto_owns:
-            out = to_xray(u, "me-own-up-%d" % i)
-            mine.append(out)
-    if not cfg.get("direct_first", True):
-        mine += mains
-    seen = set()
-    members = []
-    for o in mine:
+    singles, members, member_hops, auto_entries = [], [], {}, set()
+    for e in entries:
+        if e["skip"] or e["kind"] == "chain_any":
+            continue
+        before = len(members)
+        try:
+            if e["kind"] in ("main", "tunnel"):
+                for k, n in enumerate(own_ok, 1):
+                    m = n if e["kind"] == "main" else rewrite_for_tunnel(n, e["entry_ip"], e["port_map"]) \
+                        if tunnel_applies(n, e["tunnel"], e["exit_srv"], cfg) else None
+                    if m is None:
+                        continue
+                    tag = "me-%d-direct" % k if e["kind"] == "main" else "me-%d-tun-%s" % (k, e["tunnel"]["id"])
+                    if e["show"]:
+                        singles.append(xray_config(route_name(cfg, n, one, e["name"]), [to_xray(m, "proxy")], cfg, {"outboundTag": "proxy"}))
+                    if e["auto"]:
+                        members.append(to_xray(m, tag))
+            elif e["kind"] == "chain":
+                if e["idx"] not in hops:
+                    continue
+                for k, n in enumerate(own_ok, 1):
+                    if e["show"]:
+                        singles.append(xray_config(route_name(cfg, n, one, e["name"]),
+                                                   [chained(n, e["idx"], "proxy"), dict(hops[e["idx"]], tag="up-%d" % e["idx"])],
+                                                   cfg, {"outboundTag": "proxy"}))
+                    if e["auto"]:
+                        members.append(chained(n, e["idx"], "me-%d-via-up-%d" % (k, e["idx"])))
+                        member_hops[e["idx"]] = hops[e["idx"]]
+            elif e["kind"] == "own":
+                if e["idx"] not in hops:
+                    continue
+                if e["show"]:
+                    singles.append(xray_config(e["name"], [dict(hops[e["idx"]], tag="proxy")], cfg, {"outboundTag": "proxy"}))
+                if e["auto"]:
+                    members.append(dict(hops[e["idx"]], tag="me-own-up-%d" % e["idx"]))
+        except ValueError as ex:
+            skipped.append("%s: %s" % (e["name"], ex))
+        if len(members) > before:
+            auto_entries.add(e["key"])
+    if not singles and not members:
+        raise ValueError("no usable config for this user")
+    if len(auto_entries) < 2 or not cfg.get("show_auto", True):  # Auto only when there is something to fall back to
+        return json.dumps(singles or [xray_config(remarks, [dict(members[0], tag="proxy")], cfg, {"outboundTag": "proxy"})],
+                          ensure_ascii=False, indent=2), skipped
+    seen, uniq = set(), []
+    for o in members:
         if o["tag"] not in seen:
             seen.add(o["tag"])
-            members.append(o)
-    hops = [to_xray(u, "up-%d" % i) for i, u, o in chain_ups if o["chain_auto"]]
-    auto = xray_config(auto_name(cfg), members + hops, cfg, {"balancerTag": "auto"})
+            uniq.append(o)
+    members = uniq
+    auto = xray_config(auto_name(cfg), members + list(member_hops.values()), cfg, {"balancerTag": "auto"})
     auto["observatory"] = {
         "subjectSelector": ["me-"],
         "probeURL": cfg.get("test_url") or DEFAULTS["test_url"],
@@ -839,6 +1016,82 @@ def build_xray(own, ups, cfg, remarks):
             {"regexp": False, "match": o["tag"], "value": round(1 + 0.6 * k, 2)} for k, o in enumerate(members)]}}
     auto["routing"]["balancers"] = [{"tag": "auto", "selector": ["me-"], "strategy": strategy, "fallbackTag": members[0]["tag"]}]
     return json.dumps([auto] + singles, ensure_ascii=False, indent=2), skipped
+
+
+def live_entries(app, cfg, ups):
+    """Entries with the live state of this panel: traffic of the servers this period, tunnel
+    status, Decos the monitor found down."""
+    def used(key, e):
+        sid = key.split(":", 1)[1] if key.startswith("srv:") else "main"
+        return app.usage.period_total("srv:%s" % sid, e["bill_day"], e.get("count") or "both")
+    statuses = {t["id"]: t.get("status") for t in (cfg.get("tunnels") or [])}
+    down = {node_key(it["node"]): True for it in app.monitor.results if it.get("down")}
+    return sub_entries(cfg, ups, usage=used, statuses=statuses, deco_down=down)
+
+
+JALALI_MONTHS = ["فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور", "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"]
+
+
+def g2j(gy, gm, gd):
+    g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    gy2 = gy + 1 if gm > 2 else gy
+    days = 355666 + 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400 + gd + g_d_m[gm - 1]
+    jy = -1595 + 33 * (days // 12053)
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        return jy, 1 + days // 31, 1 + days % 31
+    return jy, 7 + (days - 186) // 30, 1 + (days - 186) % 30
+
+
+def j2g(jy, jm, jd):
+    jy += 1595
+    days = -355668 + 365 * jy + (jy // 33) * 8 + ((jy % 33) + 3) // 4 + jd + ((jm - 1) * 31 if jm < 7 else (jm - 7) * 30 + 186)
+    gy = 400 * (days // 146097)
+    days %= 146097
+    if days > 36524:
+        days -= 1
+        gy += 100 * (days // 36524)
+        days %= 36524
+        if days >= 365:
+            days += 1
+    gy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        gy += (days - 1) // 365
+        days = (days - 1) % 365
+    gd = days + 1
+    leap = (gy % 4 == 0 and gy % 100 != 0) or gy % 400 == 0
+    lengths = [31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    gm = 1
+    while gm <= 12 and gd > lengths[gm - 1]:
+        gd -= lengths[gm - 1]
+        gm += 1
+    return gy, gm, gd
+
+
+def period_start(bill_day, now=None):
+    """First day (YYYY-MM-DD, Tehran) of the current billing period: the latest Jalali date whose
+    day of month is bill_day (Iranian servers are billed by the Jalali month)."""
+    bill_day = min(max(int(bill_day or 1), 1), 30)
+    t = time.gmtime((now or time.time()) + TEHRAN)
+    jy, jm, jd = g2j(t.tm_year, t.tm_mon, t.tm_mday)
+    if jd < bill_day:
+        jm -= 1
+        if jm == 0:
+            jy, jm = jy - 1, 12
+    day = min(bill_day, 31 if jm <= 6 else 30 if jm <= 11 else 29)
+    return "%04d-%02d-%02d" % j2g(jy, jm, day)
+
+
+def period_label(bill_day, now=None):
+    y, m, d = (int(x) for x in period_start(bill_day, now).split("-"))
+    jy, jm, jd = g2j(y, m, d)
+    return "از %d %s" % (jd, JALALI_MONTHS[jm - 1])
 
 
 # ---------------------------------------------------------------- fetching
@@ -1000,7 +1253,7 @@ def label_configs(own, rt):
     return own
 
 
-def build_subscription(sub_id, fmt, rt):
+def build_subscription(sub_id, fmt, rt, app=None):
     """-> (status, headers, body)."""
     url = rt["xui_sub_url"] + urllib.parse.quote(sub_id)
     try:
@@ -1015,12 +1268,13 @@ def build_subscription(sub_id, fmt, rt):
     ups = UPSTREAMS.nodes()
     label_configs(own, rt)
     title = rt.get("title") or NAME
+    entries = live_entries(app, rt, ups) if app else None
     try:
         if fmt == "xray":
-            text, _ = build_xray(own, ups, rt, title)
+            text, _ = build_xray(own, ups, rt, title, entries)
             ctype, ext = "application/json; charset=utf-8", "json"
         else:
-            text, _ = build_mihomo(own, ups, rt)
+            text, _ = build_mihomo(own, ups, rt, entries)
             ctype, ext = "text/yaml; charset=utf-8", "yaml"
     except ValueError as e:
         return 422, {}, "%s\n" % e
@@ -1266,7 +1520,9 @@ class Monitor:
         r["at"] = time.time()
         return r
 
-    def run_once(self):
+    def run_once(self, servers=True):
+        """Tests the Decos; servers=True also samples the servers' traffic and checks the tunnels
+        (the periodic run), which the manual test from the admin page skips."""
         with self.run_lock:
             rt = self.app.rt
             decos = UPSTREAMS.nodes(errors=[])
@@ -1297,6 +1553,13 @@ class Monitor:
             self.results = items
             self.last_run = time.time()
             msgs = self.alerts(items, rt)
+            try:
+                if servers and getattr(self.app, "net", None) and self.app.net.servers():
+                    self.app.net.sample_traffic()
+                    msgs += self.app.net.check_tunnels()
+                    msgs += self.quota_alerts(rt)
+            except Exception as e:
+                print("server check error: %s" % e, flush=True)
         if msgs:
             err = tg_send(rt, "🔗 %s · %s\n\n%s" % (NAME, rt.get("public_host") or "server", "\n\n".join(msgs)))
             if err:
@@ -1343,6 +1606,20 @@ class Monitor:
                 days = max(0, int((exp - now) // 86400))
                 msgs.append("⏳ اشتراک %s %s" % (name, "منقضی شده" if exp <= now else "تا %d روز دیگه تموم می‌شه" % days))
             self.flags.add(("exp", src)) if soon else self.flags.discard(("exp", src))
+        return msgs
+
+    def quota_alerts(self, rt):
+        """Low volume on an Iran server / this server with a quota (once per period)."""
+        msgs = []
+        for e in live_entries(self.app, rt, []):
+            if e["kind"] not in ("main", "tunnel") or not e.get("quota_gb") or e.get("remaining") is None:
+                continue
+            total = e["quota_gb"] * GB_BYTES
+            low = e["remaining"] < total * self.LOW_RATIO or e["remaining"] < self.LOW_BYTES
+            flag = ("quota", e["key"], period_start(e["bill_day"]))
+            if low and flag not in self.flags:
+                msgs.append("🟡 حجم %s رو به تمومه: %s GB از %s GB مانده" % (e["name"], fmt_gb(e["remaining"]), fmt_gb(total)))
+                self.flags.add(flag)
         return msgs
 
     def loop(self):
@@ -2475,6 +2752,15 @@ def tunnel_scripts(t, entry, exit_, tunnel_ip):
     return S
 
 
+TRAFFIC_SCRIPT = r'''
+IF=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+[ -n "$IF" ] || IF=$(ip -o link show up 2>/dev/null | awk -F': ' '$2!="lo"{print $2; exit}')
+echo "iface=$IF"
+echo "rx=$(cat /sys/class/net/$IF/statistics/rx_bytes 2>/dev/null || echo 0)"
+echo "tx=$(cat /sys/class/net/$IF/statistics/tx_bytes 2>/dev/null || echo 0)"
+'''
+
+
 def tunnel_status_script(t):
     name = "ez-%s" % t["id"]
     unit = ("wg-quick@" + name) if t["engine"] == "wireguard" else name
@@ -2608,6 +2894,7 @@ class Net:
         self.paths = {}     # "entry|exit" -> last path test
         self.probes = {}    # sub id or "decos" -> last probe from Iran
         self.trials = {}    # "entry|exit" -> engine trial results
+        self.tun_state = {}  # tunnel id -> {"fails", "down"} for the alerts
 
     # -- storage
     def servers(self):
@@ -2799,6 +3086,61 @@ class Net:
         t["check"] = dict(res, at=int(time.time() * 1000))
         self.save_tunnel(t)
         return t
+
+    def sample_traffic(self):
+        """Read the default interface's byte counters of every server (this one included) and
+        feed them to the usage store as srv:<id>:rx / :tx, so each entry's volume this period is known."""
+        servers = self.servers()
+        if not servers:
+            return
+        samples = {}
+
+        def work(srv):
+            try:
+                rc, out, err = Remote(srv).run(TRAFFIC_SCRIPT, 25)
+                kv = parse_kv(out)
+                rx, tx = int(kv.get("rx") or 0), int(kv.get("tx") or 0)
+                if rx or tx:
+                    samples["srv:%s:rx" % srv["id"]], samples["srv:%s:tx" % srv["id"]] = rx, tx
+            except (SSHError, ValueError):
+                pass
+
+        threads = [threading.Thread(target=work, args=(srv,), daemon=True) for srv in servers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        if samples:
+            self.app.usage.record(samples)
+
+    def check_tunnels(self):
+        """Checks every tunnel; a tunnel down twice in a row (or back) gives an alert message.
+        Its status is saved, so a down tunnel leaves the subscriptions while skip_down is on."""
+        msgs = []
+        for t in self.tunnels():
+            if t.get("status") in ("failed", "setting-up"):
+                continue
+            st = self.tun_state.setdefault(t["id"], {"fails": 0, "down": False})
+            try:
+                t = self.status_tunnel(t["id"])
+            except PanelError:
+                continue
+            except Exception as e:
+                print("tunnel check %s: %s" % (t.get("name"), e), flush=True)
+                continue
+            if t["status"] == "up":
+                if st["down"]:
+                    msgs.append("🟢 تانل %s دوباره بالا اومد" % t["name"])
+                st["fails"], st["down"] = 0, False
+            else:
+                st["fails"] += 1
+                if st["fails"] >= 2 and not st["down"]:
+                    st["down"] = True
+                    c = t.get("check") or {}
+                    why = "؛ ".join("%s: %s" % ("ایران" if side == "entry" else "خارج", (c.get(side) or {}).get("active") or "?")
+                                    for side in ("entry", "exit") if (c.get(side) or {}).get("active") not in ("active", None))
+                    msgs.append("🔴 تانل %s قطع شد (%s)\nکاربرها تا برگشتن، از ورودی بعدی می‌رن." % (t["name"], why or "بدون پاسخ"))
+        return msgs
 
     def remove_tunnel(self, tid, log):
         t = next((x for x in self.tunnels() if x["id"] == tid), None)
@@ -3068,7 +3410,9 @@ def inbound_security(ib):
 def admin_state(app, host):
     panel = app.panel.overview()  # may connect automatically and reload the settings
     cfg, rt = app.cfg, app.rt
-    opts = {node_key(n): o for _, n, o in deco_options(cfg, UPSTREAMS.nodes())}
+    ups = UPSTREAMS.nodes()
+    opts = {node_key(n): o for _, n, o in deco_options(cfg, ups)}
+    entries = entries_public(live_entries(app, cfg, ups))
     clients = read_clients(app.db_path)
     source = "db"
     if not clients and panel["ok"]:
@@ -3088,7 +3432,8 @@ def admin_state(app, host):
             "main_location": cfg.get("main_location", ""),
             "show_auto": cfg.get("show_auto", True), "show_main": cfg.get("show_main", True),
             "auto_mode": cfg.get("auto_mode") or "priority", "probe_url": cfg.get("probe_url", ""),
-            "show_deco_any": cfg.get("show_deco_any", True),
+            "show_deco_any": cfg.get("show_deco_any", True), "order_mode": cfg.get("order_mode") or "manual",
+            "skip_down": cfg.get("skip_down", True), "skip_exhausted": cfg.get("skip_exhausted", True),
             "user_page": cfg.get("user_page", True), "support_url": cfg.get("support_url", ""),
             "announce": cfg.get("announce", ""),
             "label_deco": label(cfg, "label_deco"), "label_auto": label(cfg, "label_auto"),
@@ -3104,6 +3449,7 @@ def admin_state(app, host):
             "panel_rt": rt.get("panel_url", ""), "xui_rt": rt.get("xui_sub_url", ""),
         },
         "decos": [dict(d, nodes=[dict(x, opt=opts.get(x["key"])) for x in d["nodes"]]) for d in deco_lines(app)],
+        "entries": entries,
         "monitor": {"last_run": int(app.monitor.last_run * 1000), "note": app.monitor.note,
                     "xray": bool(find_xray())},
         "panel": {k: panel[k] for k in ("configured", "ok", "error", "version")},
@@ -3148,8 +3494,8 @@ def net_state(app):
 
 
 SETTING_BOOLS = ("direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "show_main",
-                 "show_deco_any")
-SETTING_TEXTS = {"title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
+                 "show_deco_any", "skip_down", "skip_exhausted")
+SETTING_TEXTS = {"title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("tg_token", "panel_token", "panel_pass")
 
@@ -3277,6 +3623,46 @@ def do_action(app, action, body, host):
                 return done("%s؛ %d inbound پیدا شد" % (note, len(p["inbounds"])))
             return fail(p["error"] or note)
 
+        if action == "entries_save":
+            cfg = load_config()
+            for k in ("show_auto", "direct_first", "skip_down", "skip_exhausted"):
+                if k in body:
+                    cfg[k] = bool(body[k])
+            if body.get("auto_mode") in ("priority", "fastest"):
+                cfg["auto_mode"] = body["auto_mode"]
+            if body.get("order_mode") in ("manual", "price"):
+                cfg["order_mode"] = body["order_mode"]
+            if "label_auto" in body:
+                cfg["label_auto"] = str(body["label_auto"] or "").strip()[:30] or DEFAULTS["label_auto"]
+            valid = {e["key"] for e in sub_entries(cfg, UPSTREAMS.nodes())}
+            stored = {k: v for k, v in (cfg.get("entries_cfg") or {}).items() if k in valid}
+            for pos, e in enumerate(body.get("entries") or []):
+                key = str(e.get("key", ""))
+                if key not in valid:
+                    continue
+                price = e.get("price")
+                try:
+                    price = None if price in (None, "") else max(0.0, float(price))
+                    quota = max(0.0, float(e.get("quota_gb") or 0))
+                    bill = min(max(int(e.get("bill_day") or 1), 1), 30)
+                except (TypeError, ValueError):
+                    return fail("قیمت، حجم یا روز شارژ عدد نیست")
+                stored[key] = {"name": str(e.get("name") or "").strip()[:40], "show": bool(e.get("show", True)),
+                               "auto": bool(e.get("auto", True)), "price": price,
+                               "unit": "gb" if e.get("unit") == "gb" else "month", "quota_gb": quota, "bill_day": bill,
+                               "count": "out" if e.get("count") == "out" else "in" if e.get("count") == "in" else "both",
+                               "order": int(e.get("order", pos))}
+                if key == "main":
+                    cfg["show_main"] = stored[key]["show"]
+                    cfg["label_main"] = stored[key]["name"] or DEFAULTS["label_main"]
+                if key == "chain_any":
+                    cfg["show_deco_any"] = stored[key]["show"]
+                    cfg["label_deco"] = stored[key]["name"] or DEFAULTS["label_deco"]
+            cfg["entries_cfg"] = stored
+            save_config(cfg)
+            app.reload()
+            return done("ورودی‌های ساب ذخیره شد")
+
         if action == "sub_layout":
             cfg = load_config()
             for k in ("show_auto", "show_main", "show_deco_any", "direct_first"):
@@ -3298,6 +3684,17 @@ def do_action(app, action, body, host):
                                "own_name": str(d.get("own_name") or "").strip()[:60]}
             current = {node_key(n) for n in UPSTREAMS.nodes()}
             cfg["deco_opts"] = {k: v for k, v in stored.items() if k in current}  # forget removed Decos
+            ecfg = dict(cfg.get("entries_cfg") or {})
+            for key, o in cfg["deco_opts"].items():  # the same choices in the entries model
+                for kind in ("chain", "own"):
+                    cur = dict(ecfg.get("%s:%s" % (kind, key)) or {})
+                    cur.update({"show": o[kind], "auto": o[kind] and o[kind + "_auto"], "name": o[kind + "_name"]})
+                    ecfg["%s:%s" % (kind, key)] = cur
+            if "show_main" in body:
+                ecfg["main"] = dict(ecfg.get("main") or {}, show=cfg["show_main"])
+            if "label_main" in body:
+                ecfg["main"] = dict(ecfg.get("main") or {}, name=cfg["label_main"])
+            cfg["entries_cfg"] = ecfg
             save_config(cfg)
             app.reload()
             return done("محتوای ساب ذخیره شد")
@@ -3332,7 +3729,7 @@ def do_action(app, action, body, host):
             return done("Decoها ذخیره شد")
 
         if action == "test":
-            app.monitor.run_once()
+            app.monitor.run_once(servers=False)
             return done("تست Decoها انجام شد")
 
         if action == "tgtest":
@@ -3577,6 +3974,12 @@ textarea.in{min-height:120px;font:14px/1.6 ui-monospace,Menlo,Consolas,monospace
 .dtitle{flex:1;min-width:0}.dtitle b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dtitle small{color:var(--mut);font-size:12px}
 .dacts{display:flex;gap:4px}.dacts button{width:34px;height:34px;border-radius:10px;border:1px solid var(--line);background:var(--card2);display:grid;place-items:center;cursor:pointer;color:var(--fg)}
 .dacts button[disabled]{opacity:.35}.dacts .i{width:17px;height:17px}
+.ecard{border:1px solid var(--line);border-radius:14px;padding:10px 12px;margin:8px 0;background:var(--bg2)}.ecard.skip{border-style:dashed}
+.ehead{display:flex;gap:10px;align-items:flex-start}.ehead .t{flex:1;min-width:0}.ehead .t small{display:block;color:var(--mut);font-size:12px;margin-top:4px;line-height:1.5}
+.ehead .ename{padding:7px 10px;font-weight:600}.ecard .meter{margin:8px 0 0}
+.eflags{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px}.eflags .check{margin:0;padding:5px 10px;font-size:12.5px}.eflags .badge{margin-inline-start:auto}
+.eprice summary{cursor:pointer;font-size:12.5px;color:var(--mut);padding:7px 0 2px;list-style:none}.eprice summary::-webkit-details-marker{display:none}
+.eprice summary::before{content:"▸ ";font-size:11px}.eprice[open] summary::before{content:"▾ "}.eprice label.f{margin:6px 0}.eprice .cols2{gap:6px}
 .node{display:flex;align-items:center;gap:8px;padding:9px 0 0;margin-top:9px;border-top:1px dashed var(--line);font-size:13.5px;flex-wrap:wrap}
 .node .tag{font-weight:700;font-size:12px;padding:1px 8px;border-radius:8px;background:var(--card2);border:1px solid var(--line);direction:ltr}
 .node .nn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -3789,6 +4192,7 @@ VIEWS.home=()=>{
   </div>
   ${!st.panel.configured?`<div class="card"><h2>${ic("info")} پنل 3x-ui وصل نیست</h2><p class="mut">${st.settings.panel_auto&&st.settings.auto_note?esc(st.settings.auto_note):"برای ساخت و مدیریت کاربر از همین‌جا، پنل رو در تنظیمات وصل کن."}</p><button class="btn sm" data-act="goto-panel">رفتن به تنظیمات پنل</button></div>`:""}
   ${attention.length?`<div class="sec-title"><h3>نیاز به تمدید</h3><button class="btn sm ghost" data-act="tab" data-tab="users">همه</button></div><div class="card list-mini">${attention.map(u=>{const s=ustat(u);return `<div class="it" data-act="edit" data-sub="${esc(u.sub)}"><span class="ltr"><b>${esc(u.name)}</b></span><span class="badge b-${s[0]}">${s[0]==="soon"?daysText(u):s[1]}</span></div>`}).join("")}</div>`:""}
+  ${(st.entries||[]).filter(e=>e.show||e.auto).length>1?`<div class="sec-title"><h3>ورودی‌های ساب</h3><button class="btn sm ghost" data-act="layout">${ic("edit")} ترتیب و قیمت</button></div><div class="card list-mini">${st.entries.filter(e=>e.show||e.auto).map((e,i)=>`<div class="it" data-act="layout"><span style="display:flex;align-items:center;gap:8px"><span class="mut small">${fa(i+1)}</span><span><b>${esc(e.name)}</b>${e.cost!=null?` <span class="mut small">≈ ${toman(e.cost)} ت/GB</span>`:""}</span></span><span style="display:flex;align-items:center;gap:8px">${e.remaining!=null?`<span class="small ${e.exhausted?"st-bad":"mut"}">${gb(e.remaining)} GB مانده</span>`:e.used!=null&&e.kind!=="main"?`<span class="small mut">${gb(e.used)} GB</span>`:""}${entryBadge(e)}</span></div>`).join("")}</div>`:""}
   ${st.net.tunnels.length?`<div class="sec-title"><h3>تانل‌ها</h3><button class="btn sm ghost" data-act="tab" data-tab="net">همه</button></div><div class="card list-mini">${st.net.tunnels.map(t=>`<div class="it" data-act="tab" data-tab="net"><span>${esc(t.name)} <span class="mut small">${esc(srvName(t.entry))} ← ${esc(srvName(t.exit))}</span></span><span class="badge ${t.status==="up"?"b-on":"b-exp"}">${t.status==="up"?"بالا":"پایین"}</span></div>`).join("")}</div>`:""}
   ${probeCard()}
   <div class="sec-title"><h3>سرور</h3><span class="mut small">${sv.uptime?"روشن از "+uptime(sv.uptime):""}</span></div>
@@ -3982,9 +4386,11 @@ NETVIEWS.servers=()=>{
   <button class="btn block" data-act="srv-add">${ic("plus")} افزودن سرور</button></div>
   ${srvs.map(s=>{const f=s.facts||{};const on=!s.error&&f.ip;const tuned=f.cc==="bbr";
     const tools=Object.entries(f.tools||{}).filter(([k,v])=>v).map(([k])=>k);
+    const ent=(S.state.entries||[]).find(e=>s.local?e.kind==="main":e.kind==="tunnel"&&e.server_id===s.id);
     return `<div class="lcard"><div class="lhead">${mono(roleFlag(s),s.id,s.local?"acc":"")}<div class="t"><b>${esc(s.name)}</b><small>${esc(f.ip||s.host||"")}${f.os?" · "+esc(f.os):""}</small></div>
     <span class="badge ${on?"b-on":s.error?"b-exp":"b-off"}">${s.local?"این پنل":on?"وصل":s.error?"خطا":"؟"}</span></div>
-    <div class="lmeta"><span class="pill ${s.role==="iran"?"ir":""}">${roleName(s.role)}</span>${f.cpus?`<span>${fa(f.cpus)} هسته</span>`:""}${f.mem?`<span>${gb(f.mem)} GB رم</span>`:""}${f.load!=null&&f.cpus?`<span>بار ${fa(Math.round(f.load*100/f.cpus))}٪</span>`:""}${f.cc?`<span class="${tuned?"st-ok":""}">${tuned?"BBR ✓":"TCP "+esc(f.cc)}</span>`:""}${f.xui?`<span>3x-ui ✓</span>`:""}${s.node_id?`<span>لوکیشن ✓</span>`:""}</div>
+    <div class="lmeta"><span class="pill ${s.role==="iran"?"ir":""}">${roleName(s.role)}</span>${f.cpus?`<span>${fa(f.cpus)} هسته</span>`:""}${f.mem?`<span>${gb(f.mem)} GB رم</span>`:""}${f.load!=null&&f.cpus?`<span>بار ${fa(Math.round(f.load*100/f.cpus))}٪</span>`:""}${f.cc?`<span class="${tuned?"st-ok":""}">${tuned?"BBR ✓":"TCP "+esc(f.cc)}</span>`:""}${f.xui?`<span>3x-ui ✓</span>`:""}${s.node_id?`<span>لوکیشن ✓</span>`:""}${ent&&ent.used!=null&&!ent.quota_gb?`<span>${gb(ent.used)} GB ${fa(esc(ent.period))}</span>`:""}</div>
+    ${ent&&ent.quota_gb?entryVolume(ent):""}
     ${s.error?`<div class="err">${esc(s.error)}</div>`:""}
     ${tools.length?`<div class="locs">${tools.map(t=>`<span class="loc-chip ltr">${esc(t)}</span>`).join("")}</div>`:""}
     <div class="row-btns">${!tuned?`<button class="btn sm" data-act="srv-tune" data-id="${s.id}">${ic("zap")} بهینه‌سازی</button>`:""}
@@ -4003,10 +4409,10 @@ NETVIEWS.tunnels=()=>{
    ${trial.best?`<button class="btn sm" style="margin-top:10px" data-act="tun-add" data-engine="${trial.best.engine}" data-transport="${esc(trial.best.transport||"")}">${ic("plus")} ساخت تانل با ${esc(trial.best.label)}</button>`:""}</div>`:""}
   ${Object.entries(n.paths).map(([k,p])=>{const [a,b]=k.split("|");return `<div class="card"><h2>${ic("zap")} مسیر ${esc(srvName(a))} ← ${esc(srvName(b))}</h2><div class="lmeta"><span>پینگ ${p.ping_ms>=0?fa(p.ping_ms.toFixed(0))+"ms":"—"}</span><span>افت ${fa(p.loss)}٪</span><span>MTU ${p.mtu==="1380ok"?"✓":"کوچک"}</span></div>
    <div class="locs">${Object.entries(p.tcp).map(([port,v])=>`<span class="loc-chip ltr ${v>=0?"ok":"no"}">:${port} ${v>=0?fa(v)+"ms":"بسته"}</span>`).join("")}</div><div class="hint">${fmtAgo(p.at)}</div></div>`}).join("")}
-  ${ts.map(t=>{const e=n.engines[t.engine]||{name:t.engine};const b=t.bench_result;const c=t.check||{};
+  ${ts.map(t=>{const e=n.engines[t.engine]||{name:t.engine};const b=t.bench_result;const c=t.check||{};const ent=(S.state.entries||[]).find(x=>x.key==="tunnel:"+t.id);
     return `<div class="lcard"><div class="lhead">${mono(e.name.slice(0,2),t.id)}<div class="t"><b>${esc(t.name)}</b><small>${esc(srvName(t.entry))} ← ${esc(srvName(t.exit))} · ${esc(e.name)}${t.transport?" · "+esc(t.transport):""}${t.via_name?" · از راه "+esc(t.via_name):""}</small></div>
     <span class="badge ${t.status==="up"?"b-on":t.status==="down"||t.status==="failed"?"b-exp":"b-wait"}">${t.status==="up"?"بالا":t.status==="down"?"پایین":t.status==="failed"?"خطا":"در حال ساخت"}</span></div>
-    <div class="lmeta"><span>پورت‌ها <span class="ltr">${esc(t.ports)}</span></span><span>کنترل <span class="ltr">${fa(t.cport)}</span></span>${b?`<span class="st-ok">↓ ${mb(b.down_mbps)}</span><span>↑ ${mb(b.up_mbps)}</span>`:""}</div>
+    <div class="lmeta"><span>پورت‌ها <span class="ltr">${esc(t.ports)}</span></span><span>کنترل <span class="ltr">${fa(t.cport)}</span></span>${b?`<span class="st-ok">↓ ${mb(b.down_mbps)}</span><span>↑ ${mb(b.up_mbps)}</span>`:""}${ent?`<span class="${ent.show||ent.auto?"st-ok":"st-mut"}">${ent.show||ent.auto?"توی ساب ✓":"توی ساب نیست"}</span>`:""}</div>
     ${t.error?`<div class="err">${esc(t.error)}</div>`:""}
     ${c.entry&&c.entry.active!=="active"?`<div class="err">ورودی: ${esc(c.entry.active||"")} ${esc((c.entry.log||c.entry.error||"").slice(0,120))}</div>`:""}
     ${c.exit&&c.exit.active&&c.exit.active!=="active"&&t.engine!=="direct"?`<div class="err">خروجی: ${esc(c.exit.active)} ${esc((c.exit.log||c.exit.error||"").slice(0,120))}</div>`:""}
@@ -4137,7 +4543,7 @@ const NET_ACTS={
 VIEWS.decos=()=>{
   const st=S.state,ds=st.decos,lab=st.settings.label_deco;
   return `<div class="card"><h2>${ic("link")} Decoها</h2><p class="mut small">کانفیگ‌های بقیه که کاربر از راه اون‌ها به سرورت می‌رسه. ترتیب = اولویت: اول ${esc(lab)}۱ امتحان می‌شه، اگه قطع بود بعدی. لینک ساب بذاری، حجم و انقضاش هم دیده می‌شه.</p>
-  <div class="row-btns"><button class="btn" data-act="deco-add">${ic("plus")} افزودن</button><button class="btn ghost" data-act="layout">${ic("text")} محتوای ساب</button><button class="btn ghost icon" data-act="test" title="تست از سرور" aria-label="تست">${ic("refresh")}</button><button class="btn ghost icon" data-act="probe" title="تست از ایران" aria-label="تست از ایران">${ic("chart")}</button><button class="btn ghost icon" data-act="deco-raw" title="ویرایش متنی" aria-label="ویرایش متنی">${ic("edit")}</button></div>
+  <div class="row-btns"><button class="btn" data-act="deco-add">${ic("plus")} افزودن</button><button class="btn ghost" data-act="layout">${ic("text")} ورودی‌ها و قیمت</button><button class="btn ghost icon" data-act="test" title="تست از سرور" aria-label="تست">${ic("refresh")}</button><button class="btn ghost icon" data-act="probe" title="تست از ایران" aria-label="تست از ایران">${ic("chart")}</button><button class="btn ghost icon" data-act="deco-raw" title="ویرایش متنی" aria-label="ویرایش متنی">${ic("edit")}</button></div>
   <div class="hint">آخرین تست: ${ago(st.monitor.last_run)}${st.monitor.xray?"، تست واقعی با هسته‌ی Xray پنل":""}</div>${st.monitor.note?`<div class="hint">${ic("info")} ${esc(st.monitor.note)}</div>`:""}</div>
   ${ds.length?ds.map((d,i)=>{
     const q=d.quota;let qh="";
@@ -4168,36 +4574,66 @@ function decoAddSheet(){
 }
 const lrow=(name,on,input,value,ph,title,hint)=>`<div class="lrow ${on?"":"off"}"><label class="tg"><input type="checkbox" ${name} ${on?"checked":""}><span class="t"></span></label>
   <div class="b"><div style="font-weight:600;margin-bottom:4px">${title}</div><input class="in" ${input} value="${esc(value)}" placeholder="${esc(ph)}" autocomplete="off"><div class="hint">${hint}</div></div></div>`;
-function layoutSheet(){
-  const s=S.state.settings,ds=S.state.decos,lab=s.label_deco;
-  const nodes=ds.flatMap(d=>d.nodes);
-  sheet(`<h3>${ic("text")} محتوای ساب کاربرها</h3><p class="mut small">هر چیزی که کاربر توی اپش می‌بینه. خاموشش کنی توی ساب نمیاد. اسم هر کدوم رو هم می‌تونی عوض کنی.</p>
-  <form id="lof">
-  <div class="mut small" style="margin:6px 0">رفتار ⚡ خودکار</div>
-  <div class="seg wide"><button type="button" data-mode="priority" class="${s.auto_mode!=="fastest"?"on":""}">به ترتیب اولویت</button><button type="button" data-mode="fastest" class="${s.auto_mode==="fastest"?"on":""}">سریع‌ترین</button></div>
+/* entries: everything a user's subscription offers, in priority order */
+const KIND_MONO={main:"⌂",tunnel:"IR",chain_any:"D*"};
+const entryMono=e=>mono(e.kind==="chain"?S.state.settings.label_deco.slice(0,1).toUpperCase()+e.idx:e.kind==="own"?"C"+e.idx:KIND_MONO[e.kind],e.key,e.kind==="main"?"acc":"");
+function entryDesc(e){const lab=esc(S.state.settings.label_deco);
+  switch(e.kind){
+    case "main":return "مستقیم به سرور خودت؛ تا آی‌پی‌ش فیلتر نیست سریع‌ترینه";
+    case "tunnel":return `سرور ایران «${esc(e.server_name)}» <span class="ltr">${esc(e.entry_ip)}</span> ← تانل «${esc(e.label)}» ← سرور خودت`;
+    case "chain":return `سرور خودت از راه ${lab}${fa(e.idx)} (<span class="ltr">${esc(e.label)}</span>)؛ دو مرحله‌ای، حجم روی سرور خودته`;
+    case "own":return `خود کانفیگ ${lab}${fa(e.idx)} (<span class="ltr">${esc(e.label)}</span>) همون‌طور که هست؛ یک مرحله‌ای و سریع‌تر`;
+    default:return "سرور خودت از اولین Deco سالم (فقط FlClash/Clash)";
+  }}
+const toman=v=>v==null?"—":fa(Math.round(v).toLocaleString("en-US"));
+const entryBadge=e=>e.down?`<span class="badge b-exp">قطع</span>`:e.exhausted?`<span class="badge b-exp">حجم تموم</span>`:!e.show&&!e.auto?`<span class="badge b-off">خاموش</span>`:`<span class="badge b-on">${e.show?"فعال":"فقط خودکار"}</span>`;
+function entryVolume(e){
+  if(e.quota_gb){const total=e.quota_gb*GB,used=e.used||0,p=pct(used,total);
+    return `<div class="meter"><div class="row"><span class="small">${e.used==null?"هنوز مصرفی ثبت نشده":gb(Math.max(0,total-used))+" از "+num(e.quota_gb)+" GB مانده"}</span><span class="small mut">${fa(esc(e.period||""))}</span></div><div class="bar"><i class="${barCls(p)}" style="width:${e.used==null?0:p}%"></i></div></div>`}
+  if(e.used!=null)return `<div class="hint">${gb(e.used)} GB مصرف ${fa(esc(e.period||""))}</div>`;
+  return "";
+}
+const priceSummary=e=>e.price==null||e.price===""?"قیمت و حجم (تنظیم نشده)":`${toman(e.price)} تومان${e.unit==="gb"?" برای هر GB":" در ماه"}${e.quota_gb?" · "+num(e.quota_gb)+" GB":""}${e.cost!=null?" · ≈ "+toman(e.cost)+" ت/GB":""}`;
+function entriesSheet(){
+  const s=S.state.settings,ents=S.state.entries||[];let om=s.order_mode||"manual",mode=s.auto_mode||"priority";
+  const inp=(k,v,attrs)=>`<input class="in ltr" data-k="${k}" value="${esc(v==null?"":v)}" ${attrs} autocomplete="off">`;
+  const row=(e,i)=>`<div class="ecard ${e.skip?"skip":""}" data-key="${esc(e.key)}">
+   <div class="ehead">${entryMono(e)}<div class="t"><input class="in ename" value="${esc(e.name)}" placeholder="${esc(e.name)}" maxlength="40" autocomplete="off"><small>${entryDesc(e)}</small></div>
+    <div class="dacts"><button type="button" data-mv="-1" aria-label="بالا">${ic("up")}</button><button type="button" data-mv="1" aria-label="پایین">${ic("down")}</button></div></div>
+   <div class="eflags"><label class="check small-check"><input type="checkbox" data-k="show" ${e.show?"checked":""}><span>توی ساب</span></label>${e.kind==="chain_any"?"":`<label class="check small-check"><input type="checkbox" data-k="auto" ${e.auto?"checked":""}><span>توی ⚡ خودکار</span></label>`}${entryBadge(e)}</div>
+   ${e.kind==="chain_any"?"":`<details class="eprice"><summary>${priceSummary(e)}</summary>
+    <div class="cols2"><label class="f"><span>قیمت (تومان)</span>${inp("price",e.price,'inputmode="numeric" placeholder="مثلاً 1200000"')}</label><label class="f"><span>واحد</span><select class="in" data-k="unit"><option value="month" ${e.unit!=="gb"?"selected":""}>در ماه</option><option value="gb" ${e.unit==="gb"?"selected":""}>برای هر GB</option></select></label></div>
+    <div class="cols2"><label class="f"><span>حجم ماهانه (GB)</span>${inp("quota_gb",e.quota_gb||"",'inputmode="decimal" placeholder="'+(e.quota_from_sub?"از لینک ساب":"خالی = نامحدود")+'"')}</label><label class="f"><span>روز شارژ (شمسی)</span>${inp("bill_day",e.bill_day||1,'inputmode="numeric" min="1" max="30"')}</label></div>
+    ${e.kind==="tunnel"||e.kind==="main"?`<label class="f"><span>حجم چطور حساب بشه</span><select class="in" data-k="count"><option value="both" ${e.count!=="out"&&e.count!=="in"?"selected":""}>رفت و برگشت (بیشتر سرورها)</option><option value="out" ${e.count==="out"?"selected":""}>فقط خروجی سرور</option><option value="in" ${e.count==="in"?"selected":""}>فقط ورودی سرور</option></select></label>`:""}
+    <div class="hint">قیمت برای چیدن «ارزون‌ترین اول» استفاده می‌شه. ماهانه بدون حجم = ۵۰۰ GB فرض می‌شه.</div></details>`}
+   ${entryVolume(e)}</div>`;
+  sheet(`<h3>${ic("text")} ورودی‌های ساب</h3><p class="mut small">هر چیزی که توی اپ کاربر میاد یه «ورودی»ـه: سرور خودت، سرورهای ایران تانل‌شده و Decoها. ترتیب = اولویت ⚡ خودکار: اولی که سالم بود. قیمت و حجم هر کدوم رو بذار تا هزینه‌ت مدیریت بشه و حجم مانده رو ببینی.</p>
+  <form id="ef">
+  <div class="mut small" style="margin:6px 0">ترتیب اولویت</div>
+  <div class="seg wide"><button type="button" data-om="manual" class="${om==="manual"?"on":""}">دستی (با فلش‌ها)</button><button type="button" data-om="price" class="${om==="price"?"on":""}">ارزون‌ترین اول</button></div>
+  <div class="hint" id="omhint"></div>
+  <div class="mut small" style="margin:10px 0 6px">رفتار ⚡ خودکار</div>
+  <div class="seg wide"><button type="button" data-mode="priority" class="${mode!=="fastest"?"on":""}">به ترتیب اولویت</button><button type="button" data-mode="fastest" class="${mode==="fastest"?"on":""}">سریع‌ترین</button></div>
   <div class="hint" id="modehint"></div>
-  ${sw("direct_first",s.direct_first,"سرور خودم اول","خاموش: سرور خودم آخرین گزینه می‌شه و اول واسط‌ها امتحان می‌شن")}
-  ${lrow('name="show_auto"',s.show_auto,'name="label_auto"',s.label_auto,"Auto","⚡ خودکار","")}
-  ${lrow('name="show_main"',s.show_main,'name="label_main"',s.label_main,"Main","مستقیم به سرور خودت","تا آی‌پی سرورت فیلتر نیست، سریع‌ترین مسیره")}
-  ${nodes.length?lrow('name="show_deco_any"',s.show_deco_any,'name="label_deco"',s.label_deco,"Deco","سرور خودت از اولین واسط سالم","فقط در FlClash و Clash. شماره‌ی واسط‌ها هم با همین اسم ساخته می‌شه (Deco1، Deco2…)"):""}
-  ${nodes.map(n=>{const o=n.opt||{chain:true,own:false,chain_name:lab+n.n,own_name:n.name};return `<div class="lgroup"><span class="tag">${esc(lab)}${n.n}</span>${esc(n.name)}</div>
-   ${lrow(`data-key="${esc(n.key)}" data-k="chain"`,o.chain,`data-key="${esc(n.key)}" data-k="chain_name"`,o.chain_name,lab+n.n,"سرور خودت از راه این واسط","دو مرحله‌ای، کندتر؛ ولی حجم و حساب کاربر روی سرور خودته")}
-   <label class="check small-check"><input type="checkbox" data-key="${esc(n.key)}" data-k="chain_auto" ${o.chain_auto!==false?"checked":""}><span>توی ⚡ خودکار هم باشه</span></label>
-   ${lrow(`data-key="${esc(n.key)}" data-k="own"`,o.own,`data-key="${esc(n.key)}" data-k="own_name"`,o.own_name,n.name,"خود این کانفیگ، همون‌طور که هست","یک مرحله‌ای و سریع‌تر؛ ترافیک مستقیم از حجم این کانفیگ کم می‌شه")}
-   <label class="check small-check"><input type="checkbox" data-key="${esc(n.key)}" data-k="own_auto" ${o.own_auto?"checked":""}><span>توی ⚡ خودکار هم باشه</span></label>`}).join("")}
-  <div class="hint">برای کاربرهایی که چند لوکیشن دارن، اول اسم لوکیشن میاد، مثلاً «🇩🇪 آلمان · Main».</div>
+  ${lrow('name="show_auto"',s.show_auto,'name="label_auto"',s.label_auto,"Auto","⚡ خودکار توی ساب","اپ خودش بین ورودی‌ها جابه‌جا می‌شه")}
+  ${sw("skip_down",s.skip_down,"ورودی قطع‌شده موقتاً از ساب برداشته بشه","تانل پایین یا Deco قطع؛ با وصل شدن دوباره برمی‌گرده. اپ‌ها در هر به‌روزرسانی ساب می‌گیرن.")}
+  ${sw("skip_exhausted",s.skip_exhausted,"ورودی با حجم تموم‌شده برداشته بشه","تا شروع دوره‌ی بعدش")}
+  <div class="sec-title"><h3>ورودی‌ها به ترتیب</h3><span class="mut small">${fa(ents.length)}</span></div>
+  <div id="elist">${ents.map(row).join("")}</div>
   <button class="btn block" style="margin-top:12px">${ic("check")} ذخیره</button></form>`,el=>{
-    const f=$("#lof",el);let mode=s.auto_mode||"priority";
-    const hint=()=>{$("#modehint",el).textContent=mode==="fastest"?"اپ هر چند دقیقه همه رو تست می‌کنه و سریع‌ترین رو برمی‌داره (url-test / leastPing).":"اپ به ترتیب لیست می‌ره: اولی که سالم بود. ارزون‌ترها رو بالاتر بذار."};hint();
-    $$("[data-mode]",el).forEach(b=>b.onclick=()=>{mode=b.dataset.mode;$$("[data-mode]",el).forEach(x=>x.classList.toggle("on",x===b));hint()});
+    const f=$("#ef",el),list=$("#elist",el);
+    const arrows=()=>{const cards=$$(".ecard",list);cards.forEach((c,i)=>{$("[data-mv='-1']",c).disabled=om==="price"||i===0;$("[data-mv='1']",c).disabled=om==="price"||i===cards.length-1})};
+    const hints=()=>{$("#omhint",el).textContent=om==="price"?"بعد از ذخیره، ورودی‌ها از ارزون‌ترین (تومان به ازای هر GB) چیده می‌شن؛ بدون قیمت‌ها آخر.":"با فلش‌ها بالا و پایین کن. بالاترین، اول امتحان می‌شه.";
+      $("#modehint",el).textContent=mode==="fastest"?"اپ هر چند دقیقه همه رو تست می‌کنه و سریع‌ترین رو برمی‌داره (url-test / leastPing).":"اپ به ترتیب لیست می‌ره: اولی که سالم بود. ارزون‌ترها رو بالاتر بذار.";arrows()};hints();
+    $$("[data-om]",el).forEach(b=>b.onclick=()=>{om=b.dataset.om;$$("[data-om]",el).forEach(x=>x.classList.toggle("on",x===b));hints()});
+    $$("[data-mode]",el).forEach(b=>b.onclick=()=>{mode=b.dataset.mode;$$("[data-mode]",el).forEach(x=>x.classList.toggle("on",x===b));hints()});
     $$(".tg input",el).forEach(x=>x.onchange=()=>x.closest(".lrow").classList.toggle("off",!x.checked));
+    list.addEventListener("click",ev=>{const b=ev.target.closest("[data-mv]");if(!b||b.disabled)return;const c=b.closest(".ecard"),d=+b.dataset.mv,sib=d<0?c.previousElementSibling:c.nextElementSibling;if(!sib)return;d<0?sib.before(c):sib.after(c);arrows();c.scrollIntoView({block:"nearest",behavior:"smooth"})});
     f.onsubmit=async e=>{e.preventDefault();
-      const g=n=>f.elements.namedItem(n);const body={auto_mode:mode};
-      ["show_auto","show_main","show_deco_any","direct_first"].forEach(k=>{if(g(k))body[k]=g(k).checked});
-      ["label_auto","label_main","label_deco"].forEach(k=>{if(g(k))body[k]=g(k).value.trim()});
-      const decos={};$$("[data-key]",f).forEach(x=>{const k=x.dataset.key;decos[k]=decos[k]||{key:k};decos[k][x.dataset.k]=x.type==="checkbox"?x.checked:x.value.trim()});
-      body.decos=Object.values(decos);
-      const j=await act($("button.btn",f),"sub_layout",body);if(j.ok)closeSheet()};
+      const g=n=>f.elements.namedItem(n);const body={order_mode:om,auto_mode:mode,show_auto:g("show_auto").checked,label_auto:g("label_auto").value.trim(),skip_down:g("skip_down").checked,skip_exhausted:g("skip_exhausted").checked};
+      body.entries=$$(".ecard",list).map((c,i)=>{const v=k=>{const x=$(`[data-k="${k}"]`,c);return x?(x.type==="checkbox"?x.checked:x.value.trim()):undefined};
+        return {key:c.dataset.key,order:i,name:$(".ename",c).value.trim(),show:v("show"),auto:v("auto")??false,price:v("price")??null,unit:v("unit"),quota_gb:v("quota_gb")||0,bill_day:v("bill_day")||1,count:v("count")}});
+      const j=await act($("button.btn",f),"entries_save",body);if(j.ok)closeSheet()};
   });
 }
 function decoRawSheet(){
@@ -4215,7 +4651,7 @@ VIEWS.settings=()=>{
   <form class="card" data-sec="conn"><h2>${ic("zap")} رفتار اتصال</h2>
    ${sw("iran_direct",s.iran_direct,"سایت‌های ‎.ir بدون تونل","سایت‌های ایرانی مستقیم باز می‌شن")}
    ${field("probe_url","لینک تست سرعت از ایران",s.probe_url,'class="in ltr" placeholder="https://speed.cloudflare.com/__down?bytes=10000000"',"فایلی که برای اندازه‌گیری سرعت دانلود می‌شه")}
-   <div class="hint" style="margin-top:10px">${ic("info")} اینکه چه چیزهایی توی ساب کاربرها باشه و اسم هر کدوم: Decoها ← محتوای ساب</div>
+   <div class="hint" style="margin-top:10px">${ic("info")} اینکه چه چیزهایی توی ساب کاربرها باشه، ترتیب، اسم، قیمت و حجم هر کدوم: خانه ← ورودی‌های ساب (یا Decoها ← ورودی‌ها و قیمت)</div>
    ${field("title","اسم پروفایل در اپ",s.title,'placeholder="EZ-XUI"')}
    <button class="btn block">${ic("check")} ذخیره</button></form>
 
@@ -4291,7 +4727,7 @@ const ACTS={
   "u-del":async b=>{const u=userBy(b.dataset.sub);if(await confirmSheet("حذف کاربر","<b class=\"ltr\">"+esc(u.name)+"</b> از پنل 3x-ui هم حذف می‌شه و قابل برگشت نیست.","حذف کن",true))act(null,"user_delete",{sub:u.sub})},
   "deco-add":()=>decoAddSheet(),
   "deco-raw":()=>decoRawSheet(),
-  layout:()=>layoutSheet(),
+  layout:()=>entriesSheet(),
   "deco-move":b=>{const l=decoLines(),i=+b.dataset.i,j=i+(+b.dataset.d);[l[i],l[j]]=[l[j],l[i]];saveDecos(l,null)},
   "deco-del":async b=>{const i=+b.dataset.i,d=S.state.decos[i];if(await confirmSheet("حذف Deco","<span class=\"ltr\">"+esc(d.title)+"</span> از فهرست حذف بشه؟","حذف کن",true)){const l=decoLines();l.splice(i,1);saveDecos(l,null)}},
   "panel-test":b=>act(b,"panel_test",{}),
@@ -4396,6 +4832,21 @@ class UsageStore:
                 con.commit()
             finally:
                 con.close()
+
+    def period_total(self, key, bill_day=1, count="both", now=None):
+        """Bytes counted for a server since the start of its billing period. The sampler stores the
+        default interface's counters as <key>:rx and <key>:tx; count = both | out (tx only) | in."""
+        start = period_start(bill_day, now)
+        subs = {"both": (key + ":rx", key + ":tx"), "out": (key + ":tx",), "in": (key + ":rx",)}.get(count) or (key + ":rx", key + ":tx")
+        with self.lock:
+            con = self._con()
+            try:
+                total = con.execute("SELECT COALESCE(SUM(bytes), 0) FROM daily WHERE day >= ? AND sub IN (%s)" % ",".join("?" * len(subs)),
+                                    (start,) + tuple(subs)).fetchone()[0]
+                started = con.execute("SELECT COUNT(*) FROM last WHERE sub IN (%s)" % ",".join("?" * len(subs)), subs).fetchone()[0]
+            finally:
+                con.close()
+        return int(total) if started else None
 
     def history(self, sub, days=30, now=None):
         """[(day, bytes)] for the last `days` days, oldest first, zero-filled; and whether sampling has started."""
@@ -4766,7 +5217,7 @@ def make_handler(app):
                 if app.cfg.get("user_page", True) and not _q(q, "format") and (_q(q, "page") or wants_page(self.headers)):
                     return self.send(200, USER_HTML, ADMIN_HEADERS)
                 fmt = pick_format(_q(q, "format"), self.headers.get("User-Agent", ""))
-                status, hdrs, body = build_subscription(parts[1], fmt, app.rt)
+                status, hdrs, body = build_subscription(parts[1], fmt, app.rt, app)
                 return self.send(status, body, hdrs or None)
             if self.is_admin(parts) and len(parts) == 1:
                 if not u.path.endswith("/"):

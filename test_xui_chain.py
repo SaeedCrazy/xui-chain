@@ -1,6 +1,7 @@
 """Tests: python3 -m unittest -v test_xui_chain.py"""
 
 import base64
+import calendar
 import http.cookiejar
 import json
 import os
@@ -201,8 +202,8 @@ class ProfileTests(unittest.TestCase):
                    deco_opts={ka: {"chain": False, "own": True, "own_name": "Friend A"},
                               kb: {"chain": True, "own": True, "chain_name": "Via B"}})
         confs = json.loads(xc.build_xray(own, ups, cfg, "t")[0])
-        self.assertEqual([c["remarks"] for c in confs], ["⚡ Best", "Via B", "Friend A", "friend-b"])
-        own_a = confs[2]["outbounds"][0]
+        self.assertEqual([c["remarks"] for c in confs], ["⚡ Best", "Friend A", "Via B", "friend-b"])  # Deco order
+        own_a = confs[1]["outbounds"][0]
         self.assertEqual((own_a["protocol"], own_a["settings"]["vnext"][0]["address"]), ("vmess", "198.51.100.5"))
         self.assertNotIn("sockopt", own_a["streamSettings"])
         auto_tags = [o["tag"] for o in confs[0]["outbounds"]]
@@ -210,7 +211,7 @@ class ProfileTests(unittest.TestCase):
         self.assertIn("up-2", auto_tags)
         prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])
         groups = {g["name"]: g for g in prof["proxy-groups"]}
-        self.assertEqual(groups[xc.G_MAIN]["proxies"], ["⚡ Best", "Deco", "Via B", "Friend A", "friend-b"])
+        self.assertEqual(groups[xc.G_MAIN]["proxies"], ["⚡ Best", "Deco", "Friend A", "Via B", "friend-b"])
         self.assertEqual(groups[xc.G_UP]["proxies"], ["Deco2 · friend-b"])
         self.assertEqual(groups["⚡ Best"]["proxies"], ["Main", "Via B"])  # hidden Main still backs Auto
         self.assertEqual(groups["⚡ Best"]["type"], "fallback")
@@ -233,6 +234,84 @@ class ProfileTests(unittest.TestCase):
         prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])
         self.assertEqual(next(g for g in prof["proxy-groups"] if g["name"] == xc.G_MAIN)["proxies"], ["Main", "friend-a"])
         self.assertNotIn(xc.G_UP, [g["name"] for g in prof["proxy-groups"]])
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_tunnel_entries(self):
+        own, ups = self.own[:2], self.ups[:1]
+        ka = xc.node_key(ups[0])
+        servers = [{"id": "ir1", "name": "🇮🇷 ایران", "host": "5.6.7.8", "role": "iran", "facts": {"ip": "5.6.7.8"}},
+                   {"id": "ir2", "name": "ایران ۲", "host": "5.6.7.9", "role": "iran", "facts": {"ip": "5.6.7.9"}}]
+        tunnels = [{"id": "t1", "name": "تانل ۱", "entry": "ir1", "exit": "main", "engine": "backhaul", "ports": "443, 2053=8443", "status": "up"},
+                   {"id": "t2", "name": "تانل ۲", "entry": "ir2", "exit": "main", "engine": "gost", "ports": "443", "status": "down"},
+                   {"id": "t3", "name": "x", "entry": "ir2", "exit": "main", "engine": "gost", "ports": "443", "status": "failed"}]
+        cfg = dict(self.cfg, servers=servers, tunnels=tunnels)
+        entries = xc.sub_entries(cfg, ups)
+        self.assertEqual([e["key"] for e in entries], ["main", "tunnel:t1", "tunnel:t2", "chain_any", "chain:" + ka, "own:" + ka])
+        self.assertTrue(entries[2]["down"] and entries[2]["skip"])
+        prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])
+        by = {p["name"]: p for p in prof["proxies"]}
+        self.assertEqual((by["user1-reality · تانل ۱"]["server"], by["user1-reality · تانل ۱"]["port"]), ("5.6.7.8", 443))
+        self.assertEqual((by["user1-ws · تانل ۱"]["server"], by["user1-ws · تانل ۱"]["port"]), ("5.6.7.8", 2053))  # mapped port
+        self.assertEqual(by["user1-ws · تانل ۱"]["servername"], "cdn.example.com")  # TLS name unchanged
+        self.assertFalse(any("تانل ۲" in n for n in by))  # down tunnel left out
+        groups = {g["name"]: g for g in prof["proxy-groups"]}
+        self.assertEqual(groups["⚡ Auto"]["proxies"][:4], ["user1-reality · Main", "user1-ws · Main", "user1-reality · تانل ۱", "user1-ws · تانل ۱"])
+        self.assertEqual(groups[xc.G_MAIN]["proxies"][1:6], ["user1-reality · Main", "user1-ws · Main", "user1-reality · تانل ۱", "user1-ws · تانل ۱", "user1-reality · Deco"])
+        confs = json.loads(xc.build_xray(own, ups, cfg, "t")[0])
+        self.assertEqual([o["tag"] for o in confs[0]["outbounds"]][:4], ["me-1-direct", "me-2-direct", "me-1-tun-t1", "me-2-tun-t1"])
+        tun = next(o for o in confs[0]["outbounds"] if o["tag"] == "me-2-tun-t1")
+        self.assertEqual((tun["settings"]["vnext"][0]["address"], tun["settings"]["vnext"][0]["port"]), ("5.6.7.8", 2053))
+        self.assertIn("user1-ws · تانل ۱", [c["remarks"] for c in confs])
+        # skip_down off: the down tunnel is offered anyway (the app's own fallback handles it)
+        prof = yaml.safe_load(xc.build_mihomo(own, ups, dict(cfg, skip_down=False))[0])
+        self.assertIn("user1-reality · تانل ۲", [p["name"] for p in prof["proxies"]])
+        # configs that live on another location are not sent through a tunnel to this server
+        prof = yaml.safe_load(xc.build_mihomo(own, ups, dict(cfg, locations={"203.0.113.10": "DE"}))[0])
+        self.assertFalse(any("تانل" in p["name"] for p in prof["proxies"]))
+        # a tunnel that does not carry the config's port gives nothing for it
+        e = xc.sub_entries(dict(cfg, tunnels=[dict(tunnels[0], ports="443")]), [])[1]
+        self.assertIsNone(xc.rewrite_for_tunnel(own[1], e["entry_ip"], e["port_map"]))
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_price_order_and_quota(self):
+        own, ups = self.own[:1], self.ups[:2]
+        ka, kb = xc.node_key(ups[0]), xc.node_key(ups[1])
+        servers = [{"id": "ir1", "name": "ایران", "host": "5.6.7.8", "role": "iran", "facts": {"ip": "5.6.7.8"}}]
+        tunnels = [{"id": "t1", "name": "تانل", "entry": "ir1", "exit": "main", "engine": "backhaul", "ports": "443, 2053=8443", "status": "up"}]
+        ecfg = {"tunnel:t1": {"price": 1200000, "quota_gb": 1000, "bill_day": 5},            # 1200 T/GB
+                "chain:" + ka: {"price": 300, "unit": "gb"},                                 # 300 T/GB
+                "own:" + kb: {"show": True, "auto": True, "price": 50000, "quota_gb": 100},  # 500 T/GB
+                "chain:" + kb: {"price": 90000, "quota_gb": 100}}                            # 900 T/GB
+        cfg = dict(self.cfg, servers=servers, tunnels=tunnels, entries_cfg=ecfg, order_mode="price")
+        entries = xc.sub_entries(cfg, ups, usage={"srv:ir1": 980 * xc.GB_BYTES})
+        self.assertEqual([e["key"] for e in entries], ["main", "chain:" + ka, "own:" + kb, "chain:" + kb, "tunnel:t1", "chain_any", "own:" + ka])
+        self.assertEqual([e["cost"] for e in entries][:5], [0, 300, 500, 900, 1200])
+        tun = entries[4]
+        self.assertEqual((tun["remaining"], tun["exhausted"], tun["skip"]), (20 * xc.GB_BYTES, False, False))
+        prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])
+        groups = {g["name"]: g for g in prof["proxy-groups"]}
+        self.assertEqual(groups["⚡ Auto"]["proxies"], ["Main", "Deco1", "friend-b", "Deco2", "تانل"])  # cheapest first
+        confs = json.loads(xc.build_xray(own, ups, cfg, "t")[0])
+        self.assertEqual([o["tag"] for o in confs[0]["outbounds"] if o["tag"].startswith("me-")],
+                         ["me-1-direct", "me-1-via-up-1", "me-own-up-2", "me-1-via-up-2", "me-1-tun-t1"])
+        costs = confs[0]["routing"]["balancers"][0]["strategy"]["settings"]["costs"]
+        self.assertEqual([c["match"] for c in costs][:2], ["me-1-direct", "me-1-via-up-1"])
+        # the Iran server's volume is used up: it leaves the subscription until the next period
+        entries = xc.sub_entries(cfg, ups, usage={"srv:ir1": 1001 * xc.GB_BYTES})
+        tun = next(e for e in entries if e["key"] == "tunnel:t1")
+        self.assertEqual((tun["remaining"], tun["exhausted"], tun["skip"]), (0, True, True))
+        prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])  # no usage known: nothing skipped
+        self.assertIn("تانل", [p["name"] for p in prof["proxies"]])
+        self.assertNotIn("تانل", [p["name"] for p in yaml.safe_load(xc.build_mihomo(own, ups, cfg, entries)[0])["proxies"]])
+        entries = xc.sub_entries(dict(cfg, skip_exhausted=False), ups, usage={"srv:ir1": 1001 * xc.GB_BYTES})
+        self.assertFalse(next(e for e in entries if e["key"] == "tunnel:t1")["skip"])
+        # manual order with explicit positions; unknown entries keep their default place
+        cfg2 = dict(cfg, order_mode="manual", entries_cfg={"main": {"order": 5}, "tunnel:t1": {"order": 0}})
+        self.assertEqual([e["key"] for e in xc.sub_entries(cfg2, ups)][:4], ["tunnel:t1", "main", "chain_any", "chain:" + ka])
+        pub = xc.entries_public(xc.sub_entries(cfg, ups, usage={"srv:ir1": 980 * xc.GB_BYTES}))
+        self.assertEqual((pub[4]["label"], pub[4]["server_name"], pub[4]["entry_ip"]), ("تانل", "ایران", "5.6.7.8"))
+        self.assertTrue(pub[4]["period"].startswith("از "))
+        self.assertNotIn("node", pub[1])
 
     def test_format_detection(self):
         self.assertEqual(xc.pick_format("", "FlClash/v0.8 clash-verge"), "clash")
@@ -398,6 +477,35 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("Mine", names)
         self.assertNotIn("user1-reality · Main", names)
         self.admin("sub_layout", {"show_main": True, "decos": [{"key": keys[0], "chain": True, "own": False}]})
+
+    def test_entries_action(self):
+        self.login()
+        st = self.admin("state")[1]["state"]
+        keys = [e["key"] for e in st["entries"]]
+        self.assertEqual(keys[0], "main")
+        ka = keys[keys.index("chain_any") + 1]
+        self.assertTrue(ka.startswith("chain:"))
+        own_b = [k for k in keys if k.startswith("own:")][1]
+        out = self.admin("entries_save", {"order_mode": "price", "skip_down": False, "entries": [
+            {"key": "main", "name": "خونه", "price": 0, "order": 0},
+            {"key": ka, "name": "ارزون", "price": "150", "unit": "gb", "order": 1},
+            {"key": own_b, "name": "گرون", "show": True, "auto": True, "price": 400000, "quota_gb": 200, "bill_day": 3, "order": 2},
+            {"key": "nope", "name": "x"}]})[1]
+        self.assertTrue(out["ok"], out)
+        s = out["state"]["settings"]
+        self.assertEqual((s["order_mode"], s["skip_down"], s["label_main"], s["show_main"]), ("price", False, "خونه", True))
+        ents = {e["key"]: e for e in out["state"]["entries"]}
+        self.assertEqual((ents[ka]["cost"], ents[own_b]["cost"], ents[own_b]["bill_day"]), (150, 2000, 3))
+        self.assertNotIn("nope", ents)
+        self.assertEqual([e["key"] for e in out["state"]["entries"]][:3], ["main", ka, own_b])
+        self.assertNotIn("nope", xc.load_config()["entries_cfg"])
+        status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
+        names = [c["remarks"] for c in json.loads(body)]
+        self.assertEqual(names[:2], ["⚡ Auto", "user1-reality · خونه"])
+        self.assertTrue(any(n.endswith("ارزون") for n in names) and "گرون" in names, names)
+        self.assertFalse(self.admin("entries_save", {"entries": [{"key": "main", "price": "abc"}]})[1]["ok"])
+        self.admin("entries_save", {"order_mode": "manual", "skip_down": True, "entries": [
+            {"key": "main", "name": ""}, {"key": ka, "name": ""}, {"key": own_b, "name": "", "show": False, "auto": False}]})
 
     def test_admin_page_is_static_and_hardened(self):
         status, h, page = self.get("/adm1n/")
@@ -1168,6 +1276,31 @@ class UsageTests(unittest.TestCase):
         store.record({"s": 90}, now=t0 + 100 * day)      # old days are pruned
         hist, _ = store.history("s", 120, now=t0 + 100 * day)
         self.assertEqual(sum(b for _, b in hist), 10)
+
+    def test_jalali_and_billing_period(self):
+        self.assertEqual(xc.g2j(2026, 10, 29), (1405, 8, 7))
+        self.assertEqual(xc.j2g(1405, 8, 7), (2026, 10, 29))
+        self.assertEqual(xc.j2g(1405, 1, 1), (2026, 3, 21))
+        self.assertEqual(xc.g2j(2025, 3, 20), (1403, 12, 30))  # 1403 is a leap year
+        for y, m, d in ((2024, 2, 29), (2026, 12, 31), (2030, 1, 1), (2025, 3, 21)):
+            self.assertEqual(xc.j2g(*xc.g2j(y, m, d)), (y, m, d))
+        now = calendar.timegm((2026, 10, 29, 12, 0, 0)) - xc.TEHRAN  # noon Tehran, 7 Aban 1405
+        self.assertEqual(xc.period_start(5, now), "2026-10-27")   # 5 Aban
+        self.assertEqual(xc.period_start(10, now), "2026-10-02")  # 10 Mehr, last month
+        self.assertEqual(xc.period_start(31, now), "2026-10-22")  # clamped to the 30th
+        self.assertEqual(xc.period_label(5, now), "از 5 آبان")
+        store = xc.UsageStore(os.path.join(tempfile.mkdtemp(), "u.db"))
+        day = 86400
+        t5 = calendar.timegm((2026, 10, 27, 0, 30, 0)) - xc.TEHRAN  # 00:30 Tehran on 5 Aban
+        store.record({"srv:ir1:rx": 1000, "srv:ir1:tx": 500}, now=t5 - day)        # first sample
+        store.record({"srv:ir1:rx": 1300, "srv:ir1:tx": 600}, now=t5 - day + 60)   # +300 / +100 on 4 Aban
+        store.record({"srv:ir1:rx": 1400, "srv:ir1:tx": 650}, now=t5)              # +100 / +50 on 5 Aban
+        store.record({"srv:ir1:rx": 1900, "srv:ir1:tx": 850}, now=now)             # +500 / +200 on 7 Aban
+        self.assertEqual(store.period_total("srv:ir1", 5, "both", now), 850)
+        self.assertEqual(store.period_total("srv:ir1", 5, "out", now), 250)
+        self.assertEqual(store.period_total("srv:ir1", 5, "in", now), 600)
+        self.assertEqual(store.period_total("srv:ir1", 1, "both", now), 1250)  # period began on 1 Aban
+        self.assertIsNone(store.period_total("srv:none", 5, "both", now))
 
     def test_wants_page(self):
         chrome = {"User-Agent": "Mozilla/5.0 (iPhone) Safari/604.1", "Accept": "text/html,*/*"}
