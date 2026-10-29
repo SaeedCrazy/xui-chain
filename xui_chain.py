@@ -38,10 +38,11 @@ import threading
 import time
 import uuid
 import urllib.parse
+import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "4.1.0"
+VERSION = "5.0.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -74,10 +75,10 @@ DEFAULTS = {
     "probe_url": "",           # download used by the Iran-side test
     "show_auto": True,         # which entries the users' apps list
     "show_main": True,
-    "show_deco_any": True,     # Clash: "Deco" = your server through the first working Deco
     "deco_opts": {},           # per Deco (by node key): chain, own, chain_name, own_name (older panels)
-    "entries_cfg": {},         # per subscription entry (main, tunnel:<id>, chain:<key>, own:<key>, chain_any):
-                               #   name, show, auto, price, unit, quota_gb, bill_day, order, count
+    "routes_custom": [],       # extra routes: [{id, entry: "deco:<key>", via: "deco:<key>"|"", exit: "main"|"x:<addr>"|"self"}]
+                               # routes_cfg (saved on first change): per route key -> name, show, auto, price, unit,
+                               #   quota_gb, bill_day, count, order
     "order_mode": "manual",    # priority of the entries: "manual" order, or cheapest first ("price")
     "skip_down": True,         # leave an entry out of the subscription while its tunnel / Deco is down
     "skip_exhausted": True,    # ... and while its volume quota is used up
@@ -630,7 +631,7 @@ def unique(names, name):
     return name
 
 
-G_MAIN, G_UP = "🎯 Select", "🔗 Decos"
+G_MAIN = "🎯 Select"
 
 
 def label(cfg, key):
@@ -641,70 +642,49 @@ def auto_name(cfg):
     return "⚡ " + label(cfg, "label_auto")
 
 
-def route_name(cfg, node, single_own, text):
-    """"Main", "Deco1"; prefixed with the config's name when the user has several configs."""
-    return text if single_own else "%s · %s" % (node["name"], text)
-
-
-# ---------------------------------------------------------------- subscription entries
+# ---------------------------------------------------------------- routes: entry -> (via) -> exit
 #
-# Everything a user's subscription can offer is an "entry": this server (main), an Iran server
-# with a tunnel to it (tunnel), this server reached through a Deco (chain), a Deco's own config
-# (own), or "this server through whichever Deco works" (chain_any, Clash only). Entries have a
-# priority order (manual or by price), a price, a volume quota and a live state.
+# A route is one thing a user's app can connect through: an entry (this server directly, an Iran
+# server with a tunnel, or someone else's config = a "Deco"), an optional middle hop (a Deco),
+# and an exit (one of the user's own servers, or the Deco's own exit). Routes are generated from
+# the building blocks and keep their settings (name, order, price, quota) by a stable key.
 
 GB_BYTES = 1024 ** 3
-DEFAULT_MONTH_GB = 500  # assumed monthly volume of a priced-per-month entry without a quota
+DEFAULT_MONTH_GB = 500  # assumed monthly volume of a priced-per-month route without a quota
 
 
-def entry_store(cfg):
-    return cfg.get("entries_cfg") or {}
+def exits_of(cfg, nodes=None):
+    """The user's own servers: this one ("main") and every 3x-ui node ("x:<address>")."""
+    facts = cfg.get("main_facts") or {}
+    out = [{"id": "main", "name": cfg.get("main_location") or "سرور اصلی",
+            "address": facts.get("ip") or cfg.get("public_host") or ""}]
+    for addr, name in (cfg.get("locations") or {}).items():
+        node = next((n for n in nodes or [] if n.get("address") == addr), None)
+        out.append({"id": "x:" + addr, "name": name, "address": addr, "node_id": node["id"] if node else None,
+                    "status": (node or {}).get("status") or ""})
+    return out
 
 
-def entry_name_default(kind, cfg, idx=0, node=None, tunnel=None):
-    if kind == "main":
-        return label(cfg, "label_main")
-    if kind == "tunnel":
-        return (tunnel or {}).get("name") or "ایران"
-    if kind == "chain":
-        return "%s%d" % (label(cfg, "label_deco"), idx)
-    if kind == "own":
-        return (node or {}).get("name") or "Deco"
-    return label(cfg, "label_deco")
+def exit_of_config(n, cfg):
+    """Which exit a user's config lives on."""
+    return ("x:" + n["server"]) if n["server"] in (cfg.get("locations") or {}) else "main"
 
 
-def entry_settings(cfg, key, kind, idx=0, node=None, tunnel=None):
-    """Stored settings of one entry with defaults (and the older deco_opts flags as a fallback)."""
-    st = entry_store(cfg).get(key) or {}
-    show, auto, price = True, True, None
-    if kind == "own":
-        show, auto = False, False
-    if kind == "chain_any":
-        show, auto = cfg.get("show_deco_any", True), False
-    if kind == "main":
-        show, price = cfg.get("show_main", True), 0
-    legacy_name = ""
-    if kind in ("chain", "own") and node is not None:
-        o = (cfg.get("deco_opts") or {}).get(node_key(node)) or {}
-        show = o.get(kind, show)
-        auto = show and o.get(kind + "_auto", auto)
-        legacy_name = (o.get(kind + "_name") or "").strip()
-    name = (st.get("name") or "").strip() or legacy_name or entry_name_default(kind, cfg, idx, node, tunnel)
-    return {"name": name, "show": bool(st.get("show", show)), "auto": bool(st.get("auto", auto)),
-            "price": st.get("price", price), "unit": st.get("unit") or "month",
-            "quota_gb": float(st.get("quota_gb") or 0), "bill_day": int(st.get("bill_day") or 1),
-            "count": st.get("count") or "both", "order": st.get("order")}
-
-
-def entry_cost(e):
-    """Toman per GB for sorting by price; None when unknown."""
-    price = e.get("price")
-    if price in (None, ""):
+def exit_for_server(srv, cfg, nodes=None):
+    """Exit id of a managed server (a tunnel's exit), or None when it is not one of the exits."""
+    if not srv:
         return None
-    price = float(price)
-    if e.get("unit") == "gb":
-        return price
-    return price / (e.get("quota_gb") or DEFAULT_MONTH_GB)
+    if srv.get("local") or srv.get("id") == "main":
+        return "main"
+    if srv.get("node_id"):
+        node = next((n for n in nodes or [] if n.get("id") == srv["node_id"]), None)
+        if node and node.get("address") in (cfg.get("locations") or {}):
+            return "x:" + node["address"]
+    facts = srv.get("facts") or {}
+    for addr in cfg.get("locations") or {}:
+        if addr in (srv.get("host"), facts.get("ip")):
+            return "x:" + addr
+    return None
 
 
 def tunnel_port_map(t):
@@ -714,166 +694,273 @@ def tunnel_port_map(t):
         return {}
 
 
-def tunnel_applies(n, tunnel, exit_srv, cfg):
-    """Does the user's config n live on the tunnel's exit server?"""
-    if not exit_srv:
-        return False
-    if exit_srv.get("local"):
-        return n["server"] not in (cfg.get("locations") or {})  # not one of the other locations
-    facts = exit_srv.get("facts") or {}
-    return n["server"] in (facts.get("ip"), exit_srv.get("host"))
-
-
 def rewrite_for_tunnel(n, entry_ip, port_map):
+    """The user's config as reached through the Iran server: its IP and the mapped port."""
     port = port_map.get(n["port"])
     if not port or not entry_ip:
         return None
-    m = dict(n, server=entry_ip, port=port)
-    return m
+    return dict(n, server=entry_ip, port=port)
 
 
-def sub_entries(cfg, ups, usage=None, statuses=None, deco_down=None):
-    """Ordered entries of the subscription. usage: {"srv:<id>" | "main": used bytes this period};
-    statuses: {tunnel id: "up"|"down"}; deco_down: {node_key: True}."""
-    statuses, deco_down = statuses or {}, deco_down or {}
-    if usage is None:
-        usage = {}
-    used_of = usage if callable(usage) else (lambda key, e: usage.get(key))
-    servers = {s["id"]: s for s in (cfg.get("servers") or [])}
-    servers["main"] = {"id": "main", "local": True, "facts": cfg.get("main_facts") or {}, "host": cfg.get("public_host", "")}
-    out = []
-
-    def add(key, kind, idx=0, node=None, tunnel=None, default_order=0, **extra):
-        st = entry_settings(cfg, key, kind, idx, node, tunnel)
-        e = dict(st, key=key, kind=kind, idx=idx, node=node, tunnel=tunnel, default_order=default_order,
-                 used=None, remaining=None, down=False, exhausted=False, **extra)
-        out.append(e)
-        return e
-
-    main = add("main", "main", default_order=0 if cfg.get("direct_first", True) else 10 ** 6, server_id="main")
-    main["used"] = used_of("main", main)
-    for k, t in enumerate(cfg.get("tunnels") or [], 1):
-        if t.get("status") in ("failed", "setting-up"):
-            continue
-        entry_srv, exit_srv = servers.get(t.get("entry")), servers.get(t.get("exit"))
-        ip = ((entry_srv or {}).get("facts") or {}).get("ip") or (entry_srv or {}).get("host") or ""
-        e = add("tunnel:" + t["id"], "tunnel", k, tunnel=t, default_order=100 + k, entry_ip=ip, exit_srv=exit_srv,
-                port_map=tunnel_port_map(t), server_id=t.get("entry"), server_name=(entry_srv or {}).get("name", ""))
-        e["down"] = statuses.get(t["id"], t.get("status")) == "down"
-        e["used"] = used_of("srv:%s" % t.get("entry"), e)
-    if ups:
-        add("chain_any", "chain_any", default_order=500)
-    base = 1000
-    for i, n in enumerate(ups, 1):
-        key = node_key(n)
-        info = UPSTREAMS.info.get(n.get("src", "")) if n.get("src") else None
-        for kind, off in (("chain", 0), ("own", 1)):
-            e = add("%s:%s" % (kind, key), kind, i, node=n, default_order=base + i * 10 + off)
-            e["down"] = bool(deco_down.get(key))
-            if info:
-                e["used"] = info.get("upload", 0) + info.get("download", 0)
-                if info.get("total"):
-                    e["quota_gb"] = e["quota_gb"] or info["total"] / GB_BYTES
-                    e["quota_from_sub"] = True
-
-    for e in out:
-        if e["quota_gb"] and e["used"] is not None:
-            e["remaining"] = max(0, e["quota_gb"] * GB_BYTES - e["used"])
-            e["exhausted"] = e["remaining"] <= 0
-        e["cost"] = entry_cost(e)
-        e["skip"] = (e["kind"] != "main") and ((e["down"] and cfg.get("skip_down", True)) or
-                                               (e["exhausted"] and cfg.get("skip_exhausted", True)))
-    if (cfg.get("order_mode") or "manual") == "price":
-        out.sort(key=lambda e: (e["cost"] is None, e["cost"] or 0, e["default_order"]))
-    else:
-        out.sort(key=lambda e: (e["order"] if e["order"] is not None else e["default_order"], e["default_order"]))
+def routes_store(cfg):
+    """Stored per-route settings; older panels' entries_cfg / deco_opts are mapped once."""
+    if cfg.get("routes_cfg") is not None:
+        return cfg["routes_cfg"]
+    out = {}
+    for key, o in (cfg.get("deco_opts") or {}).items():
+        out["deco:%s>main" % key] = {"show": o.get("chain", True), "auto": o.get("chain", True) and o.get("chain_auto", True),
+                                      "name": (o.get("chain_name") or "").strip()}
+        out["deco:%s>self" % key] = {"show": o.get("own", False), "auto": o.get("own", False) and o.get("own_auto", False),
+                                      "name": (o.get("own_name") or "").strip()}
+    for key, st in (cfg.get("entries_cfg") or {}).items():
+        new = {"main": "direct>main", "chain_any": None}.get(key, key)
+        if key.startswith("tunnel:"):
+            new = "tun:" + key[7:]
+        elif key.startswith("chain:"):
+            new = "deco:%s>main" % key[6:]
+        elif key.startswith("own:"):
+            new = "deco:%s>self" % key[4:]
+        if new:
+            out[new] = dict(out.get(new) or {}, **st)
+    if "direct>main" not in out and (not cfg.get("show_main", True) or (cfg.get("label_main") or "") not in ("", DEFAULTS["label_main"])):
+        out["direct>main"] = {"show": cfg.get("show_main", True), "name": (cfg.get("label_main") or "").strip()}
     return out
 
 
-def entries_public(entries):
-    """Entries for the admin page (no node or tunnel objects)."""
-    keep = ("key", "kind", "idx", "name", "show", "auto", "price", "unit", "quota_gb", "bill_day", "order",
-            "used", "remaining", "down", "exhausted", "skip", "cost", "quota_from_sub", "server_name", "entry_ip",
-            "server_id", "count")
+def route_settings(cfg, key, default_name, show=True, auto=True, price=None):
+    st = routes_store(cfg).get(key) or {}
+    return {"name": (st.get("name") or "").strip() or default_name, "show": bool(st.get("show", show)),
+            "auto": bool(st.get("auto", auto)), "price": st.get("price", price), "unit": st.get("unit") or "month",
+            "quota_gb": float(st.get("quota_gb") or 0), "bill_day": int(st.get("bill_day") or 1),
+            "count": st.get("count") or "both", "order": st.get("order")}
+
+
+def route_cost(r):
+    """Toman per GB for sorting by price; None when unknown."""
+    price = r.get("price")
+    if price in (None, ""):
+        return None
+    price = float(price)
+    if r.get("unit") == "gb":
+        return price
+    return price / (r.get("quota_gb") or DEFAULT_MONTH_GB)
+
+
+def deco_label(cfg, i):
+    return "%s%d" % (label(cfg, "label_deco"), i)
+
+
+def routes(cfg, ups, usage=None, statuses=None, deco_down=None, nodes=None):
+    """Ordered routes. usage: {"srv:<id>": bytes} or a callable (key, route) -> bytes;
+    statuses: {tunnel id: "up"|"down"}; deco_down: {node_key: True}; nodes: the panel's node list."""
+    statuses, deco_down = statuses or {}, deco_down or {}
+    used_of = usage if callable(usage) else (lambda key, r: (usage or {}).get(key))
+    servers = {s["id"]: s for s in (cfg.get("servers") or [])}
+    servers["main"] = {"id": "main", "local": True, "facts": cfg.get("main_facts") or {}, "host": cfg.get("public_host", "")}
+    exits = exits_of(cfg, nodes)
+    exit_by = {e["id"]: e for e in exits}
+    decos = {node_key(n): (i, n) for i, n in enumerate(ups, 1)}
     out = []
-    for e in entries:
-        d = {k: e.get(k) for k in keep}
-        d["period"] = period_label(e["bill_day"]) if e["kind"] in ("main", "tunnel") else ""
-        d["label"] = e["node"]["name"] if e.get("node") is not None else (e["tunnel"] or {}).get("name", "") if e.get("tunnel") else ""
-        d["ports"] = (e.get("tunnel") or {}).get("ports", "") if e.get("tunnel") else ""
+
+    def add(key, kind, default_name, default_order, entry, via, exit_, show=True, auto=True, price=None, **extra):
+        st = route_settings(cfg, key, default_name, show, auto, price)
+        r = dict(st, key=key, kind=kind, entry=entry, via=via, exit=exit_, default_order=default_order,
+                 used=None, remaining=None, down=False, exhausted=False, note="", **extra)
+        out.append(r)
+        return r
+
+    direct = {"type": "direct", "name": "مستقیم"}
+    for j, e in enumerate(exits):
+        main = e["id"] == "main"
+        name = label(cfg, "label_main") if main else e["name"]
+        order = (0 if cfg.get("direct_first", True) else 10 ** 6) + j
+        r = add("direct>" + e["id"], "direct", name, order, direct, None, e, price=0 if main else None, exit_id=e["id"])
+        r["used"] = used_of("srv:main", r) if main else None
+    for k, t in enumerate(cfg.get("tunnels") or [], 1):
+        if t.get("status") in ("failed", "setting-up"):
+            continue
+        entry_srv = servers.get(t.get("entry"))
+        exit_id = exit_for_server(servers.get(t.get("exit")), cfg, nodes)
+        ip = ((entry_srv or {}).get("facts") or {}).get("ip") or (entry_srv or {}).get("host") or ""
+        entry = {"type": "server", "id": t.get("entry"), "name": (entry_srv or {}).get("name") or "ایران", "ip": ip}
+        via = {"type": "deco", "name": t["via_name"]} if t.get("via_name") else None
+        exit_ = exit_by.get(exit_id) or {"id": exit_id or "", "name": "؟"}
+        r = add("tun:" + t["id"], "tunnel", t.get("name") or entry["name"], 100 + k, entry, via, exit_, tunnel=t,
+                exit_id=exit_id, port_map=tunnel_port_map(t), server_id=t.get("entry"))
+        r["down"] = statuses.get(t["id"], t.get("status")) == "down"
+        r["used"] = used_of("srv:%s" % t.get("entry"), r)
+        if not exit_id:
+            r["note"] = "سرور خروجی این تانل هنوز خروجی (نود 3x-ui) نیست"
+    for i, n in enumerate(ups, 1):
+        key = node_key(n)
+        entry = {"type": "deco", "key": key, "name": n["name"], "idx": i, "ip": n["server"]}
+        info = UPSTREAMS.info.get(n.get("src", "")) if n.get("src") else None
+        for j, e in enumerate(exits):
+            r = add("deco:%s>%s" % (key, e["id"]), "deco", deco_label(cfg, i) + ("" if e["id"] == "main" else " · " + e["name"]),
+                    1000 + i * 10 + j, entry, None, e, node=n, idx=i, exit_id=e["id"])
+            r["down"] = bool(deco_down.get(key))
+        r = add("deco:%s>self" % key, "own", n["name"], 1000 + i * 10 + 9, entry, None,
+                {"id": "self", "name": n["name"]}, node=n, idx=i, exit_id="self", show=False, auto=False)
+        r["down"] = bool(deco_down.get(key))
+        if info:
+            for r in out:
+                if r.get("node") is n:
+                    r["used"] = info.get("upload", 0) + info.get("download", 0)
+                    if info.get("total"):
+                        r["quota_gb"] = r["quota_gb"] or info["total"] / GB_BYTES
+                        r["quota_from_sub"] = True
+    for k, c in enumerate(cfg.get("routes_custom") or [], 1):
+        ent = decos.get((c.get("entry") or "")[5:]) if (c.get("entry") or "").startswith("deco:") else None
+        via = decos.get((c.get("via") or "")[5:]) if (c.get("via") or "").startswith("deco:") else None
+        exit_ = exit_by.get(c.get("exit")) if c.get("exit") != "self" else None
+        if not ent or (c.get("via") and not via) or (c.get("exit") != "self" and not exit_):
+            continue
+        i, n = ent
+        entry = {"type": "deco", "key": node_key(n), "name": n["name"], "idx": i, "ip": n["server"]}
+        via_d = {"type": "deco", "key": node_key(via[1]), "name": via[1]["name"], "idx": via[0]} if via else None
+        exit_ = exit_ or {"id": "self", "name": via[1]["name"] if via else n["name"]}
+        if exit_["id"] == "self":
+            name = "%s · %s" % (deco_label(cfg, i), via[1]["name"]) if via else n["name"]
+        else:
+            name = " · ".join(x for x in [deco_label(cfg, i), deco_label(cfg, via[0]) if via else "",
+                                          exit_["name"] if exit_["id"] != "main" else ""] if x)
+        r = add("custom:" + c["id"], "custom", name, 5000 + k, entry, via_d, exit_, node=n, idx=i, via_node=via[1] if via else None,
+                exit_id=exit_["id"], custom=c)
+        r["down"] = bool(deco_down.get(node_key(n))) or (via is not None and bool(deco_down.get(node_key(via[1]))))
+
+    for r in out:
+        if r["quota_gb"] and r["used"] is not None:
+            r["remaining"] = max(0, r["quota_gb"] * GB_BYTES - r["used"])
+            r["exhausted"] = r["remaining"] <= 0
+        r["cost"] = route_cost(r)
+        r["skip"] = (r["kind"] != "direct") and ((r["down"] and cfg.get("skip_down", True)) or
+                                                 (r["exhausted"] and cfg.get("skip_exhausted", True)))
+    if (cfg.get("order_mode") or "manual") == "price":
+        out.sort(key=lambda r: (r["cost"] is None, r["cost"] or 0, r["default_order"]))
+    else:
+        out.sort(key=lambda r: (r["order"] if r["order"] is not None else r["default_order"], r["default_order"]))
+    return out
+
+
+def route_items(r, own, cfg):
+    """The client-side configs of one route for a user's own configs: [{"name", "target", "hops"}],
+    hops ordered from the app outward (the app connects to hops[0] first)."""
+    if r["kind"] == "own":
+        return [{"name": r["name"], "target": r["node"], "hops": []}]
+    if r["kind"] == "custom" and r["exit_id"] == "self":
+        target = r["via_node"] or r["node"]
+        return [{"name": r["name"], "target": target, "hops": [r["node"]] if r["via_node"] is not None else []}]
+    mine = [n for n in own if exit_of_config(n, cfg) == r["exit_id"]]
+    items = []
+    for n in mine:
+        if r["kind"] == "tunnel":
+            m = rewrite_for_tunnel(n, r["entry"]["ip"], r["port_map"])
+            if m is None:
+                continue
+            hops = []
+        elif r["kind"] in ("deco", "custom"):
+            m = n
+            hops = [r["node"]] + ([r["via_node"]] if r.get("via_node") is not None else [])
+        else:
+            m, hops = n, []
+        items.append({"name": r["name"], "target": m, "hops": hops, "own": n})
+    if len(items) > 1:  # two inbounds on one exit: keep their remarks apart
+        for it in items:
+            extra = clean_remark(it["own"]["name"])
+            it["name"] = "%s · %s" % (r["name"], extra) if extra and extra != r["name"] else r["name"]
+    return items
+
+
+def route_tag(r):
+    """Short, unique, ASCII-safe id of a route for Xray outbound tags."""
+    if r["kind"] == "direct":
+        return "direct" if r["exit_id"] == "main" else "direct-%d" % (zlib.crc32(r["exit_id"].encode()) % 10000)
+    if r["kind"] == "tunnel":
+        return "tun-%s" % r["tunnel"]["id"]
+    if r["kind"] == "own":
+        return "own-%d" % r["idx"]
+    if r["kind"] == "custom":
+        return "c-%s" % r["custom"]["id"]
+    return "via-%d" % r["idx"] if r["exit_id"] == "main" else "via-%d-%d" % (r["idx"], zlib.crc32(r["exit_id"].encode()) % 10000)
+
+
+def routes_public(rts, pings=None):
+    """Routes for the admin page (no node or tunnel objects)."""
+    keep = ("key", "kind", "idx", "name", "show", "auto", "price", "unit", "quota_gb", "bill_day", "count", "order",
+            "used", "remaining", "down", "exhausted", "skip", "cost", "quota_from_sub", "server_id", "exit_id", "note")
+    out = []
+    for r in rts:
+        d = {k: r.get(k) for k in keep}
+        d["entry"] = {k: v for k, v in r["entry"].items() if k != "node"}
+        d["via"] = r["via"]
+        d["exit"] = {"id": r["exit"]["id"], "name": r["exit"]["name"]}
+        d["period"] = period_label(r["bill_day"]) if r["kind"] in ("direct", "tunnel") and r.get("used") is not None else ""
+        t = r.get("tunnel")
+        if t:
+            d["tunnel"] = {k: t.get(k) for k in ("id", "engine", "transport", "ports", "status", "bench_result", "error", "check")}
+        d["ping"] = (pings or {}).get(r["key"])
         out.append(d)
     return out
 
 
-def deco_options(cfg, ups):
-    """[(index, node, options)]: the chain/own flags of each Deco, derived from the entries."""
-    out = []
-    for i, n in enumerate(ups, 1):
-        key = node_key(n)
-        c = entry_settings(cfg, "chain:" + key, "chain", i, n)
-        o = entry_settings(cfg, "own:" + key, "own", i, n)
-        out.append((i, n, {"chain": c["show"], "own": o["show"], "chain_auto": c["auto"], "own_auto": o["auto"],
-                           "chain_name": c["name"], "own_name": o["name"]}))
-    return out
+def live_routes(app, cfg, ups):
+    """Routes with the live state of this panel: servers' traffic this period, tunnel status,
+    Decos the monitor found down, the panel's nodes."""
+    def used(key, r):
+        sid = key.split(":", 1)[1] if key.startswith("srv:") else "main"
+        return app.usage.period_total("srv:%s" % sid, r["bill_day"], r.get("count") or "both")
+    statuses = {t["id"]: t.get("status") for t in (cfg.get("tunnels") or [])}
+    down = {node_key(it["node"]): True for it in app.monitor.results if it.get("down")}
+    nodes = app.panel.overview().get("nodes") if app.panel.configured() else None
+    return routes(cfg, ups, usage=used, statuses=statuses, deco_down=down, nodes=nodes)
 
 
-def build_mihomo(own, ups, cfg, entries=None):
+def active_routes(rts):
+    return [r for r in rts if not r["skip"] and (r["show"] or r["auto"])]
+
+
+def build_mihomo(own, ups, cfg, rts=None):
     """own, ups: lists of neutral nodes. Returns (yaml_text, skipped_messages)."""
     g_auto = auto_name(cfg)
-    deco = label(cfg, "label_deco")
-    names = {G_MAIN, g_auto, G_UP, "DIRECT", "REJECT"}
+    names = {G_MAIN, g_auto, "DIRECT", "REJECT"}
     skipped = []
-    entries = entries if entries is not None else sub_entries(cfg, ups)
-    one = len(own) == 1
-    hops = {}
-    for i, n in enumerate(ups, 1):
-        try:
-            hops[i] = to_mihomo(n, unique(names, "%s%d · %s" % (deco, i, n["name"])))
-        except ValueError as e:
-            skipped.append("upstream %d: %s" % (i, e))
-    proxies, visible, auto, used_hops = [], [], [], []
-    for e in entries:
-        if e["skip"] or not (e["show"] or e["auto"]):
-            continue
+    rts = rts if rts is not None else routes(cfg, ups)
+    decos = {node_key(n): i for i, n in enumerate(ups, 1)}
+    proxies, hop_proxies, hop_cache, visible, auto = [], [], {}, [], []
+
+    def hop_proxy(node, dialer):
+        ck = (node_key(node), dialer)
+        if ck in hop_cache:
+            return hop_cache[ck]
+        base = "%s · %s" % (deco_label(cfg, decos.get(node_key(node), 0)), node["name"])
+        p = to_mihomo(node, unique(names, base if not dialer else "%s ← %s" % (base, dialer)))
+        if dialer:
+            p["dialer-proxy"] = dialer
+        hop_proxies.append(p)
+        hop_cache[ck] = p["name"]
+        return p["name"]
+
+    for r in active_routes(rts):
         made = []
         try:
-            if e["kind"] in ("main", "tunnel"):
-                for n in own:
-                    m = n if e["kind"] == "main" else rewrite_for_tunnel(n, e["entry_ip"], e["port_map"]) \
-                        if tunnel_applies(n, e["tunnel"], e["exit_srv"], cfg) else None
-                    if m is None:
-                        continue
-                    made.append(to_mihomo(m, unique(names, route_name(cfg, n, one, e["name"]))))
-            elif e["kind"] == "chain":
-                hop = hops.get(e["idx"])
-                if hop is None or not (e["show"] or e["auto"]):
-                    continue
-                for n in own:
-                    p = to_mihomo(n, unique(names, route_name(cfg, n, one, e["name"])))
-                    p["dialer-proxy"] = hop["name"]
-                    made.append(p)
-                if made and hop not in used_hops:
-                    used_hops.append(hop)
-            elif e["kind"] == "own":
-                made.append(to_mihomo(e["node"], unique(names, e["name"])))
-            elif e["kind"] == "chain_any":
-                if not any(x["kind"] == "chain" and not x["skip"] and (x["show"] or x["auto"]) and x["idx"] in hops for x in entries):
-                    continue
-                for n in own:
-                    p = to_mihomo(n, unique(names, route_name(cfg, n, one, e["name"])))
-                    p["dialer-proxy"] = G_UP
-                    made.append(p)
+            for it in route_items(r, own, cfg):
+                dialer = None
+                for hop in it["hops"]:
+                    dialer = hop_proxy(hop, dialer)
+                p = to_mihomo(it["target"], unique(names, it["name"]))
+                if dialer:
+                    p["dialer-proxy"] = dialer
+                made.append(p)
         except ValueError as ex:
-            skipped.append("%s: %s" % (e["name"], ex))
+            skipped.append("%s: %s" % (r["name"], ex))
             continue
         proxies += made
-        if e["show"]:
+        if r["show"]:
             visible += [p["name"] for p in made]
-        if e["auto"] and e["kind"] != "chain_any":
+        if r["auto"]:
             auto += [p["name"] for p in made]
     if not proxies:
         raise ValueError("no usable config for this user")
-    group_hops = used_hops
     auto = auto or visible or [p["name"] for p in proxies]
     fastest = (cfg.get("auto_mode") or "priority") == "fastest"
     test = {"url": cfg.get("test_url") or DEFAULTS["test_url"], "interval": int(cfg.get("test_interval") or 120),
@@ -883,8 +970,6 @@ def build_mihomo(own, ups, cfg, entries=None):
         dict({"name": g_auto, "type": "url-test" if fastest else "fallback", "proxies": auto},
              **(dict(test, tolerance=60) if fastest else test)),
     ]
-    if group_hops:
-        groups.append(dict({"name": G_UP, "type": "fallback", "proxies": [p["name"] for p in group_hops]}, **test))
     rules = []
     if cfg.get("iran_direct", True):
         rules.append("DOMAIN-SUFFIX,ir,DIRECT")
@@ -895,7 +980,7 @@ def build_mihomo(own, ups, cfg, entries=None):
         "mode": "rule",
         "log-level": "warning",
         "unified-delay": True,
-        "proxies": proxies + [h for h in hops.values() if h in group_hops],
+        "proxies": proxies + hop_proxies,
         "proxy-groups": groups,
         "rules": rules,
     }
@@ -927,82 +1012,50 @@ def xray_config(remarks, outbounds, cfg, route):
     }
 
 
-def build_xray(own, ups, cfg, remarks, entries=None):
-    """List of Xray client configs (one app entry each): an automatic one over every entry in
-    Auto, then every visible entry on its own (per own config)."""
+def xray_chain(item, tag, ups):
+    """Xray outbounds of one client config: the target (tag) dialing through its hops.
+    Hop tags are shared between routes that use the same hop the same way."""
+    decos = {node_key(n): i for i, n in enumerate(ups, 1)}
+    outs, dialer = [], None
+    for hop in item["hops"]:
+        htag = "up-%d" % decos.get(node_key(hop), 0) + ("-via-" + dialer if dialer else "")
+        o = to_xray(hop, htag)
+        if dialer:
+            o["streamSettings"]["sockopt"] = {"dialerProxy": dialer}
+        outs.append(o)
+        dialer = htag
+    target = to_xray(item["target"], tag)
+    if dialer:
+        target["streamSettings"]["sockopt"] = {"dialerProxy": dialer}
+    return [target] + outs
+
+
+def build_xray(own, ups, cfg, remarks, rts=None):
+    """List of Xray client configs (one app entry each): an automatic one over every route in
+    Auto, then every visible route on its own."""
     skipped = []
-    entries = entries if entries is not None else sub_entries(cfg, ups)
-    one = len(own) == 1
-    hops = {}
-    for i, n in enumerate(ups, 1):
+    rts = rts if rts is not None else routes(cfg, ups)
+    singles, members, hops, auto_routes = [], [], {}, set()
+    for r in active_routes(rts):
         try:
-            hops[i] = to_xray(n, "up-%d" % i)
-        except ValueError as e:
-            skipped.append("upstream %d: %s" % (i, e))
-    own_ok = []
-    for n in own:
-        try:
-            to_xray(n, "proxy")
-            own_ok.append(n)
-        except ValueError as e:
-            skipped.append("%s: %s" % (n["name"], e))
-
-    def chained(n, i, tag):
-        o = to_xray(n, tag)
-        o["streamSettings"]["sockopt"] = {"dialerProxy": "up-%d" % i}
-        return o
-
-    singles, members, member_hops, auto_entries = [], [], {}, set()
-    for e in entries:
-        if e["skip"] or e["kind"] == "chain_any":
-            continue
-        before = len(members)
-        try:
-            if e["kind"] in ("main", "tunnel"):
-                for k, n in enumerate(own_ok, 1):
-                    m = n if e["kind"] == "main" else rewrite_for_tunnel(n, e["entry_ip"], e["port_map"]) \
-                        if tunnel_applies(n, e["tunnel"], e["exit_srv"], cfg) else None
-                    if m is None:
-                        continue
-                    tag = "me-%d-direct" % k if e["kind"] == "main" else "me-%d-tun-%s" % (k, e["tunnel"]["id"])
-                    if e["show"]:
-                        singles.append(xray_config(route_name(cfg, n, one, e["name"]), [to_xray(m, "proxy")], cfg, {"outboundTag": "proxy"}))
-                    if e["auto"]:
-                        members.append(to_xray(m, tag))
-            elif e["kind"] == "chain":
-                if e["idx"] not in hops:
-                    continue
-                for k, n in enumerate(own_ok, 1):
-                    if e["show"]:
-                        singles.append(xray_config(route_name(cfg, n, one, e["name"]),
-                                                   [chained(n, e["idx"], "proxy"), dict(hops[e["idx"]], tag="up-%d" % e["idx"])],
-                                                   cfg, {"outboundTag": "proxy"}))
-                    if e["auto"]:
-                        members.append(chained(n, e["idx"], "me-%d-via-up-%d" % (k, e["idx"])))
-                        member_hops[e["idx"]] = hops[e["idx"]]
-            elif e["kind"] == "own":
-                if e["idx"] not in hops:
-                    continue
-                if e["show"]:
-                    singles.append(xray_config(e["name"], [dict(hops[e["idx"]], tag="proxy")], cfg, {"outboundTag": "proxy"}))
-                if e["auto"]:
-                    members.append(dict(hops[e["idx"]], tag="me-own-up-%d" % e["idx"]))
+            items = route_items(r, own, cfg)
+            for k, it in enumerate(items, 1):
+                if r["show"]:
+                    singles.append(xray_config(it["name"], xray_chain(it, "proxy", ups), cfg, {"outboundTag": "proxy"}))
+                if r["auto"]:
+                    chain = xray_chain(it, "me-%s-%d" % (route_tag(r), k), ups)
+                    members.append(chain[0])
+                    for o in chain[1:]:
+                        hops[o["tag"]] = o
+                    auto_routes.add(r["key"])
         except ValueError as ex:
-            skipped.append("%s: %s" % (e["name"], ex))
-        if len(members) > before:
-            auto_entries.add(e["key"])
+            skipped.append("%s: %s" % (r["name"], ex))
     if not singles and not members:
         raise ValueError("no usable config for this user")
-    if len(auto_entries) < 2 or not cfg.get("show_auto", True):  # Auto only when there is something to fall back to
+    if len(auto_routes) < 2 or not cfg.get("show_auto", True):  # Auto only when there is something to fall back to
         return json.dumps(singles or [xray_config(remarks, [dict(members[0], tag="proxy")], cfg, {"outboundTag": "proxy"})],
                           ensure_ascii=False, indent=2), skipped
-    seen, uniq = set(), []
-    for o in members:
-        if o["tag"] not in seen:
-            seen.add(o["tag"])
-            uniq.append(o)
-    members = uniq
-    auto = xray_config(auto_name(cfg), members + list(member_hops.values()), cfg, {"balancerTag": "auto"})
+    auto = xray_config(auto_name(cfg), members + list(hops.values()), cfg, {"balancerTag": "auto"})
     auto["observatory"] = {
         "subjectSelector": ["me-"],
         "probeURL": cfg.get("test_url") or DEFAULTS["test_url"],
@@ -1018,15 +1071,85 @@ def build_xray(own, ups, cfg, remarks, entries=None):
     return json.dumps([auto] + singles, ensure_ascii=False, indent=2), skipped
 
 
-def live_entries(app, cfg, ups):
-    """Entries with the live state of this panel: traffic of the servers this period, tunnel
-    status, Decos the monitor found down."""
-    def used(key, e):
-        sid = key.split(":", 1)[1] if key.startswith("srv:") else "main"
-        return app.usage.period_total("srv:%s" % sid, e["bill_day"], e.get("count") or "both")
-    statuses = {t["id"]: t.get("status") for t in (cfg.get("tunnels") or [])}
-    down = {node_key(it["node"]): True for it in app.monitor.results if it.get("down")}
-    return sub_entries(cfg, ups, usage=used, statuses=statuses, deco_down=down)
+def sub_configs(rt, sub_id):
+    """The user's own configs from the panel subscription -> (own nodes, headers) or raises PanelError."""
+    try:
+        status, hdrs, body = http_get(rt["xui_sub_url"] + urllib.parse.quote(sub_id), connect=rt.get("xui_connect", ""))
+    except Exception as e:
+        raise PanelError("ساب پنل در دسترس نیست: %s" % e)
+    if status != 200:
+        raise PanelError("این ساب در پنل پیدا نشد")
+    own = parse_nodes(split_lines(body))
+    if not own:
+        raise PanelError("این ساب کانفیگی ندارد")
+    return own, hdrs
+
+
+def route_tests(app, sub, log=None, limit=24):
+    """Ping every config a user's subscription offers, from this server: TCP connect to the first
+    hop and, with the panel's Xray, a real request through the whole route. Stored in app.net.pings."""
+    rt = app.rt
+    log = log or (lambda m: None)
+    subs = [sub] if sub else [s for _, s, en in list_clients(app.db_path) if en][:1]
+    if not subs:
+        raise PanelError("کاربری برای تست نیست")
+    sub = subs[0]
+    own, _ = sub_configs(rt, sub)
+    ups = UPSTREAMS.nodes()
+    rts = live_routes(app, rt, ups)
+    xray = find_xray()
+    url = rt.get("test_url") or DEFAULTS["test_url"]
+    rows = []
+    for r in rts:
+        if r["skip"] or not (r["show"] or r["auto"]):
+            continue
+        try:
+            items = route_items(r, own, cfg=rt)
+        except ValueError:
+            continue
+        for it in items[:3]:
+            first = it["hops"][0] if it["hops"] else it["target"]
+            rows.append({"key": r["key"], "name": it["name"], "server": first["server"], "port": first["port"],
+                         "item": it, "tcp_ms": None, "ok": None, "ms": None, "error": ""})
+    rows = rows[:limit]
+    if not rows:
+        raise PanelError("مسیری برای تست نیست")
+    log("تست %d کانفیگ از این سرور…" % len(rows))
+
+    def work(row):
+        row["tcp_ms"] = tcp_check(row["server"], row["port"])
+        if row["tcp_ms"] is None:
+            row["ok"], row["error"] = False, "پورت بسته است"
+        elif xray and row["item"]["target"]["proto"] in XRAY_PROTOCOLS:
+            try:
+                res = xray_test(xray_chain(row["item"], "proxy", ups), xray, url)
+            except (OSError, ValueError) as e:
+                res = {"ok": False, "ms": None, "error": str(e)}
+            row.update(ok=res["ok"], ms=res["ms"], error=res["error"])
+        elif row["item"]["target"]["proto"] == "hysteria2":
+            row["ok"], row["error"] = None, "UDP؛ فقط پورت چک شد"
+        else:
+            row["ok"] = True
+    threads = [threading.Thread(target=work, args=(row,), daemon=True) for row in rows]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(40)
+    for row in rows:
+        row.pop("item", None)
+        if row["ok"] is None and row["tcp_ms"] is not None and row["error"] == "":
+            row["ok"], row["error"] = False, "timeout"
+    res = {"sub": sub, "at": int(time.time() * 1000), "rows": rows, "xray": bool(xray)}
+    app.net.pings[sub] = res
+    by_key = {}
+    for row in rows:  # one summary per route: the best config of it
+        cur = by_key.get(row["key"])
+        if cur is None or (row["ok"] and (not cur["ok"] or (row["ms"] or 0) < (cur["ms"] or 0))):
+            by_key[row["key"]] = {"ok": row["ok"], "ms": row["ms"], "tcp_ms": row["tcp_ms"], "at": res["at"], "error": row["error"]}
+    app.net.ping_by_key.update(by_key)
+    ok = sum(1 for row in rows if row["ok"])
+    log("%d از %d کانفیگ جواب داد" % (ok, len(rows)))
+    return res
 
 
 JALALI_MONTHS = ["فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور", "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"]
@@ -1239,20 +1362,6 @@ def location_label(node, rt):
     return rt.get("main_location") or clean_remark(node["name"])
 
 
-def label_configs(own, rt):
-    """Name the user's configs by location; configs that share a location (two inbounds on one
-    server) keep their own remark after it so every entry stays distinct."""
-    labels = [location_label(n, rt) for n in own]
-    seen = {}
-    for n, lab in zip(own, labels):
-        if labels.count(lab) > 1:
-            extra = clean_remark(n["name"])
-            lab = "%s %s" % (lab, extra) if extra and extra != lab else lab
-        seen[lab] = seen.get(lab, 0) + 1
-        n["name"] = lab if seen[lab] == 1 else "%s %d" % (lab, seen[lab])
-    return own
-
-
 def build_subscription(sub_id, fmt, rt, app=None):
     """-> (status, headers, body)."""
     url = rt["xui_sub_url"] + urllib.parse.quote(sub_id)
@@ -1266,15 +1375,14 @@ def build_subscription(sub_id, fmt, rt, app=None):
     if not own:
         return 404, {}, "no configs for this subscription\n"
     ups = UPSTREAMS.nodes()
-    label_configs(own, rt)
     title = rt.get("title") or NAME
-    entries = live_entries(app, rt, ups) if app else None
+    rts = live_routes(app, rt, ups) if app else None
     try:
         if fmt == "xray":
-            text, _ = build_xray(own, ups, rt, title, entries)
+            text, _ = build_xray(own, ups, rt, title, rts)
             ctype, ext = "application/json; charset=utf-8", "json"
         else:
-            text, _ = build_mihomo(own, ups, rt, entries)
+            text, _ = build_mihomo(own, ups, rt, rts)
             ctype, ext = "text/yaml; charset=utf-8", "yaml"
     except ValueError as e:
         return 422, {}, "%s\n" % e
@@ -1400,13 +1508,19 @@ def socks_http_status(port, url, timeout):
 def real_test(own, deco, xray, url, timeout=15):
     """Connect from this server through the Deco to our own config and fetch url,
     using the panel's Xray. -> {"ok", "ms", "error"}"""
-    port = free_port()
     chained = to_xray(own, "proxy")
     chained["streamSettings"]["sockopt"] = {"dialerProxy": "up"}
+    return xray_test([chained, to_xray(deco, "up")], xray, url, timeout)
+
+
+def xray_test(outbounds, xray, url, timeout=15):
+    """Run the panel's Xray with these outbounds ("proxy" = the one the request leaves through)
+    and fetch url through it. -> {"ok", "ms", "error"}"""
+    port = free_port()
     conf = {
         "log": {"loglevel": "warning"},
         "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks", "settings": {"udp": False}}],
-        "outbounds": [chained, to_xray(deco, "up")],
+        "outbounds": outbounds,
     }
     fd, path = tempfile.mkstemp(prefix="xui-chain-", suffix=".json")
     with os.fdopen(fd, "w") as f:
@@ -1611,8 +1725,8 @@ class Monitor:
     def quota_alerts(self, rt):
         """Low volume on an Iran server / this server with a quota (once per period)."""
         msgs = []
-        for e in live_entries(self.app, rt, []):
-            if e["kind"] not in ("main", "tunnel") or not e.get("quota_gb") or e.get("remaining") is None:
+        for e in live_routes(self.app, rt, []):
+            if e["kind"] not in ("direct", "tunnel") or not e.get("quota_gb") or e.get("remaining") is None:
                 continue
             total = e["quota_gb"] * GB_BYTES
             low = e["remaining"] < total * self.LOW_RATIO or e["remaining"] < self.LOW_BYTES
@@ -2895,6 +3009,8 @@ class Net:
         self.probes = {}    # sub id or "decos" -> last probe from Iran
         self.trials = {}    # "entry|exit" -> engine trial results
         self.tun_state = {}  # tunnel id -> {"fails", "down"} for the alerts
+        self.pings = {}     # sub id -> last ping of its configs from this server
+        self.ping_by_key = {}  # route key -> summary of that ping
 
     # -- storage
     def servers(self):
@@ -3239,44 +3355,34 @@ class Net:
 
     # -- user-experience probe from an Iran server
     def probe(self, server_id, sub, log):
+        """Every config of a user's subscription (or only the Decos' own configs) tested from an
+        Iran server: TCP connect, time to first byte and download speed, as a user there sees it."""
         srv = self.facts_ok(self.server(server_id))
         rt = self.app.rt
-        entries = []
-        if sub:
-            status, hdrs, body = http_get(rt["xui_sub_url"] + urllib.parse.quote(sub), connect=rt.get("xui_connect", ""))
-            if status != 200:
-                raise PanelError("ساب کاربر خوانده نشد")
-            own = label_configs(parse_nodes(split_lines(body)), rt)
-        else:
-            own = []
+        own = sub_configs(rt, sub)[0] if sub else []
         ups = UPSTREAMS.nodes()
-        main = label(rt, "label_main")
-        for n in own:
+        entries = []
+        for r in live_routes(self.app, rt, ups):
+            if r["skip"] or (sub and not (r["show"] or r["auto"])) or (not sub and r["kind"] != "own"):
+                continue
             try:
-                entries.append((len(entries), [to_xray(n, "proxy")], n["server"], n["port"], route_name(rt, n, len(own) == 1, main)))
-            except ValueError:
-                pass
-        for i, u, o in deco_options(rt, ups):
-            try:
-                hop = to_xray(u, "up")
+                items = route_items(r, own, rt)
             except ValueError:
                 continue
-            if o["chain"]:
-                for n in own:
-                    try:
-                        c = to_xray(n, "proxy")
-                        c["streamSettings"]["sockopt"] = {"dialerProxy": "up"}
-                        entries.append((len(entries), [c, hop], u["server"], u["port"], route_name(rt, n, len(own) == 1, o["chain_name"])))
-                    except ValueError:
-                        pass
-            entries.append((len(entries), [dict(hop, tag="proxy")], u["server"], u["port"], o["own_name"]))
+            for it in items[:2]:
+                try:
+                    chain = xray_chain(it, "proxy", ups)
+                except ValueError:
+                    continue
+                first = it["hops"][0] if it["hops"] else it["target"]
+                entries.append((len(entries), chain, first["server"], first["port"], it["name"], r["key"]))
         if not entries:
             raise PanelError("کانفیگی برای تست نیست")
         entries = entries[:12]
         log("تست %d مسیر از %s (هر کدام تا ۲۵ ثانیه)…" % (len(entries), srv["name"]))
-        script = probe_script([(i, ob, h, p) for i, ob, h, p, _ in entries], rt.get("probe_url") or "https://speed.cloudflare.com/__down?bytes=10000000")
+        script = probe_script([(i, ob, h, p) for i, ob, h, p, _, _ in entries], rt.get("probe_url") or "https://speed.cloudflare.com/__down?bytes=10000000")
         out = Remote(srv).check(script, 60 + 35 * len(entries), "probe")
-        rows = {i: {"name": nm, "server": h, "tcp_ms": None, "ttfb_ms": None, "mbps": None, "ok": False} for i, _, h, _, nm in entries}
+        rows = {i: {"name": nm, "key": key, "server": h, "tcp_ms": None, "ttfb_ms": None, "mbps": None, "ok": False} for i, _, h, _, nm, key in entries}
         for line in out.splitlines():
             m = re.match(r"R (\d+) (tcp|http)=(.*)", line)
             if not m:
@@ -3411,8 +3517,7 @@ def admin_state(app, host):
     panel = app.panel.overview()  # may connect automatically and reload the settings
     cfg, rt = app.cfg, app.rt
     ups = UPSTREAMS.nodes()
-    opts = {node_key(n): o for _, n, o in deco_options(cfg, ups)}
-    entries = entries_public(live_entries(app, cfg, ups))
+    rts = routes_public(live_routes(app, cfg, ups), app.net.ping_by_key)
     clients = read_clients(app.db_path)
     source = "db"
     if not clients and panel["ok"]:
@@ -3432,7 +3537,7 @@ def admin_state(app, host):
             "main_location": cfg.get("main_location", ""),
             "show_auto": cfg.get("show_auto", True), "show_main": cfg.get("show_main", True),
             "auto_mode": cfg.get("auto_mode") or "priority", "probe_url": cfg.get("probe_url", ""),
-            "show_deco_any": cfg.get("show_deco_any", True), "order_mode": cfg.get("order_mode") or "manual",
+            "order_mode": cfg.get("order_mode") or "manual",
             "skip_down": cfg.get("skip_down", True), "skip_exhausted": cfg.get("skip_exhausted", True),
             "user_page": cfg.get("user_page", True), "support_url": cfg.get("support_url", ""),
             "announce": cfg.get("announce", ""),
@@ -3448,8 +3553,10 @@ def admin_state(app, host):
             "panel_token_set": bool(cfg.get("panel_token")), "panel_pass_set": bool(cfg.get("panel_pass")),
             "panel_rt": rt.get("panel_url", ""), "xui_rt": rt.get("xui_sub_url", ""),
         },
-        "decos": [dict(d, nodes=[dict(x, opt=opts.get(x["key"])) for x in d["nodes"]]) for d in deco_lines(app)],
-        "entries": entries,
+        "decos": deco_lines(app),
+        "routes": rts,
+        "exits": exits_of(cfg, panel.get("nodes")),
+        "pings": app.net.pings,
         "monitor": {"last_run": int(app.monitor.last_run * 1000), "note": app.monitor.note,
                     "xray": bool(find_xray())},
         "panel": {k: panel[k] for k in ("configured", "ok", "error", "version")},
@@ -3493,8 +3600,8 @@ def net_state(app):
             "iran": [s["id"] for s in net.servers() if s.get("role") == "iran"]}
 
 
-SETTING_BOOLS = ("direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "show_main",
-                 "show_deco_any", "skip_down", "skip_exhausted")
+SETTING_BOOLS = ("direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
+                 "skip_exhausted")
 SETTING_TEXTS = {"title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("tg_token", "panel_token", "panel_pass")
@@ -3556,6 +3663,10 @@ def net_action(app, action, body, host, done, fail):
         if not combos:
             combos = [("direct", ""), ("backhaul", "tcpmux"), ("gost", "tls"), ("xray", "reality"), ("wireguard", ""), ("gre", "")]
         return job("مقایسه‌ی روش‌های تانل", lambda log: net.trial(str(body.get("entry", "")), str(body.get("exit", "")), combos, log))
+    if action == "route_test":
+        sub = str(body.get("sub", ""))
+        return job("تست کانفیگ‌ها از این سرور", lambda log: route_tests(app, sub, log))
+
     if action == "probe":
         return job("تست از ایران", lambda log: net.probe(str(body.get("server", "")), str(body.get("sub", "")), log))
     if action == "node_from_server":
@@ -3623,7 +3734,7 @@ def do_action(app, action, body, host):
                 return done("%s؛ %d inbound پیدا شد" % (note, len(p["inbounds"])))
             return fail(p["error"] or note)
 
-        if action == "entries_save":
+        if action == "routes_save":
             cfg = load_config()
             for k in ("show_auto", "direct_first", "skip_down", "skip_exhausted"):
                 if k in body:
@@ -3634,70 +3745,80 @@ def do_action(app, action, body, host):
                 cfg["order_mode"] = body["order_mode"]
             if "label_auto" in body:
                 cfg["label_auto"] = str(body["label_auto"] or "").strip()[:30] or DEFAULTS["label_auto"]
-            valid = {e["key"] for e in sub_entries(cfg, UPSTREAMS.nodes())}
-            stored = {k: v for k, v in (cfg.get("entries_cfg") or {}).items() if k in valid}
-            for pos, e in enumerate(body.get("entries") or []):
+            valid = {r["key"] for r in routes(cfg, UPSTREAMS.nodes())}
+            stored = {k: v for k, v in routes_store(cfg).items() if k in valid}
+            for pos, e in enumerate(body.get("routes") or []):
                 key = str(e.get("key", ""))
                 if key not in valid:
                     continue
-                price = e.get("price")
+                cur = dict(stored.get(key) or {})
                 try:
-                    price = None if price in (None, "") else max(0.0, float(price))
-                    quota = max(0.0, float(e.get("quota_gb") or 0))
-                    bill = min(max(int(e.get("bill_day") or 1), 1), 30)
+                    if "price" in e:
+                        cur["price"] = None if e["price"] in (None, "") else max(0.0, float(e["price"]))
+                    if "quota_gb" in e:
+                        cur["quota_gb"] = max(0.0, float(e["quota_gb"] or 0))
+                    if "bill_day" in e:
+                        cur["bill_day"] = min(max(int(e["bill_day"] or 1), 1), 30)
+                    cur["order"] = int(e.get("order", cur.get("order", pos)))
                 except (TypeError, ValueError):
                     return fail("قیمت، حجم یا روز شارژ عدد نیست")
-                stored[key] = {"name": str(e.get("name") or "").strip()[:40], "show": bool(e.get("show", True)),
-                               "auto": bool(e.get("auto", True)), "price": price,
-                               "unit": "gb" if e.get("unit") == "gb" else "month", "quota_gb": quota, "bill_day": bill,
-                               "count": "out" if e.get("count") == "out" else "in" if e.get("count") == "in" else "both",
-                               "order": int(e.get("order", pos))}
-                if key == "main":
-                    cfg["show_main"] = stored[key]["show"]
-                    cfg["label_main"] = stored[key]["name"] or DEFAULTS["label_main"]
-                if key == "chain_any":
-                    cfg["show_deco_any"] = stored[key]["show"]
-                    cfg["label_deco"] = stored[key]["name"] or DEFAULTS["label_deco"]
-            cfg["entries_cfg"] = stored
+                if "name" in e:
+                    cur["name"] = str(e["name"] or "").strip()[:40]
+                for k in ("show", "auto"):
+                    if k in e:
+                        cur[k] = bool(e[k])
+                if "unit" in e:
+                    cur["unit"] = "gb" if e["unit"] == "gb" else "month"
+                if "count" in e:
+                    cur["count"] = e["count"] if e["count"] in ("both", "out", "in") else "both"
+                stored[key] = cur
+                if key == "direct>main":
+                    cfg["show_main"] = cur.get("show", True)
+                    cfg["label_main"] = cur.get("name") or DEFAULTS["label_main"]
+            cfg["routes_cfg"] = stored
+            cfg.pop("entries_cfg", None)
+            cfg.pop("deco_opts", None)
             save_config(cfg)
             app.reload()
-            return done("ورودی‌های ساب ذخیره شد")
+            return done("مسیرها ذخیره شد")
 
-        if action == "sub_layout":
+        if action == "route_add":
             cfg = load_config()
-            for k in ("show_auto", "show_main", "show_deco_any", "direct_first"):
-                if k in body:
-                    cfg[k] = bool(body[k])
-            if body.get("auto_mode") in ("priority", "fastest"):
-                cfg["auto_mode"] = body["auto_mode"]
-            for k in ("label_main", "label_deco", "label_auto"):
-                if k in body:
-                    cfg[k] = str(body[k] or "").strip()[:30] or DEFAULTS[k]
-            stored = dict(cfg.get("deco_opts") or {})
-            for d in body.get("decos") or []:
-                key = str(d.get("key", ""))
-                if not key:
-                    continue
-                stored[key] = {"chain": bool(d.get("chain", True)), "own": bool(d.get("own", False)),
-                               "chain_auto": bool(d.get("chain_auto", True)), "own_auto": bool(d.get("own_auto", False)),
-                               "chain_name": str(d.get("chain_name") or "").strip()[:40],
-                               "own_name": str(d.get("own_name") or "").strip()[:60]}
-            current = {node_key(n) for n in UPSTREAMS.nodes()}
-            cfg["deco_opts"] = {k: v for k, v in stored.items() if k in current}  # forget removed Decos
-            ecfg = dict(cfg.get("entries_cfg") or {})
-            for key, o in cfg["deco_opts"].items():  # the same choices in the entries model
-                for kind in ("chain", "own"):
-                    cur = dict(ecfg.get("%s:%s" % (kind, key)) or {})
-                    cur.update({"show": o[kind], "auto": o[kind] and o[kind + "_auto"], "name": o[kind + "_name"]})
-                    ecfg["%s:%s" % (kind, key)] = cur
-            if "show_main" in body:
-                ecfg["main"] = dict(ecfg.get("main") or {}, show=cfg["show_main"])
-            if "label_main" in body:
-                ecfg["main"] = dict(ecfg.get("main") or {}, name=cfg["label_main"])
-            cfg["entries_cfg"] = ecfg
+            ups = {node_key(n) for n in UPSTREAMS.nodes()}
+            entry, via, exit_ = str(body.get("entry", "")), str(body.get("via", "") or ""), str(body.get("exit", "main"))
+            if not (entry.startswith("deco:") and entry[5:] in ups):
+                return fail("ورودی باید یکی از واسط‌ها باشد")
+            if via and not (via.startswith("deco:") and via[5:] in ups and via != entry):
+                return fail("واسط میانی درست نیست")
+            if exit_ != "self" and exit_ not in {e["id"] for e in exits_of(cfg)}:
+                return fail("خروجی درست نیست")
+            custom = list(cfg.get("routes_custom") or [])
+            if any(c["entry"] == entry and (c.get("via") or "") == via and c["exit"] == exit_ for c in custom):
+                return fail("این مسیر هست")
+            c = {"id": secrets.token_hex(3), "entry": entry, "via": via, "exit": exit_}
+            custom.append(c)
+            cfg["routes_custom"] = custom
+            name = str(body.get("name") or "").strip()[:40]
+            if name:
+                store = dict(routes_store(cfg))
+                store["custom:" + c["id"]] = {"name": name}
+                cfg["routes_cfg"] = store
             save_config(cfg)
             app.reload()
-            return done("محتوای ساب ذخیره شد")
+            return done("مسیر اضافه شد", key="custom:" + c["id"])
+
+        if action == "route_delete":
+            key = str(body.get("key", ""))
+            if not key.startswith("custom:"):
+                return fail("فقط مسیرهای دستی حذف می‌شوند؛ بقیه را خاموش کن")
+            cfg = load_config()
+            cfg["routes_custom"] = [c for c in (cfg.get("routes_custom") or []) if "custom:" + c["id"] != key]
+            store = dict(routes_store(cfg))
+            store.pop(key, None)
+            cfg["routes_cfg"] = store
+            save_config(cfg)
+            app.reload()
+            return done("مسیر حذف شد")
 
         if action.startswith("net_"):
             return net_action(app, action[4:], body, host, done, fail)
@@ -3836,182 +3957,139 @@ ADMIN_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
-<meta name="theme-color" content="#0a0f1d">
+<meta name="theme-color" content="#0b0c0f">
 <title>EZ-XUI</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css">
 <style>
-:root{--bg:#0b0d12;--bg2:#10131a;--card:#141821;--card2:#1a1f2a;--line:#232935;--fg:#eceff4;--mut:#8a93a3;--acc:#6d8cff;--acc2:#6d8cff;--ok:#2fd27a;--warn:#f0b43c;--bad:#f45b69;--okbg:rgba(47,210,122,.12);--warnbg:rgba(240,180,60,.13);--badbg:rgba(244,91,105,.12);--accbg:rgba(109,140,255,.14);--shadow:none;--r:16px;color-scheme:dark}
-:root[data-theme=light]{--bg:#f6f7fa;--bg2:#eef0f5;--card:#fff;--card2:#f3f4f8;--line:#e3e6ee;--fg:#14171f;--mut:#6b7384;--acc:#3b5bdb;--acc2:#3b5bdb;--okbg:rgba(47,210,122,.14);--accbg:rgba(59,91,219,.1);--shadow:none;color-scheme:light}
+:root{--bg:#0b0c0f;--bg2:#101217;--card:#121419;--line:#22252d;--line2:#2c3039;--fg:#e9eaef;--mut:#8a8f9b;--acc:#8ab4ff;--ok:#3ecf8e;--warn:#f2b63c;--bad:#ff6b6b;--okbg:rgba(62,207,142,.12);--warnbg:rgba(242,182,60,.12);--badbg:rgba(255,107,107,.12);--accbg:rgba(138,180,255,.13);--r:12px;color-scheme:dark}
+:root[data-theme=light]{--bg:#f6f6f7;--bg2:#fff;--card:#fff;--line:#e3e5e9;--line2:#d3d6dc;--fg:#15171c;--mut:#6b7079;--acc:#2f6fed;--okbg:rgba(62,207,142,.14);--accbg:rgba(47,111,237,.1);color-scheme:light}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;background:var(--bg);color:var(--fg)}
-body{font:15px/1.65 Vazirmatn,Tahoma,system-ui,sans-serif;min-height:100vh;background:var(--bg)}
-.mono{width:38px;height:38px;border-radius:11px;display:inline-grid;place-items:center;flex:none;font:800 13px/1 Vazirmatn,system-ui,sans-serif;letter-spacing:.3px;direction:ltr;color:hsl(var(--h) 70% 72%);background:hsl(var(--h) 45% 20%);border:1px solid hsl(var(--h) 40% 28%)}
-:root[data-theme=light] .mono{color:hsl(var(--h) 55% 32%);background:hsl(var(--h) 70% 93%);border-color:hsl(var(--h) 50% 85%)}
-.mono.acc{color:#fff;background:var(--acc);border-color:var(--acc)}
-.mono.sm{width:30px;height:30px;border-radius:9px;font-size:11.5px}
-.pill{font-size:11.5px;padding:1px 8px;border-radius:7px;background:var(--card2);border:1px solid var(--line)}.pill.ir{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,var(--line))}
-.seg.wide{display:flex;width:100%;margin:4px 0 10px}.seg.wide button{flex:1}
-.tbl{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px}.tbl th{text-align:right;color:var(--mut);font-weight:500;padding:6px 4px;border-bottom:1px solid var(--line)}.tbl td{padding:7px 4px;border-bottom:1px dashed var(--line);white-space:nowrap}.tbl td:first-child{white-space:normal}.tbl tr:last-child td{border:0}.tbl tr.best td{color:var(--ok);font-weight:700}.tbl tr.bad td{color:var(--mut)}
-.job{border-color:color-mix(in srgb,var(--acc) 40%,var(--line))}.jh{display:flex;align-items:center;gap:10px}.spin{width:14px;height:14px;border-radius:50%;border:2px solid var(--acc);border-left-color:transparent;animation:spin .8s linear infinite;flex:none}
-.ltr-auto{unicode-bidi:plaintext}
-.loc-chip.ok{color:var(--ok)}.loc-chip.no{color:var(--bad)}
-.note-card{background:var(--card2)}
+body{font:14.5px/1.6 Vazirmatn,Tahoma,system-ui,sans-serif;min-height:100vh}
 button,input,textarea,select{font:inherit;color:inherit}
-input,textarea,select{font-size:16px}/* no zoom on focus in iOS */
+input,textarea,select{font-size:16px}
 button{touch-action:manipulation}
-.i{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+a{color:var(--acc)}
+.i{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex:none}
 .ltr{direction:ltr;unicode-bidi:plaintext}.cmd{direction:ltr;unicode-bidi:isolate;white-space:nowrap;font-family:ui-monospace,Menlo,monospace;font-size:.92em}
-.mut{color:var(--mut)}.small{font-size:12.5px}
-.wrap{max-width:780px;margin:0 auto;padding:12px 16px calc(110px + env(safe-area-inset-bottom))}
-.fade{animation:fade .18s ease-out}
-select.in{appearance:none;-webkit-appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),linear-gradient(135deg,var(--mut) 50%,transparent 50%);background-position:16px 50%,11px 50%;background-size:5px 5px;background-repeat:no-repeat;padding-left:30px}
-.code{direction:ltr;text-align:left;background:var(--bg2);border:1px dashed var(--line);border-radius:12px;padding:10px 12px;font:13px/1.5 ui-monospace,Menlo,monospace;word-break:break-all;margin:8px 0}
-.step{display:flex;gap:10px;margin:14px 0 6px;align-items:center;font-weight:700}.step .n{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;background:var(--accbg);color:var(--acc);font-size:13px;flex:none}
-.locs{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.loc-chip{font-size:12px;padding:1px 8px;border-radius:8px;background:var(--card2);border:1px solid var(--line);color:var(--mut)}
-.lcard{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px;margin:10px 0}
-.lhead{display:flex;align-items:center;gap:10px}.lhead .t{flex:1;min-width:0}.lhead .t b{display:block;font-size:16px}.lhead .t small{color:var(--mut);direction:ltr;display:block;text-align:right;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.lmeta{display:flex;gap:12px;flex-wrap:wrap;font-size:12.5px;color:var(--mut);margin-top:8px}.lmeta span{display:inline-flex;align-items:center;gap:4px}.lmeta .i{width:15px;height:15px}
-.ib-head{font-size:13px;color:var(--mut);margin:12px 2px 2px;display:flex;align-items:center;gap:6px}.ib-head .i{width:16px;height:16px}
+.mut{color:var(--mut)}.small{font-size:12.5px}.xs{font-size:11.5px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+.wrap{max-width:760px;margin:0 auto;padding:8px 16px calc(96px + env(safe-area-inset-bottom))}
+.fade{animation:fade .18s ease-out}@keyframes fade{from{opacity:0}}
+/* monogram */
+.mono{width:34px;height:34px;border-radius:9px;display:inline-grid;place-items:center;flex:none;font:700 12px/1 Vazirmatn,system-ui,sans-serif;letter-spacing:.2px;direction:ltr;color:var(--mut);border:1px solid var(--line2);background:transparent}
+.mono.on{color:var(--acc);border-color:var(--acc)}.mono.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 60%,var(--line2))}.mono.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 60%,var(--line2))}
+.mono.lg{width:40px;height:40px;font-size:13px}
 /* header */
-.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 16px;padding-top:max(10px,env(safe-area-inset-top));background:var(--bg);background:color-mix(in srgb,var(--bg) 78%,transparent);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
-.top .inner{max-width:780px;margin:0 auto;width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px}
-.brand{display:flex;align-items:center;gap:10px;min-width:0}
-.logo{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;color:#fff;font:800 14px/1 Vazirmatn,system-ui,sans-serif;letter-spacing:.5px;direction:ltr;background:var(--acc)}
-.brand b{display:block;font-size:16px;line-height:1.2}.brand small{display:block;color:var(--mut);font-size:12px;direction:ltr;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:52vw}
-.hbtns{display:flex;gap:6px}
-.ibtn{width:40px;height:40px;border-radius:12px;border:1px solid var(--line);background:var(--card);display:grid;place-items:center;cursor:pointer;color:var(--fg)}
-.ibtn:active{transform:scale(.96)}
-/* bottom nav */
-.nav{position:fixed;bottom:0;left:0;right:0;z-index:20;padding:8px 12px max(8px,env(safe-area-inset-bottom));background:var(--bg);background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-top:1px solid var(--line)}
-.nav .inner{max-width:520px;margin:0 auto;display:grid;grid-template-columns:repeat(4,1fr);gap:4px}
-.nav button{border:0;background:none;color:var(--mut);display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 0;border-radius:14px;cursor:pointer;font-size:11.5px;white-space:nowrap;transition:background .15s,color .15s}
-.nav button.on{color:var(--acc);background:var(--accbg)}
-.nav .i{width:22px;height:22px}
-/* cards and blocks */
-.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin:12px 0;box-shadow:var(--shadow)}
-.card h2{font-size:16px;margin:0 0 4px;display:flex;align-items:center;gap:8px}
-.card h2 .i{color:var(--acc)}
+.top{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.top .inner{max-width:760px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 16px;padding-top:max(10px,env(safe-area-inset-top))}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}.brand b{display:block;font-size:15px;line-height:1.2}.brand small{display:block;color:var(--mut);font-size:11.5px;direction:ltr;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:50vw}
+.logo{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;font:800 12px/1 Vazirmatn,system-ui,sans-serif;direction:ltr;color:var(--bg);background:var(--fg)}
+.hbtns{display:flex;gap:4px}
+.ibtn{width:36px;height:36px;border-radius:9px;border:1px solid transparent;background:none;display:grid;place-items:center;cursor:pointer;color:var(--mut)}
+.ibtn:hover{border-color:var(--line)}.ibtn:active{transform:scale(.95)}
+/* nav */
+.nav{position:fixed;bottom:0;left:0;right:0;z-index:20;padding:6px 10px max(8px,env(safe-area-inset-bottom));background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-top:1px solid var(--line)}
+.nav .inner{max-width:480px;margin:0 auto;display:grid;grid-template-columns:repeat(4,1fr)}
+.nav button{border:0;background:none;color:var(--mut);display:flex;flex-direction:column;align-items:center;gap:3px;padding:6px 0 4px;cursor:pointer;font-size:11px}
+.nav button.on{color:var(--fg)}.nav .i{width:21px;height:21px}
+/* sections */
+.sec{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:22px 2px 8px}
+.sec h3{font-size:13px;margin:0;color:var(--mut);font-weight:600;letter-spacing:.2px}
+.sec .lnk{border:0;background:none;color:var(--acc);font-size:12.5px;cursor:pointer;padding:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;margin:10px 0}
+.card h2{font-size:15px;margin:0 0 6px;display:flex;align-items:center;gap:8px}
 .card p{margin:4px 0 10px}
-.sec-title{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:18px 2px 6px}
-.sec-title h3{font-size:15px;margin:0}
-.hero{position:relative;overflow:hidden;border-radius:var(--r);padding:18px;margin:12px 0;border:1px solid var(--line);background:var(--card)}
-.hero.okk{border-color:color-mix(in srgb,var(--ok) 45%,var(--line))}
-.hero.badd{border-color:color-mix(in srgb,var(--bad) 50%,var(--line))}
-.hero.warnn{border-color:color-mix(in srgb,var(--warn) 50%,var(--line))}
-.hero b{font-size:18px;display:block}.hero .mut{font-size:13px}
-.hero .big{position:absolute;left:14px;top:14px;opacity:.12}.hero .big .i{width:76px;height:76px}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
-@media(min-width:640px){.grid.g4{grid-template-columns:repeat(4,1fr)}}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:12px 14px}
-.stat .k{color:var(--mut);font-size:12.5px;display:flex;align-items:center;gap:6px}.stat .k .i{width:16px;height:16px}
-.stat .v{font-size:22px;font-weight:700;margin-top:2px}.stat .v small{font-size:13px;color:var(--mut);font-weight:500}
-.bar{height:8px;border-radius:99px;background:var(--card2);overflow:hidden;border:1px solid var(--line)}
-.bar i{display:block;height:100%;border-radius:99px;background:var(--acc);min-width:3px}
-.bar i.warn{background:var(--warn)}.bar i.bad{background:var(--bad)}
-.meter{margin:10px 0}.meter .row{display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px}
-.badge{display:inline-flex;align-items:center;gap:4px;font-size:12px;padding:2px 10px;border-radius:99px;white-space:nowrap;font-weight:600}
-.b-on{background:var(--okbg);color:var(--ok)}.b-off{background:var(--card2);color:var(--mut)}.b-exp,.b-full{background:var(--badbg);color:var(--bad)}.b-wait,.b-soon{background:var(--warnbg);color:var(--warn)}.b-acc{background:var(--accbg);color:var(--acc)}
-.dot{width:9px;height:9px;border-radius:50%;background:var(--line);display:inline-block;flex:none}.dot.on{background:var(--ok);box-shadow:0 0 0 4px var(--okbg)}
+.list{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:0 14px;margin:8px 0}
+.row{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--line);min-height:52px}
+.row:last-child{border-bottom:0}
+.row.btn-row{cursor:pointer}.row.btn-row:active{opacity:.7}
+.row .t{flex:1;min-width:0}.row .t b{display:block;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row .t small{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;color:var(--mut);font-size:12px;margin-top:1px;overflow:hidden;line-height:1.5}
+.row .r{display:flex;align-items:center;gap:8px;flex:none;font-size:12.5px;color:var(--mut)}
+.row.dim .t{opacity:.5}
+.arr{color:var(--line2);margin:0 3px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--line2);display:inline-block;flex:none}.dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}.dot.warn{background:var(--warn)}
+.tag{font-size:11px;padding:1px 7px;border-radius:6px;border:1px solid var(--line2);color:var(--mut);white-space:nowrap;direction:ltr}
+.tag.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 50%,var(--line2))}.tag.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 50%,var(--line2))}.tag.acc{color:var(--acc);border-color:color-mix(in srgb,var(--acc) 50%,var(--line2))}
+.hero{padding:18px 2px 6px}.hero h1{font-size:20px;margin:0 0 2px;font-weight:700}.hero .mut{font-size:13px}
+.stats{display:flex;gap:18px;margin:14px 2px 4px;flex-wrap:wrap}.stat .v{font-size:20px;font-weight:700;line-height:1.1}.stat .v small{font-size:12px;color:var(--mut);font-weight:500}.stat .k{font-size:11.5px;color:var(--mut)}
+.bar{height:5px;border-radius:99px;background:var(--line);overflow:hidden}.bar i{display:block;height:100%;border-radius:99px;background:var(--acc);min-width:3px}.bar i.warn{background:var(--warn)}.bar i.bad{background:var(--bad)}
+.meter{margin:8px 0 2px}.meter .rw{display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:4px}
+.kv{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:13.5px}.kv:last-child{border:0}
+.empty{text-align:center;padding:34px 12px;color:var(--mut)}.empty .i{width:38px;height:38px;opacity:.5}
+.err{color:var(--bad);font-size:12.5px;margin-top:6px}
+.note{font-size:12.5px;color:var(--mut);padding:8px 2px}
 /* buttons */
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:0;border-radius:12px;padding:11px 16px;cursor:pointer;font-weight:600;background:var(--acc);color:#fff;box-shadow:none;transition:transform .1s,opacity .2s,filter .15s;text-decoration:none}
-.btn:hover{filter:brightness(1.08)}
-.btn:active{transform:scale(.98)}.btn[disabled]{opacity:.55}
-.btn.ghost{background:var(--card2);color:var(--fg);border:1px solid var(--line);box-shadow:none}
-.btn.danger{background:var(--bad)}
-.btn.sm{padding:7px 12px;border-radius:12px;font-size:13.5px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid var(--fg);border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:600;background:var(--fg);color:var(--bg);transition:opacity .15s,transform .1s;text-decoration:none;font-size:14px}
+.btn:active{transform:scale(.98)}.btn[disabled]{opacity:.5}
+.btn.ghost{background:none;color:var(--fg);border-color:var(--line2)}
+.btn.danger{background:none;color:var(--bad);border-color:color-mix(in srgb,var(--bad) 50%,var(--line2))}
+.btn.sm{padding:7px 11px;font-size:13px;border-radius:9px}
 .btn.block{width:100%}
-.btn.busy{pointer-events:none;opacity:.7}.btn.busy::after{content:"";width:15px;height:15px;border-radius:50%;border:2px solid currentColor;border-left-color:transparent;animation:spin .7s linear infinite}
+.btn.busy{pointer-events:none;opacity:.7}.btn.busy::after{content:"";width:14px;height:14px;border-radius:50%;border:2px solid currentColor;border-left-color:transparent;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.row-btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.row-btns .btn{flex:1;white-space:nowrap}.row-btns .btn.icon{flex:0 0 auto;padding:11px 13px}
+.bar-btns{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 2px}.bar-btns .btn{flex:1;white-space:nowrap}.bar-btns .btn.icon{flex:0 0 auto;padding:10px 12px}
+.toolbar{display:flex;gap:8px;align-items:center;margin:10px 0 2px}
+.seg{display:flex;background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:3px;gap:2px;width:100%;margin:6px 0 10px}
+.seg button{flex:1;border:0;background:none;padding:6px 10px;border-radius:8px;cursor:pointer;font-size:13px;color:var(--mut)}
+.seg button.on{background:var(--card);color:var(--fg);box-shadow:0 0 0 1px var(--line2)}
+.chips{display:flex;gap:7px;overflow-x:auto;padding:4px 0 8px;scrollbar-width:none;flex-wrap:wrap}.chips.nowrap{flex-wrap:nowrap}.chips::-webkit-scrollbar{display:none}
+.chip{border:1px solid var(--line2);background:none;border-radius:99px;padding:5px 11px;white-space:nowrap;cursor:pointer;font-size:12.5px;color:var(--fg)}
+.chip.on{background:var(--fg);border-color:var(--fg);color:var(--bg)}
+.chip b{font-weight:700;opacity:.7;margin-inline-start:4px}
 /* forms */
 label.f{display:block;margin:10px 0}
-label.f>span{display:block;font-size:13px;color:var(--mut);margin-bottom:5px}
-.in,textarea.in{width:100%;background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:11px 12px;outline:none;transition:border .15s,box-shadow .15s}
-.in:focus{border-color:var(--acc);box-shadow:0 0 0 4px var(--accbg)}
-textarea.in{min-height:120px;font:14px/1.6 ui-monospace,Menlo,Consolas,monospace;direction:ltr}
+label.f>span{display:block;font-size:12.5px;color:var(--mut);margin-bottom:4px}
+.in,textarea.in{width:100%;background:var(--bg2);border:1px solid var(--line2);border-radius:10px;padding:10px 12px;outline:none;transition:border .15s}
+.in:focus{border-color:var(--fg)}
+textarea.in{min-height:110px;font:13.5px/1.6 ui-monospace,Menlo,Consolas,monospace;direction:ltr}
 .in.ltr{direction:ltr;text-align:left}
+select.in{appearance:none;-webkit-appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--mut) 50%),linear-gradient(135deg,var(--mut) 50%,transparent 50%);background-position:16px 50%,11px 50%;background-size:5px 5px;background-repeat:no-repeat;padding-left:30px}
 .cols{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.cols2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.hint{font-size:12.5px;color:var(--mut);margin-top:4px}
-.sw{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px dashed var(--line);cursor:pointer}
-.sw:last-child{border-bottom:0}
-.sw input{display:none}
-.sw .t{width:46px;height:28px;border-radius:99px;background:var(--card2);border:1px solid var(--line);position:relative;flex:none;transition:.2s}
-.sw .t::after{content:"";position:absolute;top:3px;right:3px;width:20px;height:20px;border-radius:50%;background:var(--mut);transition:.2s}
-.sw input:checked+.t{background:var(--acc);border-color:var(--acc)}
-.sw input:checked+.t::after{right:21px;background:#fff}
-.tg{flex:none;cursor:pointer;margin-top:9px}.tg input{display:none}
-.tg .t{display:block;width:46px;height:28px;border-radius:99px;background:var(--card2);border:1px solid var(--line);position:relative;transition:.2s}
-.tg .t::after{content:"";position:absolute;top:3px;right:3px;width:20px;height:20px;border-radius:50%;background:var(--mut);transition:.2s}
-.tg input:checked+.t{background:var(--acc);border-color:var(--acc)}.tg input:checked+.t::after{right:21px;background:#fff}
-.lrow{display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px dashed var(--line)}.lrow:last-child{border:0}
-.lrow .b{flex:1;min-width:0}.lrow .in{padding:9px 11px}.lrow.off .b{opacity:.55}
-.lgroup{margin:14px 0 2px;font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px}.lgroup .tag{font-size:11.5px;padding:1px 7px;border-radius:7px;background:var(--card2);border:1px solid var(--line);direction:ltr}
-.chips{display:flex;gap:8px;overflow-x:auto;padding:4px 0 8px;scrollbar-width:none}.chips::-webkit-scrollbar{display:none}
-.chip{border:1px solid var(--line);background:var(--card);border-radius:99px;padding:6px 12px;white-space:nowrap;cursor:pointer;font-size:13px;color:var(--fg)}
-.chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
-.chip b{font-weight:700;opacity:.8;margin-inline-start:4px}
-.check{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--line);border-radius:12px;margin:6px 0;cursor:pointer;background:var(--bg2)}
-.check input{width:18px;height:18px;accent-color:var(--acc)}
-.check.small-check{margin:-4px 0 8px;padding:7px 12px;font-size:13px;background:transparent}
-/* search */
-.search{position:relative;flex:1}.search .i{position:absolute;right:12px;top:50%;transform:translateY(-50%);color:var(--mut)}
-.search .in{padding-right:40px}
-.toolbar{display:flex;gap:8px;align-items:center;margin:12px 0 4px}
-/* user cards */
-.ucard{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px;margin:10px 0}
-.uhead{display:flex;justify-content:space-between;align-items:center;gap:10px}
-.uname{display:flex;align-items:center;gap:8px;min-width:0}.uname b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:ltr}
-.umeta{display:flex;justify-content:space-between;gap:8px;font-size:13px;color:var(--mut);margin-top:6px}
-.ucard .bar{margin-top:10px}
-.uacts{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;margin-top:12px}
-.uacts button{display:flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line);background:var(--card2);border-radius:12px;padding:8px 10px;cursor:pointer;font-size:13.5px;color:var(--fg)}
-.uacts button:active{transform:scale(.98)}
-.empty{text-align:center;padding:38px 12px;color:var(--mut)}.empty .i{width:46px;height:46px;opacity:.5}
-/* decos */
-.dcard{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px;margin:10px 0}
-.dhead{display:flex;gap:10px;align-items:center}
-.prio{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;font-weight:800;background:var(--accbg);color:var(--acc);flex:none}
-.dtitle{flex:1;min-width:0}.dtitle b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dtitle small{color:var(--mut);font-size:12px}
-.dacts{display:flex;gap:4px}.dacts button{width:34px;height:34px;border-radius:10px;border:1px solid var(--line);background:var(--card2);display:grid;place-items:center;cursor:pointer;color:var(--fg)}
-.dacts button[disabled]{opacity:.35}.dacts .i{width:17px;height:17px}
-.ecard{border:1px solid var(--line);border-radius:14px;padding:10px 12px;margin:8px 0;background:var(--bg2)}.ecard.skip{border-style:dashed}
-.ehead{display:flex;gap:10px;align-items:flex-start}.ehead .t{flex:1;min-width:0}.ehead .t small{display:block;color:var(--mut);font-size:12px;margin-top:4px;line-height:1.5}
-.ehead .ename{padding:7px 10px;font-weight:600}.ecard .meter{margin:8px 0 0}
-.eflags{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px}.eflags .check{margin:0;padding:5px 10px;font-size:12.5px}.eflags .badge{margin-inline-start:auto}
-.eprice summary{cursor:pointer;font-size:12.5px;color:var(--mut);padding:7px 0 2px;list-style:none}.eprice summary::-webkit-details-marker{display:none}
-.eprice summary::before{content:"▸ ";font-size:11px}.eprice[open] summary::before{content:"▾ "}.eprice label.f{margin:6px 0}.eprice .cols2{gap:6px}
-.node{display:flex;align-items:center;gap:8px;padding:9px 0 0;margin-top:9px;border-top:1px dashed var(--line);font-size:13.5px;flex-wrap:wrap}
-.node .tag{font-weight:700;font-size:12px;padding:1px 8px;border-radius:8px;background:var(--card2);border:1px solid var(--line);direction:ltr}
-.node .nn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.st-ok{color:var(--ok)}.st-bad{color:var(--bad)}.st-mut{color:var(--mut)}
-.err{color:var(--bad);font-size:13px;margin-top:6px}
+.hint{font-size:12px;color:var(--mut);margin-top:4px}
+.sw{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line);cursor:pointer}
+.sw:last-child{border-bottom:0}.sw input{display:none}
+.sw .t{width:42px;height:26px;border-radius:99px;background:var(--line);position:relative;flex:none;transition:.2s}
+.sw .t::after{content:"";position:absolute;top:3px;right:3px;width:20px;height:20px;border-radius:50%;background:var(--card);transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.3)}
+.sw input:checked+.t{background:var(--fg)}.sw input:checked+.t::after{right:19px;background:var(--bg)}
+.check{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--line);border-radius:10px;margin:6px 0;cursor:pointer;background:var(--bg2)}
+.check input{width:17px;height:17px;accent-color:var(--fg)}
+.step{display:flex;gap:10px;margin:14px 0 6px;align-items:center;font-weight:600;font-size:13.5px}.step .n{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;border:1px solid var(--line2);color:var(--mut);font-size:12px;flex:none}
+.code{direction:ltr;text-align:left;background:var(--bg2);border:1px dashed var(--line2);border-radius:10px;padding:10px 12px;font:12.5px/1.5 ui-monospace,Menlo,monospace;word-break:break-all;margin:8px 0}
+.search{position:relative;flex:1}.search .i{position:absolute;right:12px;top:50%;transform:translateY(-50%);color:var(--mut)}.search .in{padding-right:38px}
+/* users */
+.u .bar{margin-top:9px}
+.umeta{display:flex;justify-content:space-between;gap:8px;font-size:12.5px;color:var(--mut);margin-top:6px}
+.uacts{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;margin-top:10px}
+.uacts button{display:flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line2);background:none;border-radius:9px;padding:7px 10px;cursor:pointer;font-size:13px;color:var(--fg)}
+.ucard{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:13px 14px;margin:8px 0}
+.uhead{display:flex;justify-content:space-between;align-items:center;gap:10px}.uname{display:flex;align-items:center;gap:9px;min-width:0}.uname b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:ltr}
+/* chain */
+.chain{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12.5px;margin:8px 0}.chain .node{border:1px solid var(--line2);border-radius:8px;padding:3px 9px;display:inline-flex;align-items:center;gap:6px}.chain .node.me{border-color:var(--fg)}.chain .node small{color:var(--mut);font-size:11px;direction:ltr}
+.job{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px dashed var(--line2);border-radius:10px;margin:8px 0;font-size:13px}.spin{width:13px;height:13px;border-radius:50%;border:2px solid var(--fg);border-left-color:transparent;animation:spin .8s linear infinite;flex:none}
+.tbl{width:100%;border-collapse:collapse;margin-top:6px;font-size:12.5px}.tbl th{text-align:right;color:var(--mut);font-weight:500;padding:6px 4px;border-bottom:1px solid var(--line)}.tbl td{padding:7px 4px;border-bottom:1px solid var(--line);white-space:nowrap}.tbl td:first-child{white-space:normal}.tbl tr:last-child td{border:0}.tbl tr.best td{color:var(--ok);font-weight:600}.tbl tr.off td{color:var(--mut)}
+.move{display:flex;gap:4px}.move button{width:34px;height:34px;border-radius:9px;border:1px solid var(--line2);background:none;display:grid;place-items:center;cursor:pointer;color:var(--fg)}.move button[disabled]{opacity:.3}.move .i{width:16px;height:16px}
 /* sheet */
-.ov{position:fixed;inset:0;z-index:50;background:rgba(5,8,18,.55);backdrop-filter:blur(3px);display:flex;align-items:flex-end;justify-content:center;animation:fade .15s}
-.sheet{width:100%;max-width:560px;max-height:92vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:20px 20px 0 0;padding:8px 16px max(18px,env(safe-area-inset-bottom));animation:up .22s ease-out}
-@media(min-width:700px){.ov{align-items:center}.sheet{border-radius:24px}}
-.grab{width:42px;height:5px;border-radius:9px;background:var(--line);margin:4px auto 10px}
-.sheet h3{margin:0 0 4px;font-size:17px;display:flex;align-items:center;gap:8px}
-@keyframes up{from{transform:translateY(40px);opacity:.4}}@keyframes fade{from{opacity:0}}
-.linkbox{direction:ltr;text-align:left;background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:10px 12px;font:13px/1.5 ui-monospace,Menlo,monospace;word-break:break-all;margin:10px 0}
-.qr{background:#fff;border-radius:16px;padding:14px;width:max-content;margin:12px auto;min-height:60px}
-.qr img,.qr canvas{display:block}
-.menu button{width:100%;display:flex;align-items:center;gap:12px;border:0;background:none;padding:13px 6px;border-bottom:1px solid var(--line);cursor:pointer;font-size:15px;color:var(--fg);text-align:right}
+.ov{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.5);display:flex;align-items:flex-end;justify-content:center;animation:fade .15s}
+.sheet{width:100%;max-width:560px;max-height:92vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:18px 18px 0 0;padding:6px 16px max(18px,env(safe-area-inset-bottom));animation:up .2s ease-out}
+@media(min-width:700px){.ov{align-items:center}.sheet{border-radius:18px}}
+.grab{width:36px;height:4px;border-radius:9px;background:var(--line2);margin:6px auto 12px}
+.sheet h3{margin:0 0 4px;font-size:16px;display:flex;align-items:center;gap:8px}
+@keyframes up{from{transform:translateY(30px);opacity:.5}}
+.linkbox{direction:ltr;text-align:left;background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font:12.5px/1.5 ui-monospace,Menlo,monospace;word-break:break-all;margin:10px 0}
+.qr{background:#fff;border-radius:14px;padding:12px;width:max-content;margin:12px auto;min-height:60px}.qr img,.qr canvas{display:block}
+.menu button{width:100%;display:flex;align-items:center;gap:12px;border:0;background:none;padding:12px 4px;border-bottom:1px solid var(--line);cursor:pointer;font-size:14.5px;color:var(--fg);text-align:right}
 .menu button:last-child{border-bottom:0}.menu .danger{color:var(--bad)}
 /* toast */
 #toasts{position:fixed;top:max(12px,env(safe-area-inset-top));left:0;right:0;z-index:80;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none;padding:0 16px}
-.toast{pointer-events:auto;max-width:520px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 14px;box-shadow:0 10px 30px rgba(0,0,0,.25);display:flex;gap:10px;align-items:center;animation:up .2s}
-.toast.ok .i{color:var(--ok)}.toast.bad .i{color:var(--bad)}
+.toast{pointer-events:auto;max-width:520px;background:var(--fg);color:var(--bg);border-radius:10px;padding:9px 14px;display:flex;gap:10px;align-items:center;animation:up .2s;font-size:13.5px}
+.toast.bad{background:var(--bad);color:#fff}
 /* auth */
-.auth{min-height:100vh;display:grid;place-items:center;padding:24px 16px}
-.auth .box{width:100%;max-width:380px;text-align:center}
-.auth .logo{width:68px;height:68px;border-radius:22px;margin:0 auto 14px;font-size:24px}
-.auth h1{font-size:22px;margin:0 0 4px}
-.auth form{margin-top:18px;text-align:right}
-.skel{height:90px;border-radius:18px;background:linear-gradient(90deg,var(--card),var(--card2),var(--card));background-size:200% 100%;animation:sk 1.2s infinite;margin:12px 0}
+.auth{min-height:100vh;display:grid;place-items:center;padding:24px 16px}.auth .box{width:100%;max-width:360px;text-align:center}
+.auth .logo{width:56px;height:56px;border-radius:16px;margin:0 auto 14px;font-size:18px}.auth h1{font-size:20px;margin:0 0 4px}.auth form{margin-top:16px;text-align:right}
+.skel{height:70px;border-radius:12px;background:linear-gradient(90deg,var(--card),var(--bg2),var(--card));background-size:200% 100%;animation:sk 1.2s infinite;margin:10px 0}
 @keyframes sk{to{background-position:-200% 0}}
-details summary{padding:6px 0;font-size:14px}details[open] summary{margin-bottom:4px}
-.kv{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px dashed var(--line);font-size:14px}.kv:last-child{border:0}
-.list-mini .it{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 0;border-bottom:1px dashed var(--line);cursor:pointer}.list-mini .it:last-child{border:0}
+details summary{padding:6px 0;font-size:13.5px;cursor:pointer;color:var(--mut)}details[open] summary{margin-bottom:4px}
 </style>
 </head>
 <body>
@@ -4023,6 +4101,7 @@ details summary{padding:6px 0;font-size:14px}details[open] summary{margin-bottom
 const I={
 home:"M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z",
 users:"M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75",
+route:"M4 19h4a4 4 0 0 0 4-4V9a4 4 0 0 1 4-4h4M4 19l3-3M4 19l3 3M20 5l-3-3M20 5l-3 3",
 link:"M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71",
 sliders:"M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6",
 plus:"M12 5v14M5 12h14",copy:"M9 9h11v11H9zM5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1",
@@ -4037,7 +4116,9 @@ bell:"M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0",lock
 globe:"M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20",
 zap:"M13 2 3 14h9l-1 8 10-12h-9z",alert:"M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z",
 qr:"M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h3v3h-3zM20 14v.01M14 20h.01M17 20h4v-3",info:"M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 16v-4M12 8h.01",
-text:"M4 6h16M4 12h16M4 18h10",chart:"M3 3v18h18M7 15v3M12 10v8M17 6v12",clock:"M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2"
+text:"M4 6h16M4 12h16M4 18h10",chart:"M3 3v18h18M7 15v3M12 10v8M17 6v12",clock:"M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2",
+wifi:"M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0M12 20h.01M2 9a14 14 0 0 1 20 0",
+in:"M12 3v12M7 10l5 5 5-5M4 21h16",out:"M12 21V9M7 14l5-5 5 5M4 3h16",
 };
 const ic=(n,c="")=>`<svg class="i ${c}" viewBox="0 0 24 24" aria-hidden="true"><path d="${I[n]}"/></svg>`;
 const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
@@ -4046,11 +4127,16 @@ const fa=n=>String(n).replace(/\d/g,d=>"۰۱۲۳۴۵۶۷۸۹"[d]);
 const GB=1024**3;
 const num=(v,d=1)=>fa((+v).toFixed(d).replace(/\.0+$/,"").replace(/(\.\d*?)0+$/,"$1"));
 const gb=b=>num(b/GB,b/GB<10?2:1);
-const S={state:null,auth:null,tab:"home",filter:"all",q:"",theme:"auto"};
-try{S.tab=localStorage.getItem("xc_tab")||"home";S.theme=localStorage.getItem("xc_theme")||"auto"}catch(e){}
+const toman=v=>v==null||v===""?"—":fa(Math.round(+v).toLocaleString("en-US"));
+const ms_=v=>v==null||v<0?"—":fa(v)+"ms";
+const mb=v=>v==null||v<0?"—":fa(v>=100?Math.round(v):(+v).toFixed(1))+" Mb";
+const S={state:null,auth:null,tab:"home",seg:"routes",filter:"all",q:"",theme:"auto"};
+try{S.tab=localStorage.getItem("xc_tab")||"home";S.theme=localStorage.getItem("xc_theme")||"auto";S.seg=localStorage.getItem("xc_seg")||"routes"}catch(e){}
+if(!["home","routes","users","settings"].includes(S.tab))S.tab="home";
+if(!["routes","entries","exits"].includes(S.seg))S.seg="routes";
 
 /* theme */
-function applyTheme(){const dark=S.theme==="dark"||(S.theme==="auto"&&!matchMedia("(prefers-color-scheme: light)").matches);document.documentElement.dataset.theme=dark?"dark":"light";$('meta[name=theme-color]').content=dark?"#0a0f1d":"#f2f5fb";return dark}
+function applyTheme(){const dark=S.theme==="dark"||(S.theme==="auto"&&!matchMedia("(prefers-color-scheme: light)").matches);document.documentElement.dataset.theme=dark?"dark":"light";$('meta[name=theme-color]').content=dark?"#0b0c0f":"#f6f6f7";return dark}
 applyTheme();matchMedia("(prefers-color-scheme: light)").addEventListener("change",()=>{applyTheme();if(S.state)render()});
 
 /* toast */
@@ -4091,17 +4177,19 @@ function ustat(u){
   if((u.expiry>0&&u.expiry-now<3*864e5)||(u.total>0&&u.used/u.total>=.9))return["soon","رو به پایان"];
   return["on","فعال"];
 }
+const STAT_CLS={on:"ok",soon:"warn",wait:"",off:"",exp:"bad",full:"bad"};
 function daysText(u){
   if(u.expiry===0)return "بدون محدودیت زمان";
   if(u.expiry<0)return fa(Math.round(-u.expiry/864e5))+" روز از اولین اتصال";
   const d=(u.expiry-S.state.now)/864e5;
   return d<=0?"منقضی شده":d<1?"کمتر از یک روز":fa(Math.ceil(d))+" روز مانده";
 }
-const usage=u=>u.total?gb(u.used)+" از "+gb(u.total)+" GB":gb(u.used)+" GB، حجم نامحدود";
+const usage=u=>u.total?gb(u.used)+" از "+gb(u.total)+" GB":gb(u.used)+" GB، نامحدود";
 const pct=(a,b)=>b>0?Math.min(100,Math.round(a*100/b)):0;
 const barCls=p=>p>=95?"bad":p>=80?"warn":"";
 const sw=(name,checked,title,hint="")=>`<label class="sw"><div><div>${title}</div>${hint?`<div class="hint">${hint}</div>`:""}</div><input type="checkbox" name="${name}" ${checked?"checked":""}><span class="t"></span></label>`;
 const field=(name,title,value="",attrs="",hint="")=>`<label class="f"><span>${title}</span><input name="${name}" value="${esc(value)}" ${attrs.includes("class=")?attrs:'class="in" '+attrs}>${hint?`<div class="hint">${hint}</div>`:""}</label>`;
+const mono=(text,cls="",lg=false)=>`<span class="mono ${cls} ${lg?"lg":""}">${esc([...String(text)].slice(0,3).join(""))}</span>`;
 
 /* sheet */
 let sheetHist=false,ignorePop=false;
@@ -4121,20 +4209,20 @@ document.addEventListener("keydown",e=>{if(e.key==="Escape")closeSheet()});
 function confirmSheet(title,text,okLabel,danger){
   return new Promise(res=>{
     let done=false;const finish=v=>{if(!done){done=true;res(v)}};
-    sheet(`<h3>${ic(danger?"alert":"info")} ${title}</h3><p class="mut">${text}</p><div class="row-btns"><button class="btn ghost" data-r="0">انصراف</button><button class="btn ${danger?"danger":""}" data-r="1">${okLabel}</button></div>`,
+    sheet(`<h3>${title}</h3><p class="mut">${text}</p><div class="bar-btns"><button class="btn ghost" data-r="0">انصراف</button><button class="btn ${danger?"danger":""}" data-r="1">${okLabel}</button></div>`,
       el=>{$$("[data-r]",el).forEach(b=>b.onclick=()=>{closeSheet();finish(b.dataset.r==="1")});new MutationObserver((m,o)=>{if(!document.body.contains(el)){o.disconnect();finish(false)}}).observe(document.body,{childList:true})});
   });
 }
 
-/* auth screens */
+/* auth */
 function authView(){
   const setup=S.auth==="setup";
   return `<div class="auth"><div class="box"><div class="logo">EZ</div><h1>EZ-XUI</h1>
-  <div class="mut">${setup?"اولین ورود: یه رمز برای پنل بذار":"برای ورود رمز پنل رو بزن"}</div>
+  <div class="mut small">${setup?"اولین ورود: یه رمز برای پنل بذار":"رمز پنل"}</div>
   <form id="authf" class="card">
   <label class="f"><span>رمز</span><input class="in ltr" type="password" name="password" autocomplete="${setup?"new-password":"current-password"}" required minlength="${setup?6:1}" autofocus></label>
-  ${setup?`<label class="f"><span>تکرار رمز</span><input class="in ltr" type="password" name="password2" autocomplete="new-password" required></label><div class="hint">حداقل ۶ کاراکتر. اگه یادت رفت، روی سرور بزن: <span class="cmd">ez-xui password</span></div>`:""}
-  <button class="btn block" style="margin-top:12px">${ic(setup?"shield":"lock")} ${setup?"ذخیره و ورود":"ورود"}</button></form></div></div>`;
+  ${setup?`<label class="f"><span>تکرار رمز</span><input class="in ltr" type="password" name="password2" autocomplete="new-password" required></label><div class="hint">حداقل ۶ کاراکتر. اگه یادت رفت، روی سرور: <span class="cmd">ez-xui password</span></div>`:""}
+  <button class="btn block" style="margin-top:12px">${setup?"ذخیره و ورود":"ورود"}</button></form></div></div>`;
 }
 function bindAuth(){
   const f=$("#authf");if(!f)return;
@@ -4148,9 +4236,8 @@ function bindAuth(){
 }
 
 /* layout */
-const TABS=[["home","home","خانه"],["users","users","کاربرها"],["net","globe","شبکه"],["settings","sliders","تنظیمات"]];
-const TAB_ALIAS={locations:["net","locations"],decos:["net","decos"]};
-if(TAB_ALIAS[S.tab])S.tab="net";
+const TABS=[["home","home","خانه"],["routes","route","مسیرها"],["users","users","کاربرها"],["settings","sliders","تنظیمات"]];
+const VIEWS={};
 function render(){
   const app=$("#app");
   if(!S.state){app.innerHTML=S.auth?authView():`<div class="wrap"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>`;bindAuth();return}
@@ -4164,44 +4251,398 @@ function render(){
   if(S.tab==="users"){renderUserList();if(keepQ){const q=$("#q");q.focus();q.setSelectionRange(q.value.length,q.value.length)}}
 }
 
-/* home */
-function decoSummary(){
-  const nodes=S.state.decos.flatMap(d=>d.nodes);const tested=nodes.filter(n=>n.status&&n.status.ok!==null);
-  return{nodes,ok:tested.filter(n=>n.status.ok).length,tested:tested.length};
+/* routes: shared bits */
+const lab=()=>S.state.settings.label_deco;
+const KIND={direct:["⌂","مستقیم"],tunnel:["IR","سرور ایران"],deco:["D","از واسط"],own:["C","کانفیگ واسط"],custom:["D2","دو واسط"]};
+const routeMono=(r,lg)=>mono(r.kind==="deco"?"D"+r.idx:r.kind==="own"?"C"+r.idx:KIND[r.kind][0],r.down||r.exhausted?"bad":r.skip||!(r.show||r.auto)?"":r.kind==="direct"?"on":"",lg);
+function hopName(h){if(!h)return "";if(h.type==="direct")return "مستقیم";if(h.type==="server")return h.name;return h.idx?lab()+fa(h.idx):h.name}
+function chainText(r){
+  const parts=[hopName(r.entry)];
+  if(r.kind==="tunnel")parts.push("تانل");
+  if(r.via)parts.push(hopName(r.via));
+  parts.push(r.exit.id==="self"?"خروجی خودش":r.exit.name);
+  return parts.map(esc).join('<span class="arr">←</span>');
 }
-const VIEWS={};
+function chainChips(r){
+  const n=(t,sub,me)=>`<span class="node ${me?"me":""}">${esc(t)}${sub?`<small>${esc(sub)}</small>`:""}</span>`;
+  const out=[];
+  const e=r.entry;
+  out.push(e.type==="direct"?n("مستقیم","",true):e.type==="server"?n(e.name,e.ip):n(lab()+fa(e.idx),e.name));
+  if(r.kind==="tunnel")out.push(n("تانل",r.tunnel?r.tunnel.engine+(r.tunnel.transport?" "+r.tunnel.transport:""):""));
+  if(r.via)out.push(n(r.via.idx?lab()+fa(r.via.idx):"واسط",r.via.name));
+  out.push(r.exit.id==="self"?n("خروجی خودش",""):n(r.exit.name,"",true));
+  return `<div class="chain">${out.join('<span class="arr">←</span>')}</div>`;
+}
+function iranPing(r){const ps=Object.values(S.state.net.probes||{}).sort((a,b)=>b.at-a.at);for(const p of ps){const row=p.rows.find(x=>x.key===r.key);if(row)return row}return null}
+function pingText(r){
+  const p=r.ping,ir=iranPing(r);
+  const a=p?(p.ok?`<span class="ok">${ms_(p.ms)}</span>`:`<span class="bad">قطع</span>`):"";
+  const b=ir?(ir.ok?`ایران ${ms_(ir.ttfb_ms)}`:`<span class="bad">ایران قطع</span>`):"";
+  return [a,b].filter(Boolean).join(" · ");
+}
+const routeDot=r=>`<span class="dot ${r.down||r.exhausted?"bad":!(r.show||r.auto)?"":r.ping&&r.ping.ok===false?"warn":"ok"}"></span>`;
+function routeRow(r,i){
+  const vol=r.remaining!=null?`<span class="${r.exhausted?"bad":""}">${gb(r.remaining)} GB مانده</span>`:r.used!=null&&r.kind!=="direct"?`${gb(r.used)} GB`:"";
+  const state=r.down?`<span class="tag bad">قطع</span>`:r.exhausted?`<span class="tag bad">حجم تموم</span>`:!(r.show||r.auto)?`<span class="tag">خاموش</span>`:!r.show?`<span class="tag">فقط خودکار</span>`:"";
+  return `<div class="row btn-row ${r.skip||!(r.show||r.auto)?"dim":""}" data-act="route" data-key="${esc(r.key)}">${routeMono(r)}
+  <div class="t"><b>${i!=null?`<span class="mut xs">${fa(i+1)}</span> `:""}${esc(r.name)}</b><small>${chainText(r)}${r.cost?` · ≈ ${toman(r.cost)} ت/GB`:""}</small></div>
+  <div class="r"><span>${[pingText(r),vol].filter(Boolean).join(" · ")||state}</span>${state&&(pingText(r)||vol)?state:""}${routeDot(r)}</div></div>`;
+}
+const routeBy=key=>(S.state.routes||[]).find(r=>r.key===key);
+const activeRoutes=()=>(S.state.routes||[]).filter(r=>r.show||r.auto);
+
+/* home */
 VIEWS.home=()=>{
-  const st=S.state,users=st.users,ds=decoSummary();
+  const st=S.state,users=st.users;
   const active=users.filter(u=>["on","soon"].includes(ustat(u)[0])).length;
   const online=users.filter(u=>u.online).length;
-  const used=users.reduce((a,u)=>a+u.used,0);
-  let hero;
-  if(!ds.nodes.length)hero=["warnn","alert","هنوز Decoای نداری","کاربرها فقط مستقیم وصل می‌شن. اگه آی‌پی سرور فیلتر بشه قطع می‌شن."];
-  else if(!ds.tested)hero=["","clock","Decoها هنوز تست نشده‌اند","چند لحظه‌ی دیگه تست خودکار انجام می‌شه."];
-  else if(ds.ok)hero=["okk","shield","زنجیره آماده‌ست",fa(ds.ok)+" از "+fa(ds.tested)+" Deco سالم، آخرین تست "+ago(st.monitor.last_run)];
-  else hero=["badd","alert","همه‌ی Decoها قطع‌اند","اگه آی‌پی سرور فیلتر بشه کاربرها وصل نمی‌شن. یه Deco سالم اضافه کن."];
+  const rts=activeRoutes(),okR=rts.filter(r=>!r.skip).length;
+  const down=rts.filter(r=>r.down),ex=rts.filter(r=>r.exhausted);
+  let line;
+  if(!rts.length)line=["bad","هیچ مسیری فعال نیست."];
+  else if(rts.length===1)line=["warn","کاربرها فقط یک مسیر دارن. با یه سرور ایران یا یه واسط، قطعی آی‌پی دیگه اثری نداره."];
+  else if(down.length)line=["warn",`${fa(down.length)} مسیر قطع: ${down.map(r=>esc(r.name)).join("، ")}. کاربرها از مسیرهای بعدی می‌رن.`];
+  else if(ex.length)line=["warn",`حجم ${ex.map(r=>esc(r.name)).join("، ")} تموم شده.`];
+  else line=["ok",`${fa(okR)} مسیر سالم. آخرین تست ${ago(st.monitor.last_run)}.`];
   const sv=st.server;const load=sv.load!=null?pct(sv.load,sv.cpus):null;
-  const attention=users.filter(u=>["soon","exp","full"].includes(ustat(u)[0])).slice(0,6);
-  return `<div class="hero ${hero[0]}"><span class="big">${ic(hero[1])}</span><b>${hero[2]}</b><div class="mut">${hero[3]}</div>
-   <div class="row-btns" style="max-width:420px"><button class="btn sm" data-act="add-user">${ic("plus")} کاربر جدید</button><button class="btn sm ghost" data-act="test">${ic("refresh")} تست Decoها</button></div></div>
-  <div class="grid g4">
-   <div class="stat"><div class="k">${ic("users")} کاربر فعال</div><div class="v">${fa(active)} <small>از ${fa(users.length)}</small></div></div>
-   <div class="stat"><div class="k">${ic("zap")} آنلاین</div><div class="v">${st.panel.ok?fa(online):"—"}</div></div>
-   <div class="stat"><div class="k">${ic("link")} Deco سالم</div><div class="v">${fa(ds.ok)} <small>از ${fa(ds.nodes.length)}</small></div></div>
-   ${multiLoc()?`<div class="stat"><div class="k">${ic("globe")} لوکیشن آنلاین</div><div class="v">${fa(st.locations.filter(l=>l.main||l.status==="online").length)} <small>از ${fa(st.locations.length)}</small></div></div>`:`<div class="stat"><div class="k">${ic("globe")} مصرف کل</div><div class="v">${gb(used)} <small>GB</small></div></div>`}
-  </div>
-  ${!st.panel.configured?`<div class="card"><h2>${ic("info")} پنل 3x-ui وصل نیست</h2><p class="mut">${st.settings.panel_auto&&st.settings.auto_note?esc(st.settings.auto_note):"برای ساخت و مدیریت کاربر از همین‌جا، پنل رو در تنظیمات وصل کن."}</p><button class="btn sm" data-act="goto-panel">رفتن به تنظیمات پنل</button></div>`:""}
-  ${attention.length?`<div class="sec-title"><h3>نیاز به تمدید</h3><button class="btn sm ghost" data-act="tab" data-tab="users">همه</button></div><div class="card list-mini">${attention.map(u=>{const s=ustat(u);return `<div class="it" data-act="edit" data-sub="${esc(u.sub)}"><span class="ltr"><b>${esc(u.name)}</b></span><span class="badge b-${s[0]}">${s[0]==="soon"?daysText(u):s[1]}</span></div>`}).join("")}</div>`:""}
-  ${(st.entries||[]).filter(e=>e.show||e.auto).length>1?`<div class="sec-title"><h3>ورودی‌های ساب</h3><button class="btn sm ghost" data-act="layout">${ic("edit")} ترتیب و قیمت</button></div><div class="card list-mini">${st.entries.filter(e=>e.show||e.auto).map((e,i)=>`<div class="it" data-act="layout"><span style="display:flex;align-items:center;gap:8px"><span class="mut small">${fa(i+1)}</span><span><b>${esc(e.name)}</b>${e.cost!=null?` <span class="mut small">≈ ${toman(e.cost)} ت/GB</span>`:""}</span></span><span style="display:flex;align-items:center;gap:8px">${e.remaining!=null?`<span class="small ${e.exhausted?"st-bad":"mut"}">${gb(e.remaining)} GB مانده</span>`:e.used!=null&&e.kind!=="main"?`<span class="small mut">${gb(e.used)} GB</span>`:""}${entryBadge(e)}</span></div>`).join("")}</div>`:""}
-  ${st.net.tunnels.length?`<div class="sec-title"><h3>تانل‌ها</h3><button class="btn sm ghost" data-act="tab" data-tab="net">همه</button></div><div class="card list-mini">${st.net.tunnels.map(t=>`<div class="it" data-act="tab" data-tab="net"><span>${esc(t.name)} <span class="mut small">${esc(srvName(t.entry))} ← ${esc(srvName(t.exit))}</span></span><span class="badge ${t.status==="up"?"b-on":"b-exp"}">${t.status==="up"?"بالا":"پایین"}</span></div>`).join("")}</div>`:""}
-  ${probeCard()}
-  <div class="sec-title"><h3>سرور</h3><span class="mut small">${sv.uptime?"روشن از "+uptime(sv.uptime):""}</span></div>
+  const attention=users.filter(u=>["soon","exp","full"].includes(ustat(u)[0])).slice(0,5);
+  return `<div class="hero"><h1>${esc(st.settings.title||"EZ-XUI")}</h1><div class="mut ${line[0]}">${line[1]}</div>
+  <div class="stats"><div class="stat"><div class="v">${fa(active)} <small>از ${fa(users.length)}</small></div><div class="k">کاربر فعال</div></div>
+  <div class="stat"><div class="v">${st.panel.ok?fa(online):"—"}</div><div class="k">آنلاین</div></div>
+  <div class="stat"><div class="v">${fa(okR)} <small>از ${fa(rts.length)}</small></div><div class="k">مسیر سالم</div></div>
+  <div class="stat"><div class="v">${gb(users.reduce((a,u)=>a+u.used,0))} <small>GB</small></div><div class="k">مصرف کل</div></div></div>
+  <div class="bar-btns"><button class="btn sm" data-act="add-user">${ic("plus")} کاربر جدید</button><button class="btn sm ghost" data-act="ping">${ic("wifi")} پینگ مسیرها</button></div></div>
+  ${!st.panel.configured?`<div class="card"><h2>پنل 3x-ui وصل نیست</h2><p class="mut small">${st.settings.panel_auto&&st.settings.auto_note?esc(st.settings.auto_note):"برای ساخت و مدیریت کاربر از همین‌جا، پنل رو در تنظیمات وصل کن."}</p><button class="btn sm ghost" data-act="goto-panel">تنظیمات پنل</button></div>`:""}
+  ${jobsBox()}
+  <div class="sec"><h3>مسیرها</h3><button class="lnk" data-act="tab" data-tab="routes">همه</button></div>
+  <div class="list">${rts.slice(0,8).map((r,i)=>routeRow(r,i)).join("")||`<div class="note">مسیری نیست. در «مسیرها» یه سرور ایران یا واسط اضافه کن.</div>`}</div>
+  ${attention.length?`<div class="sec"><h3>نیاز به تمدید</h3><button class="lnk" data-act="tab" data-tab="users">همه</button></div><div class="list">${attention.map(u=>{const s=ustat(u);return `<div class="row btn-row" data-act="edit" data-sub="${esc(u.sub)}"><div class="t"><b class="ltr" style="text-align:right">${esc(u.name)}</b><small>${usage(u)}</small></div><div class="r"><span class="${STAT_CLS[s[0]]}">${s[0]==="soon"?daysText(u):s[1]}</span></div></div>`}).join("")}</div>`:""}
+  <div class="sec"><h3>این سرور</h3><span class="mut xs">${sv.uptime?"روشن از "+uptime(sv.uptime):""}</span></div>
   <div class="card">
-   ${load!=null?`<div class="meter"><div class="row"><span>پردازنده</span><span class="mut">${fa(load)}٪</span></div><div class="bar"><i class="${barCls(load)}" style="width:${load}%"></i></div></div>`:""}
-   ${sv.mem_total?`<div class="meter"><div class="row"><span>رم</span><span class="mut">${gb(sv.mem_used)} از ${gb(sv.mem_total)} GB</span></div><div class="bar"><i class="${barCls(pct(sv.mem_used,sv.mem_total))}" style="width:${pct(sv.mem_used,sv.mem_total)}%"></i></div></div>`:""}
-   ${sv.disk_total?`<div class="meter"><div class="row"><span>دیسک</span><span class="mut">${gb(sv.disk_used)} از ${gb(sv.disk_total)} GB</span></div><div class="bar"><i class="${barCls(pct(sv.disk_used,sv.disk_total))}" style="width:${pct(sv.disk_used,sv.disk_total)}%"></i></div></div>`:""}
+   ${load!=null?`<div class="meter"><div class="rw"><span>پردازنده</span><span class="mut">${fa(load)}٪</span></div><div class="bar"><i class="${barCls(load)}" style="width:${load}%"></i></div></div>`:""}
+   ${sv.mem_total?`<div class="meter"><div class="rw"><span>رم</span><span class="mut">${gb(sv.mem_used)} از ${gb(sv.mem_total)} GB</span></div><div class="bar"><i class="${barCls(pct(sv.mem_used,sv.mem_total))}" style="width:${pct(sv.mem_used,sv.mem_total)}%"></i></div></div>`:""}
+   ${sv.disk_total?`<div class="meter"><div class="rw"><span>دیسک</span><span class="mut">${gb(sv.disk_used)} از ${gb(sv.disk_total)} GB</span></div><div class="bar"><i class="${barCls(pct(sv.disk_used,sv.disk_total))}" style="width:${pct(sv.disk_used,sv.disk_total)}%"></i></div></div>`:""}
   </div>`;
 };
+
+/* routes tab */
+const SEGS=[["routes","مسیرها"],["entries","ورودی‌ها"],["exits","خروجی‌ها"]];
+const SEGV={};
+VIEWS.routes=()=>`<div class="seg">${SEGS.map(([k,l])=>`<button data-act="seg" data-seg="${k}" class="${S.seg===k?"on":""}">${l}</button>`).join("")}</div>${jobsBox()}${(SEGV[S.seg]||SEGV.routes)()}`;
+function jobsBox(){const jobs=S.state.net.jobs||[];return jobs.map(j=>`<div class="job"><span class="spin"></span><div><b>${esc(j.title)}</b><div class="mut xs ltr" style="text-align:right;unicode-bidi:plaintext">${esc((j.log||[]).slice(-1)[0]||"…")}</div></div></div>`).join("")}
+SEGV.routes=()=>{
+  const st=S.state,rts=st.routes||[],s=st.settings;
+  const off=rts.filter(r=>!(r.show||r.auto)),on=rts.filter(r=>r.show||r.auto);
+  const ping=Object.values(st.pings||{}).sort((a,b)=>b.at-a.at)[0];
+  return `<div class="toolbar"><button class="btn" data-act="route-add">${ic("plus")} مسیر</button><button class="btn ghost" data-act="ping">${ic("wifi")} پینگ</button><button class="btn ghost" data-act="auto-cfg">${ic("zap")} خودکار</button></div>
+  <div class="note">ترتیب = اولویت ⚡ خودکار (${s.order_mode==="price"?"ارزون‌ترین اول":"دستی"}). اپ کاربر اولین مسیر سالم رو می‌گیره؛ قطع شد، می‌ره بعدی.${ping?` · آخرین پینگ ${ago(ping.at)}`:""}</div>
+  <div class="list">${on.map((r,i)=>routeRow(r,i)).join("")||`<div class="empty">${ic("route")}<p>هنوز مسیری نیست.</p></div>`}</div>
+  ${off.length?`<div class="sec"><h3>خاموش</h3></div><div class="list">${off.map(r=>routeRow(r)).join("")}</div>`:""}
+  ${probeCard()}`;
+};
+function probeCard(){
+  const probes=Object.values(S.state.net.probes||{});if(!probes.length)return "";
+  const p=probes.sort((a,b)=>b.at-a.at)[0];
+  const best=p.rows.filter(r=>r.ok&&r.mbps).sort((a,b)=>b.mbps-a.mbps)[0];
+  return `<div class="sec"><h3>تست از ایران</h3><span class="mut xs">${esc(p.server)} · ${ago(p.at)}${p.sub?" · "+esc((userBy(p.sub)||{}).name||""):""}</span></div><div class="card">
+  <table class="tbl"><tr><th>مسیر</th><th>پینگ</th><th>پاسخ</th><th>دانلود</th></tr>${p.rows.map(r=>`<tr class="${best&&r===best?"best":""} ${r.ok?"":"off"}"><td>${esc(r.name)}${best&&r===best?" ★":""}</td><td class="ltr">${ms_(r.tcp_ms)}</td><td class="ltr">${r.ok?ms_(r.ttfb_ms):"قطع"}</td><td class="ltr">${r.ok?mb(r.mbps):"—"}</td></tr>`).join("")}</table></div>`;
+}
+function routeSheet(r){
+  const s=S.state.settings,t=r.tunnel,ir=iranPing(r),ping=r.ping;
+  const rts=activeRoutes(),pos=rts.findIndex(x=>x.key===r.key);
+  const inp=(k,v,attrs)=>`<input class="in ltr" name="${k}" value="${esc(v==null?"":v)}" ${attrs} autocomplete="off">`;
+  sheet(`<h3>${routeMono(r,true)} <input class="in" name="rname" value="${esc(r.name)}" style="flex:1;font-weight:600;padding:7px 10px" maxlength="40" autocomplete="off"></h3>
+  ${chainChips(r)}
+  ${r.note?`<div class="err">${esc(r.note)}</div>`:""}
+  <form id="rf">
+  <div class="cols2"><label class="check"><input type="checkbox" name="show" ${r.show?"checked":""}><span>توی ساب کاربرها</span></label><label class="check"><input type="checkbox" name="auto" ${r.auto?"checked":""}><span>توی ⚡ خودکار</span></label></div>
+  <div class="kv"><span>پینگ از این سرور</span><span>${ping?(ping.ok?`<span class="ok">${ms_(ping.ms)}</span>`:`<span class="bad">${esc(ping.error||"قطع")}</span>`)+` <span class="mut xs">${ago(ping.at)}</span>`:"—"}</span></div>
+  <div class="kv"><span>از ایران</span><span>${ir?(ir.ok?`پینگ ${ms_(ir.tcp_ms)} · پاسخ ${ms_(ir.ttfb_ms)} · ${mb(ir.mbps)}`:`<span class="bad">قطع</span>`):"—"}</span></div>
+  ${r.used!=null||r.quota_gb?`<div class="meter"><div class="rw"><span>${r.quota_gb?(r.used==null?"مصرفی ثبت نشده":gb(Math.max(0,r.quota_gb*GB-r.used))+" از "+num(r.quota_gb)+" GB مانده"):gb(r.used)+" GB مصرف"}</span><span class="mut">${fa(esc(r.period||""))}</span></div>${r.quota_gb?`<div class="bar"><i class="${barCls(pct(r.used||0,r.quota_gb*GB))}" style="width:${r.used==null?0:pct(r.used,r.quota_gb*GB)}%"></i></div>`:""}</div>`:""}
+  <details ${r.price!=null||r.quota_gb?"open":""}><summary>قیمت و حجم ${r.cost!=null?`· ≈ ${toman(r.cost)} تومان برای هر GB`:""}</summary>
+   <div class="cols2"><label class="f"><span>قیمت (تومان)</span>${inp("price",r.price,'inputmode="numeric" placeholder="مثلاً 1200000"')}</label><label class="f"><span>واحد</span><select class="in" name="unit"><option value="month" ${r.unit!=="gb"?"selected":""}>در ماه</option><option value="gb" ${r.unit==="gb"?"selected":""}>برای هر GB</option></select></label></div>
+   <div class="cols2"><label class="f"><span>حجم ماهانه (GB)</span>${inp("quota_gb",r.quota_gb||"",'inputmode="decimal" placeholder="'+(r.quota_from_sub?"از لینک ساب":"خالی = نامحدود")+'"')}</label><label class="f"><span>روز شارژ (شمسی)</span>${inp("bill_day",r.bill_day||1,'inputmode="numeric"')}</label></div>
+   ${r.kind==="tunnel"||r.kind==="direct"?`<label class="f"><span>حجم چطور حساب بشه</span><select class="in" name="count"><option value="both" ${r.count!=="out"&&r.count!=="in"?"selected":""}>رفت و برگشت (بیشتر سرورها)</option><option value="out" ${r.count==="out"?"selected":""}>فقط خروجی سرور</option><option value="in" ${r.count==="in"?"selected":""}>فقط ورودی سرور</option></select></label>`:""}
+   <div class="hint">برای چیدن «ارزون‌ترین اول». ماهانه بدون حجم = ۵۰۰ GB فرض می‌شه.</div></details>
+  ${t?`<details><summary>تانل · ${esc(t.engine)}${t.transport?" "+esc(t.transport):""} · پورت‌ها <span class="ltr">${esc(t.ports)}</span> · ${t.status==="up"?'<span class="ok">بالا</span>':'<span class="bad">پایین</span>'}${t.bench_result?` · ↓ ${mb(t.bench_result.down_mbps)}`:""}</summary>
+   ${t.error?`<div class="err">${esc(t.error)}</div>`:""}
+   ${t.check&&t.check.entry&&t.check.entry.active!=="active"?`<div class="err">ورودی: ${esc(t.check.entry.active||"")} ${esc((t.check.entry.log||t.check.entry.error||"").slice(0,120))}</div>`:""}
+   ${t.check&&t.check.exit&&t.check.exit.active&&t.check.exit.active!=="active"&&t.engine!=="direct"?`<div class="err">خروجی: ${esc(t.check.exit.active)} ${esc((t.check.exit.log||t.check.exit.error||"").slice(0,120))}</div>`:""}
+   <div class="bar-btns"><button type="button" class="btn sm ghost" data-act="tun-status" data-id="${t.id}">${ic("refresh")} وضعیت</button><button type="button" class="btn sm ghost" data-act="tun-bench" data-id="${t.id}">${ic("chart")} سرعت</button><button type="button" class="btn sm ghost" data-act="tun-apply" data-id="${t.id}">${ic("zap")} راه‌اندازی دوباره</button><button type="button" class="btn sm danger" data-act="tun-del" data-id="${t.id}">${ic("trash")}</button></div></details>`:""}
+  <div class="bar-btns" style="align-items:center"><span class="mut small" style="flex:1">اولویت ${pos>=0?fa(pos+1):"—"}</span><div class="move"><button type="button" data-act="route-move" data-key="${esc(r.key)}" data-d="-1" ${pos<=0?"disabled":""} aria-label="بالاتر">${ic("up")}</button><button type="button" data-act="route-move" data-key="${esc(r.key)}" data-d="1" ${pos<0||pos>=rts.length-1?"disabled":""} aria-label="پایین‌تر">${ic("down")}</button></div></div>
+  <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost icon" data-act="ping" title="پینگ">${ic("wifi")}</button>${r.kind==="custom"?`<button type="button" class="btn danger icon" data-act="route-del" data-key="${esc(r.key)}" title="حذف">${ic("trash")}</button>`:""}</div>
+  </form>`,el=>{
+    const f=$("#rf",el);
+    f.onsubmit=async e=>{e.preventDefault();const g=n=>f.elements.namedItem(n);
+      const body={routes:[{key:r.key,name:$("[name=rname]",el).value.trim(),show:g("show").checked,auto:g("auto").checked,price:g("price").value.trim(),unit:g("unit").value,quota_gb:g("quota_gb").value.trim()||0,bill_day:g("bill_day").value.trim()||1,order:r.order!=null?r.order:undefined}]};
+      if(g("count"))body.routes[0].count=g("count").value;
+      if(body.routes[0].order===undefined)delete body.routes[0].order;
+      const j=await act($("button.btn:not([type=button])",f),"routes_save",body);if(j.ok)closeSheet()};
+  });
+}
+async function moveRoute(key,d){
+  const rts=activeRoutes();const i=rts.findIndex(r=>r.key===key),j=i+d;if(i<0||j<0||j>=rts.length)return;
+  const order=rts.map(r=>r.key);[order[i],order[j]]=[order[j],order[i]];
+  const all=order.concat((S.state.routes||[]).filter(r=>!(r.show||r.auto)).map(r=>r.key));
+  const res=await act(null,"routes_save",{order_mode:"manual",routes:all.map((k,n)=>({key:k,order:n}))});
+  if(res.ok){const r=routeBy(key);if(r)routeSheet(r)}
+}
+function autoSheet(){
+  const s=S.state.settings;let om=s.order_mode||"manual",mode=s.auto_mode||"priority";
+  sheet(`<h3>${ic("zap")} رفتار ⚡ خودکار</h3><form id="af">
+  <div class="mut small" style="margin:8px 0 4px">ترتیب اولویت مسیرها</div>
+  <div class="seg"><button type="button" data-om="manual" class="${om==="manual"?"on":""}">دستی</button><button type="button" data-om="price" class="${om==="price"?"on":""}">ارزون‌ترین اول</button></div>
+  <div class="hint" id="omhint"></div>
+  <div class="mut small" style="margin:12px 0 4px">انتخاب مسیر در اپ</div>
+  <div class="seg"><button type="button" data-mode="priority" class="${mode!=="fastest"?"on":""}">به ترتیب اولویت</button><button type="button" data-mode="fastest" class="${mode==="fastest"?"on":""}">سریع‌ترین</button></div>
+  <div class="hint" id="modehint"></div>
+  ${sw("show_auto",s.show_auto,"⚡ خودکار توی ساب باشه","")}
+  ${field("label_auto","اسم خودکار در اپ",s.label_auto,'class="in ltr" placeholder="Auto"')}
+  ${sw("skip_down",s.skip_down,"مسیر قطع‌شده موقتاً از ساب برداشته بشه","تانل پایین یا واسط قطع؛ با وصل شدن دوباره برمی‌گرده")}
+  ${sw("skip_exhausted",s.skip_exhausted,"مسیر با حجم تموم‌شده برداشته بشه","تا شروع دوره‌ی بعدش")}
+  <button class="btn block" style="margin-top:12px">${ic("check")} ذخیره</button></form>`,el=>{
+    const f=$("#af",el);
+    const hints=()=>{$("#omhint",el).textContent=om==="price"?"مسیرها از ارزون‌ترین (تومان به ازای هر GB) چیده می‌شن؛ بدون قیمت‌ها آخر.":"با فلش‌های هر مسیر بالا و پایین کن.";
+      $("#modehint",el).textContent=mode==="fastest"?"اپ هر چند دقیقه همه رو تست می‌کنه و سریع‌ترین رو برمی‌داره.":"اپ به ترتیب می‌ره: اولی که سالم بود."};hints();
+    $$("[data-om]",el).forEach(b=>b.onclick=()=>{om=b.dataset.om;$$("[data-om]",el).forEach(x=>x.classList.toggle("on",x===b));hints()});
+    $$("[data-mode]",el).forEach(b=>b.onclick=()=>{mode=b.dataset.mode;$$("[data-mode]",el).forEach(x=>x.classList.toggle("on",x===b));hints()});
+    f.onsubmit=async e=>{e.preventDefault();const g=n=>f.elements.namedItem(n);
+      const j=await act($("button.btn",f),"routes_save",{order_mode:om,auto_mode:mode,show_auto:g("show_auto").checked,label_auto:g("label_auto").value.trim(),skip_down:g("skip_down").checked,skip_exhausted:g("skip_exhausted").checked});if(j.ok)closeSheet()};
+  });
+}
+function pingSheet(){
+  const users=S.state.users.filter(u=>u.sub),irans=S.state.net.servers.filter(s=>s.role==="iran");
+  sheet(`<h3>${ic("wifi")} پینگ کانفیگ‌ها</h3><p class="mut small">همه‌ی کانفیگ‌هایی که توی ساب یه کاربر میاد تست می‌شه: از همین سرور (پینگ و اتصال واقعی با هسته‌ی Xray) و اگه بخوای از سرور ایران (پینگ، زمان پاسخ و سرعت دانلود؛ همون چیزی که کاربر می‌بینه).</p><form id="pf">
+  <label class="f"><span>کانفیگ‌های کدام کاربر</span><select class="in" name="sub">${users.slice(0,80).map(u=>`<option value="${esc(u.sub)}">${esc(u.name)}</option>`).join("")}</select></label>
+  <div class="mut small" style="margin:8px 0 4px">از کجا</div>
+  <label class="check"><input type="checkbox" name="here" checked><span>از این سرور</span></label>
+  ${irans.length?`<label class="check"><input type="checkbox" name="iran" checked><span>از ایران</span></label><select class="in" name="server">${irans.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select>`:`<div class="hint">برای تست از ایران، در «ورودی‌ها» یه سرور ایران اضافه کن.</div>`}
+  <button class="btn block" style="margin-top:12px">${ic("check")} شروع</button></form>`,el=>{
+    const f=$("#pf",el);f.onsubmit=async e=>{e.preventDefault();const sub=f.sub.value;const here=f.here.checked,iran=f.elements.namedItem("iran")&&f.elements.namedItem("iran").checked;
+      if(!here&&!iran)return;const b=$("button.btn",f);let last=null;
+      if(here){const j=await act(b,"net_route_test",{sub});if(j.ok)last=j.job}
+      if(iran){const j=await act(b,"net_probe",{server:f.server.value,sub});if(j.ok)last=j.job}
+      if(last){closeSheet();watchJob(last)}}});
+}
+function routeAddSheet(engine,transport){
+  const st=S.state,n=st.net,irans=n.servers.filter(s=>s.role==="iran"),others=n.servers.filter(s=>s.role!=="iran");
+  const decos=st.decos.flatMap(d=>d.nodes),exits=st.exits;
+  if(!irans.length&&!decos.length){sheet(`<h3>${ic("plus")} مسیر جدید</h3><p class="mut">مسیر از یه «ورودی» شروع می‌شه: یه سرور ایران یا یه واسط (کانفیگ بقیه). اول یکی از این‌ها رو در «ورودی‌ها» اضافه کن.</p><button class="btn block" data-act="seg" data-seg="entries">رفتن به ورودی‌ها</button>`);return}
+  let entry=irans.length?"srv:"+irans[0].id:"deco:"+decos[0].key;
+  const eng=engine||"backhaul";
+  const engOpts=Object.entries(n.engines).map(([k,e])=>`<option value="${k}" ${k===eng?"selected":""}>${esc(e.name)}</option>`).join("");
+  const trOpts=k=>{const e=n.engines[k];return e&&e.transports.length?`<select class="in" name="transport">${e.transports.map(t=>`<option value="${t}" ${t===transport?"selected":""}>${t}</option>`).join("")}</select>`:`<div class="hint">ترنسپورت ندارد</div>`};
+  const el=sheet(`<h3>${ic("plus")} مسیر جدید</h3><p class="mut small">ورودی ← (واسط) ← خروجی. ورودی جاییه که اپ کاربر بهش وصل می‌شه.</p>
+  <div class="step"><span class="n">۱</span>ورودی</div>
+  <div class="chips">${irans.map(s=>`<button type="button" class="chip" data-e="srv:${s.id}">${esc(s.name)}</button>`).join("")}${decos.map(d=>`<button type="button" class="chip" data-e="deco:${esc(d.key)}">${esc(lab()+fa(d.n))} <b>${esc(d.name)}</b></button>`).join("")}</div>
+  <form id="srvf" style="display:none">
+   <div class="step"><span class="n">۲</span>خروجی (سرور خودت)</div>
+   <select class="in" name="exit">${others.map(s=>`<option value="${s.id}" ${s.local?"selected":""}>${esc(s.name)}${s.local?" (این پنل)":""}</option>`).join("")}</select>
+   <div class="step"><span class="n">۳</span>تانل</div>
+   <label class="f"><span>روش</span><select class="in" name="engine">${engOpts}</select></label><div id="engnote" class="hint"></div>
+   <div id="trbox">${trOpts(eng)}</div>
+   ${field("ports","پورت‌ها (ایران ← خارج)","443",'class="in ltr" placeholder="443, 2053=8443, 10000-10050"',"پورت‌هایی که کاربرها بهش وصل می‌شن. «2053=8443» یعنی ۲۰۵۳ ایران به ۸۴۴۳ خارج.")}
+   ${field("tname","اسم مسیر (اختیاری)","",'autocomplete="off" placeholder="ایران ۱"')}
+   <details><summary>پیشرفته</summary>${field("cport","پورت کنترل تانل (خالی = تصادفی)","",'class="in ltr" inputmode="numeric"')}
+   ${sw("udp",false,"UDP هم رد شود","برای Backhaul با ترنسپورت tcp")}
+   ${decos.length?`<label class="f"><span>فقط Xray: رسیدن به خروجی از راه یک واسط</span><select class="in" name="via"><option value="">مستقیم</option>${decos.map(d=>`<option value="${esc(d.key)}">${esc(d.name)}</option>`).join("")}</select></label>`:""}</details>
+   <div class="hint" style="margin-top:8px">روش مطمئن نیستی؟ «مقایسه‌ی روش‌ها» همه رو موقتاً می‌سازه و سرعت می‌گیره.</div>
+   <div class="bar-btns"><button class="btn">${ic("check")} ساخت تانل و مسیر</button><button type="button" class="btn ghost" data-act="trial">${ic("chart")} مقایسه‌ی روش‌ها</button></div></form>
+  <form id="decof" style="display:none">
+   <div class="step"><span class="n">۲</span>واسط میانی (اختیاری)</div>
+   <select class="in" name="via"><option value="">بدون واسط میانی</option>${decos.map(d=>`<option value="${esc(d.key)}">${esc(lab()+fa(d.n))} · ${esc(d.name)}</option>`).join("")}</select>
+   <div class="hint">دو مرحله‌ای کندتره؛ فقط وقتی که آی‌پی واسط اول برای رسیدن به خروجی مناسب نیست.</div>
+   <div class="step"><span class="n">۳</span>خروجی</div>
+   <select class="in" name="exit">${exits.map(e=>`<option value="${esc(e.id)}">${esc(e.name)}</option>`).join("")}<option value="self">خروجی خود واسط (کانفیگ همون‌طور که هست)</option></select>
+   ${field("rname","اسم مسیر (اختیاری)","",'autocomplete="off"')}
+   <button class="btn block" style="margin-top:12px">${ic("check")} افزودن مسیر</button></form>`,el=>{
+    const sf=$("#srvf",el),df=$("#decof",el);
+    const pick=()=>{$$("[data-e]",el).forEach(x=>x.classList.toggle("on",x.dataset.e===entry));sf.style.display=entry.startsWith("srv:")?"":"none";df.style.display=entry.startsWith("deco:")?"":"none";
+      if(entry.startsWith("deco:")){$$("option",df.via).forEach(o=>o.disabled=o.value&&"deco:"+o.value===entry);if("deco:"+df.via.value===entry)df.via.value=""}};
+    pick();$$("[data-e]",el).forEach(b=>b.onclick=()=>{entry=b.dataset.e;pick()});
+    const note=()=>{const e=n.engines[sf.engine.value];$("#engnote",el).textContent=e?e.note:"";$("#trbox",el).innerHTML=trOpts(sf.engine.value)};note();sf.engine.onchange=note;
+    sf.onsubmit=async e=>{e.preventDefault();const tr=sf.elements.namedItem("transport"),via=sf.elements.namedItem("via");
+      const j=await act($("button.btn:not([type=button])",sf),"net_tunnel_add",{entry:entry.slice(4),exit:sf.exit.value,engine:sf.engine.value,transport:tr?tr.value:"",ports:sf.ports.value,name:sf.tname.value,cport:sf.cport.value,udp:sf.udp.checked,via:via?via.value:""});
+      if(j.ok){closeSheet();watchJob(j.job)}};
+    df.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",df),"route_add",{entry,via:df.via.value?"deco:"+df.via.value:"",exit:df.exit.value,name:df.rname.value.trim()});if(j.ok)closeSheet()};
+  });
+}
+
+/* entries: Iran servers, Decos, direct */
+SEGV.entries=()=>{
+  const st=S.state,n=st.net,irans=n.servers.filter(s=>s.role==="iran"),ds=st.decos;
+  const usedBy=id=>(st.routes||[]).find(r=>r.kind==="tunnel"&&r.server_id===id);
+  return `<div class="sec"><h3>سرورهای ایران</h3><button class="lnk" data-act="srv-add" data-role="iran">+ افزودن</button></div>
+  <div class="list">${irans.map(s=>{const f=s.facts||{},on=!s.error&&f.ip,r=usedBy(s.id);
+    return `<div class="row btn-row" data-act="srv-more" data-id="${s.id}">${mono("IR",on?"ok":s.error?"bad":"")}<div class="t"><b>${esc(s.name)}</b><small><span class="ltr">${esc(f.ip||s.host||"")}</span>${f.os?" · "+esc(f.os):""}${f.cc==="bbr"?" · BBR":""}${r?" · "+(r.remaining!=null?gb(r.remaining)+" GB مانده":r.used!=null?gb(r.used)+" GB":"تانل دارد"):" · بدون تانل"}</small></div>
+    <div class="r">${s.error?`<span class="bad">خطا</span>`:""}<span class="dot ${on?"ok":s.error?"bad":""}"></span></div></div>`}).join("")||`<div class="note">سرور ایران نداری. کاربرها به آی‌پی ایران وصل می‌شن و ترافیک از تانل به سرور خودت می‌رسه؛ سریع‌ترین و پایدارترین ورودیه. با یوزر و پس root اضافه کن.</div>`}</div>
+  <div class="sec"><h3>واسط‌ها (کانفیگ بقیه)</h3><span><button class="lnk" data-act="deco-raw">متنی</button> · <button class="lnk" data-act="test">تست</button> · <button class="lnk" data-act="deco-add">+ افزودن</button></span></div>
+  ${ds.length?ds.map((d,i)=>{const q=d.quota;let qh="";
+    if(q){const left=Math.max(0,(q.total||0)-(q.upload||0)-(q.download||0));const p=q.total?pct((q.upload||0)+(q.download||0),q.total):0;const days=q.expire?Math.ceil((q.expire*1000-Date.now())/864e5):null;
+      qh=`<div class="meter"><div class="rw"><span>${q.total?gb(left)+" از "+gb(q.total)+" GB مانده":gb((q.upload||0)+(q.download||0))+" GB مصرف"}</span><span class="${days!==null&&days<=2?"bad":"mut"}">${days===null?"":days>0?fa(days)+" روز":"منقضی"}</span></div>${q.total?`<div class="bar"><i class="${barCls(p)}" style="width:${p}%"></i></div>`:""}</div>`}
+    const moves=`<div class="move"><button data-act="deco-move" data-i="${i}" data-d="-1" ${i===0?"disabled":""} aria-label="بالا">${ic("up")}</button><button data-act="deco-move" data-i="${i}" data-d="1" ${i===ds.length-1?"disabled":""} aria-label="پایین">${ic("down")}</button><button data-act="deco-del" data-i="${i}" aria-label="حذف">${ic("trash")}</button></div>`;
+    const stat=s=>!s?`<span class="mut">تست‌نشده</span>`:s.ok===null?`<span class="mut">UDP</span>`:s.ok?`<span class="ok">${ms_(s.ms)}</span>`:`<span class="bad">قطع</span>`;
+    const node=(nd,extra="")=>`<div class="row">${mono("D"+nd.n)}<div class="t"><b class="ltr" style="text-align:right">${esc(nd.name)}</b><small class="ltr" style="text-align:right">${esc(nd.proto)} · ${esc(nd.server)}:${nd.port}${nd.status&&!nd.status.ok&&nd.status.error?" · "+esc(nd.status.error):""}</small></div><div class="r">${stat(nd.status)}</div>${extra}</div>`;
+    if(d.kind==="link"&&d.nodes.length===1)return `<div class="list">${node(d.nodes[0],moves)}${d.error?`<div class="err">${esc(d.error)}</div>`:""}</div>`;
+    return `<div class="list"><div class="row"><div class="t"><b class="ltr" style="text-align:right">${esc(d.title)}</b><small>${d.kind==="sub"?"لینک ساب · "+fa(d.nodes.length)+" کانفیگ":"کانفیگ"}</small></div>${moves}</div>
+     ${d.nodes.map(nd=>node(nd)).join("")}
+     ${d.error?`<div class="err">${esc(d.error)}</div>`:""}${qh?`<div style="padding:0 0 10px">${qh}</div>`:""}</div>`}).join(""):`<div class="list"><div class="note">واسط = کانفیگ یا لینک ساب یکی دیگه. کاربر اول به اون وصل می‌شه و از اونجا به سرور تو می‌رسه؛ یا خود کانفیگش همون‌طور که هست توی ساب میاد. آخرین تست: ${ago(st.monitor.last_run)}</div></div>`}
+  <div class="note">${ic("info")} ورودی «مستقیم» همیشه هست: کاربر مستقیم به آی‌پی سرور خودت وصل می‌شه. ${st.monitor.note?esc(st.monitor.note):""}</div>`;
+};
+/* exits: own servers */
+SEGV.exits=()=>{
+  const st=S.state,p=st.panel,n=st.net;
+  const notExit=n.servers.filter(s=>!s.local&&s.role!=="iran"&&!st.exits.some(e=>e.node_id===s.node_id&&s.node_id||e.address===s.host||e.address===(s.facts||{}).ip));
+  return `<div class="sec"><h3>خروجی‌ها (سرورهای خودت)</h3><span>${p.ok&&p.version===3?`<button class="lnk" data-act="loc-add">+ خروجی جدید</button>`:""}</span></div>
+  <div class="list">${st.locations.map(l=>{const on=l.status==="online";const ibs=st.inbounds.filter(ib=>l.inbounds.includes(ib.id));
+    return `<div class="row btn-row" data-act="exit-more" data-id="${l.id}">${mono(l.main?"⌂":(l.name.match(/\p{Regional_Indicator}{2}/u)||["EX"])[0],l.main||on?"on":l.status==="offline"?"bad":"")}<div class="t"><b>${esc(l.name)}</b><small>${l.main?"این پنل":esc(l.address||"")} · ${fa(usersOn(l))} کاربر · ${ibs.length?ibs.map(ib=>esc(ib.remark||ib.protocol)+" :"+ib.port).join("، "):"بدون inbound"}${l.latency!=null&&!l.main?" · "+ms_(l.latency):""}</small></div>
+    <div class="r">${l.error?`<span class="bad">خطا</span>`:""}<span class="dot ${l.main||on?"ok":l.status==="offline"?"bad":""}"></span></div></div>`}).join("")}</div>
+  ${!p.ok?`<div class="note">${p.configured?esc(p.error||"پنل در دسترس نیست"):"برای خروجی‌های بیشتر (لوکیشن) اول پنل 3x-ui رو در تنظیمات وصل کن."}</div>`:p.version!==3?`<div class="note">خروجی‌های بیشتر به 3x-ui نسخه‌ی ۳ نیاز دارند: <span class="cmd">x-ui update</span></div>`:""}
+  <div class="sec"><h3>سرورهای خارج</h3><button class="lnk" data-act="srv-add" data-role="foreign">+ افزودن</button></div>
+  <div class="list">${n.servers.filter(s=>s.role!=="iran").map(s=>{const f=s.facts||{},on=!s.error&&f.ip,isExit=s.local||!notExit.includes(s);
+    return `<div class="row btn-row" data-act="srv-more" data-id="${s.id}">${mono(s.local?"⌂":"EX",on?"ok":s.error?"bad":"")}<div class="t"><b>${esc(s.name)}</b><small><span class="ltr">${esc(f.ip||s.host||"")}</span>${f.os?" · "+esc(f.os):""}${f.cc==="bbr"?" · BBR":""}${f.xui?" · 3x-ui":""}${isExit?"":" · هنوز خروجی نیست"}</small></div>
+    <div class="r">${!isExit&&p.ok&&p.version===3?`<button class="btn sm ghost" data-act="srv-node" data-id="${s.id}">تبدیل به خروجی</button>`:""}<span class="dot ${on?"ok":s.error?"bad":""}"></span></div></div>`}).join("")}</div>
+  <div class="note">${ic("info")} خروجی یعنی سروری که اکانت کاربر روشه (این پنل یا یه نود 3x-ui). سرور خارجی که اضافه می‌کنی با «تبدیل به خروجی» نود می‌شه و inbound و کاربرها روش ساخته می‌شن.</div>`;
+};
+const usersOn=l=>S.state.users.filter(u=>u.inbounds.some(id=>l.inbounds.includes(id))).length;
+const FLAGS=["🇩🇪 آلمان","🇳🇱 هلند","🇫🇮 فنلاند","🇫🇷 فرانسه","🇬🇧 انگلیس","🇸🇪 سوئد","🇺🇸 آمریکا","🇨🇦 کانادا","🇹🇷 ترکیه","🇦🇪 امارات"];
+const NODE_CMD="bash <(curl -Ls https://raw.githubusercontent.com/saeedcrazy/xui-chain/main/node.sh)";
+const flagChips=(list=FLAGS)=>`<div class="chips nowrap">${list.map(f=>`<button type="button" class="chip" data-flag="${esc(f)}">${esc(f)}</button>`).join("")}</div>`;
+const bindFlags=(el,input)=>$$("[data-flag]",el).forEach(b=>b.onclick=()=>{input.value=b.dataset.flag;$$("[data-flag]",el).forEach(x=>x.classList.toggle("on",x===b))});
+const mainInbounds=()=>S.state.inbounds.filter(ib=>!ib.node);
+const templateSelect=()=>{const list=mainInbounds();const best=list.find(ib=>ib.security==="reality")||list[0];
+  return `<select class="in" name="template">${list.map(ib=>`<option value="${ib.id}" ${best&&ib.id===best.id?"selected":""}>${esc(ib.remark||"#"+ib.id)} · ${esc(ib.protocol)}${ib.security&&ib.security!=="none"?" · "+esc(ib.security):""} · ${ib.port}</option>`).join("")}</select>`};
+function exitMoreSheet(l){
+  const ibs=S.state.inbounds.filter(ib=>l.inbounds.includes(ib.id));
+  sheet(`<h3>${esc(l.name)}</h3><div class="mut small">${l.main?"این پنل":esc(l.address||"")}${l.latency!=null&&!l.main?" · پینگ "+ms_(l.latency):""}${l.cpu!=null&&!l.main?" · CPU "+fa(Math.round(l.cpu))+"٪":""}${l.version?" · "+esc(l.version):""}</div>
+  ${l.error?`<div class="err">${esc(l.error)}</div>`:""}
+  <div class="chips">${ibs.map(ib=>`<span class="tag">${esc(ib.remark||ib.protocol)} :${ib.port}</span>`).join("")||`<span class="tag">هنوز inbound ندارد</span>`}</div>
+  <div class="menu">${l.main?`<button data-act="loc-rename">${ic("edit")} اسم این سرور</button>`:
+   `${ibs.length?`<button data-act="loc-attach" data-id="${l.id}">${ic("users")} افزودن همه‌ی کاربرها</button>`:`<button data-act="loc-setup" data-id="${l.id}">${ic("zap")} آماده‌سازی (ساخت inbound)</button>`}
+    <button class="danger" data-act="loc-del" data-id="${l.id}">${ic("trash")} حذف خروجی</button>`}</div>`);
+}
+function locAddSheet(){
+  sheet(`<h3>${ic("plus")} خروجی جدید</h3><p class="mut small">سرور جدیدت رو به‌عنوان نود 3x-ui وصل کن. راه ساده‌تر: سرور رو در «سرورهای خارج» با یوزر و پس اضافه کن و «تبدیل به خروجی» بزن.</p><form id="lf">
+  <div class="step"><span class="n">۱</span>روی سرور جدید (با SSH) این رو بزن:</div>
+  <div class="code">${esc(NODE_CMD)}</div><button type="button" class="btn sm ghost" data-act="copy" data-text="${esc(NODE_CMD)}">${ic("copy")} کپی دستور</button>
+  <div class="hint">اگه 3x-ui اونجا نیست، خودش نصب می‌کنه. آخرش یه کد می‌ده که با <span class="cmd">EZXUI-</span> شروع می‌شه.</div>
+  <div class="step"><span class="n">۲</span>اسم</div>
+  <input class="in" name="lname" placeholder="🇩🇪 آلمان" required autocomplete="off">${flagChips()}
+  <div class="step"><span class="n">۳</span>کد</div>
+  <textarea class="in" name="code" style="min-height:80px" placeholder="EZXUI-…"></textarea>
+  ${mainInbounds().length?`${sw("setup",true,"inbound مثل این سرور بساز","")}<div id="tplbox">${templateSelect()}</div>${sw("attach",true,"همه‌ی کاربرها رو اضافه کن","")}`:""}
+  <details style="margin-top:8px"><summary>کد ندارم (آدرس پنل و توکن)</summary>
+  ${field("purl","آدرس پنل سرور جدید","",'class="in ltr" placeholder="https://1.2.3.4:2053/path/"')}${field("ptoken","توکن API سرور جدید","",'class="in ltr" type="password" autocomplete="off"')}</details>
+  <button class="btn block" style="margin-top:14px">${ic("check")} افزودن خروجی</button></form>`,el=>{
+    const f=$("#lf",el);bindFlags(el,f.lname);
+    const setup=f.elements.namedItem("setup"),attach=f.elements.namedItem("attach");
+    if(setup)setup.onchange=()=>{$("#tplbox",el).style.display=setup.checked?"":"none"};
+    f.onsubmit=async e=>{e.preventDefault();
+      const body={name:f.lname.value.trim(),code:f.code.value.trim(),url:f.purl.value.trim(),token:f.ptoken.value.trim(),template:setup&&setup.checked?+f.template.value:0,attach:!!(setup&&setup.checked&&attach&&attach.checked)};
+      if(!body.code&&!body.url){toast("کد رو بذار","bad");return}
+      const j=await act($("button:not([type=button])",f),"loc_add",body);
+      if(j.ok){closeSheet();setTimeout(()=>api("state",{},true).then(render).catch(()=>{}),6000)}};
+  });
+}
+function locSetupSheet(l){
+  sheet(`<h3>${ic("zap")} آماده‌سازی ${esc(l.name)}</h3><p class="mut small">یه inbound مثل این سرور روی ${esc(l.name)} ساخته می‌شه.</p><form id="sf">
+  ${templateSelect()}${sw("attach",true,"همه‌ی کاربرها رو اضافه کن","")}
+  <button class="btn block" style="margin-top:12px">${ic("check")} انجام بده</button></form>`,el=>{
+    const f=$("#sf",el);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button",f),"loc_setup",{node:l.id,template:+f.template.value,attach:f.elements.namedItem("attach").checked});if(j.ok)closeSheet()}});
+}
+function locRenameSheet(){
+  sheet(`<h3>${ic("edit")} اسم این سرور</h3><form id="rnf"><input class="in" name="lname" value="${esc(S.state.settings.main_location)}" placeholder="🇫🇮 فنلاند" autocomplete="off">${flagChips()}
+  <div class="hint">فقط توی پنل دیده می‌شه. اسم کانفیگ کاربرها رو از خود مسیر عوض کن.</div>
+  <button class="btn block" style="margin-top:12px">${ic("check")} ذخیره</button></form>`,el=>{
+    const f=$("#rnf",el);bindFlags(el,f.lname);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button:not([type=button])",f),"settings",{main_location:f.lname.value.trim()});if(j.ok)closeSheet()}});
+}
+/* servers */
+const srvBy=id=>S.state.net.servers.find(s=>s.id===id);
+const srvName=id=>{const s=srvBy(id);return s?s.name:"؟"};
+function srvAddSheet(role){
+  role=role||"iran";
+  sheet(`<h3>${ic("plus")} افزودن سرور</h3><p class="mut small">رمز فقط یه بار برای نصب کلید SSH استفاده می‌شه و ذخیره نمی‌شه. بعدش همه چیز (تانل، نود، بهینه‌سازی، تست) از همین‌جا انجام می‌شه.</p><form id="sf2">
+  <div class="seg"><button type="button" data-role="iran" class="${role==="iran"?"on":""}">ایران (ورودی کاربرها)</button><button type="button" data-role="foreign" class="${role==="foreign"?"on":""}">خارج (خروجی)</button></div>
+  ${field("sname","اسم","",'placeholder="🇮🇷 ایران ۱"')}${flagChips(["🇮🇷 ایران ۱","🇮🇷 ایران ۲",...FLAGS])}
+  <div class="cols2">${field("shost","آدرس (IP یا دامنه)","",'class="in ltr" required autocomplete="off" placeholder="1.2.3.4"')}${field("sport","پورت SSH","22",'class="in ltr" inputmode="numeric"')}</div>
+  <div class="cols2">${field("suser","یوزر","root",'class="in ltr" autocomplete="off"')}${field("spass","رمز","",'class="in ltr" type="password" required autocomplete="new-password"')}</div>
+  <button class="btn block" style="margin-top:14px">${ic("check")} افزودن</button></form>`,el=>{
+    const f=$("#sf2",el);bindFlags(el,f.sname);
+    $$("[data-role]",el).forEach(b=>b.onclick=()=>{role=b.dataset.role;$$("[data-role]",el).forEach(x=>x.classList.toggle("on",x===b))});
+    f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"net_server_add",{name:f.sname.value.trim(),host:f.shost.value.trim(),port:f.sport.value,user:f.suser.value.trim(),password:f.spass.value,role});if(j.ok){closeSheet();watchJob(j.job)}};
+  });
+}
+function srvMoreSheet(s){
+  const f=s.facts||{},tuned=f.cc==="bbr";const p=S.state.panel;
+  const tools=Object.entries(f.tools||{}).filter(([k,v])=>v).map(([k])=>k);
+  const r=(S.state.routes||[]).find(x=>x.kind==="tunnel"&&x.server_id===s.id);
+  sheet(`<h3>${mono(s.local?"⌂":s.role==="iran"?"IR":"EX","",true)} ${esc(s.name)}</h3><div class="mut small ltr" style="text-align:right">${esc(f.ip||s.host)}${s.local?"":" · "+esc(s.user||"root")+"@"+esc(s.host)+":"+fa(s.port||22)}</div>
+  <div class="chips">${f.os?`<span class="tag">${esc(f.os)}</span>`:""}${f.cpus?`<span class="tag">${fa(f.cpus)} هسته</span>`:""}${f.mem?`<span class="tag">${gb(f.mem)} GB</span>`:""}${f.load!=null&&f.cpus?`<span class="tag">بار ${fa(Math.round(f.load*100/f.cpus))}٪</span>`:""}${f.cc?`<span class="tag ${tuned?"ok":""}">${tuned?"BBR":"TCP "+esc(f.cc)}</span>`:""}${f.xui?`<span class="tag">3x-ui</span>`:""}${tools.map(t=>`<span class="tag">${esc(t)}</span>`).join("")}</div>
+  ${s.error?`<div class="err">${esc(s.error)}</div>`:""}
+  ${r&&r.used!=null?`<div class="kv"><span>ترافیک این دوره</span><span>${gb(r.used)} GB${r.quota_gb?" از "+num(r.quota_gb):""} <span class="mut xs">${fa(esc(r.period||""))}</span></span></div>`:""}
+  <div class="menu">
+  <button data-act="srv-refresh" data-id="${s.id}">${ic("refresh")} به‌روزرسانی مشخصات</button>
+  ${!tuned?`<button data-act="srv-tune" data-id="${s.id}">${ic("zap")} بهینه‌سازی شبکه (BBR، بافرها)</button>`:""}
+  ${s.role==="iran"?`<button data-act="route-add">${ic("plus")} تانل از این سرور (مسیر جدید)</button><button data-act="path" data-id="${s.id}">${ic("zap")} تست مسیر تا خروجی</button><button data-act="probe-pick" data-id="${s.id}">${ic("wifi")} تست کانفیگ‌ها از این سرور</button>`:""}
+  ${!s.local?`<button data-act="srv-role" data-id="${s.id}" data-role="${s.role==="iran"?"foreign":"iran"}">${ic("globe")} تغییر نقش به ${s.role==="iran"?"خارج":"ایران"}</button>`:""}
+  ${p.ok&&p.version===3&&!s.node_id&&!s.local&&s.role!=="iran"?`<button data-act="srv-node" data-id="${s.id}">${ic("plus")} تبدیل به خروجی (نود 3x-ui)</button>`:""}
+  ${!s.local?`<button class="danger" data-act="srv-del" data-id="${s.id}">${ic("trash")} حذف سرور</button>`:""}</div>`);
+}
+function srvNodeSheet(s){
+  sheet(`<h3>${ic("plus")} خروجی از ${esc(s.name)}</h3><p class="mut small">روی این سرور 3x-ui نصب می‌شه (اگه نباشه)، به پنل وصل می‌شه و یه inbound مثل این سرور روش ساخته می‌شه.</p><form id="nf">
+  ${field("lname","اسم خروجی",s.name,'autocomplete="off"')}${flagChips()}
+  ${mainInbounds().length?`${sw("setup",true,"inbound مثل این سرور بساز","")}<div id="tplbox">${templateSelect()}</div>${sw("attach",true,"همه‌ی کاربرها رو اضافه کن","")}`:""}
+  <button class="btn block" style="margin-top:12px">${ic("check")} شروع</button></form>`,el=>{
+    const f=$("#nf",el);bindFlags(el,f.lname);const setup=f.elements.namedItem("setup"),attach=f.elements.namedItem("attach");
+    if(setup)setup.onchange=()=>{$("#tplbox",el).style.display=setup.checked?"":"none"};
+    f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"net_node_from_server",{id:s.id,name:f.lname.value.trim(),template:setup&&setup.checked?+f.template.value:0,attach:!!(setup&&setup.checked&&attach&&attach.checked)});if(j.ok){closeSheet();watchJob(j.job)}};
+  });
+}
+function trialSheet(){
+  const n=S.state.net,irans=n.servers.filter(s=>s.role==="iran"),others=n.servers.filter(s=>s.role!=="iran");
+  if(!irans.length){toast("اول یه سرور ایران اضافه کن","bad");return}
+  const sel=(name,list)=>`<select class="in" name="${name}">${list.map(s=>`<option value="${s.id}" ${s.local?"selected":""}>${esc(s.name)}</option>`).join("")}</select>`;
+  const combos=[["direct","","انتقال مستقیم"],["backhaul","tcpmux","Backhaul tcpmux"],["backhaul","wssmux","Backhaul wssmux"],["gost","tls","GOST tls"],["xray","reality","Xray Reality"],["wireguard","","WireGuard"],["gre","","GRE"]];
+  const pair=irans[0].id+"|"+(others.find(s=>s.local)||others[0]).id,trial=n.trials[pair];
+  sheet(`<h3>${ic("chart")} مقایسه‌ی روش‌های تانل</h3><p class="mut small">هر روش موقتاً با یه پورت تست ساخته می‌شه، سرعتش با iperf3 اندازه گرفته می‌شه و پاک می‌شه. حدود ۱ تا ۲ دقیقه برای هر روش. تانل‌های فعلی دست نمی‌خورن.</p>
+  ${trial?`<table class="tbl"><tr><th>روش</th><th>دانلود</th><th>آپلود</th><th>اتصال</th></tr>${trial.results.map(r=>`<tr class="${trial.best&&trial.best.label===r.label?"best":""} ${r.ok?"":"off"}"><td>${esc(r.label)}${trial.best&&trial.best.label===r.label?" ★":""}</td><td class="ltr">${r.ok?mb(r.down_mbps):"—"}</td><td class="ltr">${r.ok?mb(r.up_mbps):"—"}</td><td class="ltr">${r.ok?ms_(r.connect_ms):esc((r.error||"").slice(0,40))}</td></tr>`).join("")}</table>
+   ${trial.best?`<button class="btn sm block" style="margin:10px 0" data-act="route-add" data-engine="${trial.best.engine}" data-transport="${esc(trial.best.transport||"")}">${ic("plus")} ساخت مسیر با ${esc(trial.best.label)}</button>`:""}<div class="hint">${ago(trial.at)}</div>`:""}
+  <form id="trf"><div class="cols2"><label class="f"><span>ایران</span>${sel("entry",irans)}</label><label class="f"><span>خارج</span>${sel("exit",others)}</label></div>
+  ${combos.map(([e,t,l],i)=>`<label class="check"><input type="checkbox" name="c" value="${e}|${t}" ${i<5?"checked":""}><span>${l}</span></label>`).join("")}
+  <button class="btn block" style="margin-top:12px">${ic("check")} شروع مقایسه</button></form>`,el=>{
+    const f=$("#trf",el);f.onsubmit=async e=>{e.preventDefault();const cs=$$("input[name=c]:checked",f).map(x=>{const [engine,transport]=x.value.split("|");return {engine,transport}});
+      const j=await act($("button.btn:not([type=button])",f),"net_trial",{entry:f.entry.value,exit:f.exit.value,combos:cs});if(j.ok){closeSheet();watchJob(j.job)}}});
+}
+let jobTimer=null;
+function watchJob(id){
+  clearInterval(jobTimer);
+  const tick=async()=>{try{const r=await fetch("api/net_job",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json","X-XC":"1"},body:JSON.stringify({id})});const j=await r.json();
+    if(j.state){S.state=j.state}
+    if(j.job&&j.job.status!=="running"){clearInterval(jobTimer);jobTimer=null;toast(j.job.status==="done"?(j.job.log.slice(-1)[0]||j.job.title+" انجام شد"):j.job.error||"خطا",j.job.status==="done"?"ok":"bad");render();return}
+    render()}catch(e){}};
+  jobTimer=setInterval(tick,2500);tick();
+}
+
+/* decos */
+const decoLines=()=>S.state.decos.map(d=>d.line);
+function saveDecos(lines,btn){return act(btn,"decos",{lines})}
+function decoAddSheet(){
+  sheet(`<h3>${ic("plus")} افزودن واسط</h3><div class="mut small">کانفیگ (vless, vmess, trojan, ss, hysteria2) یا لینک ساب یکی دیگه. هر خط یکی. بعدش برای هر کدوم دو مسیر ساخته می‌شه: «سرور تو از راه اون» و «خود کانفیگش» (خاموش).</div>
+  <form id="df"><textarea class="in" name="t" placeholder="ss://… یا https://…/sub/…" required></textarea>
+  ${sw("first",false,"بالاترین اولویت","اول از همه امتحان بشه")}
+  <button class="btn block" style="margin-top:12px">${ic("check")} افزودن</button></form>`,el=>{
+    const f=$("#df",el);
+    f.onsubmit=async e=>{e.preventDefault();const add=f.t.value.split("\n").map(x=>x.trim()).filter(Boolean);if(!add.length)return;
+      const lines=f.first.checked?[...add,...decoLines()]:[...decoLines(),...add];
+      const j=await saveDecos(lines,$("button",f));if(j.ok){closeSheet();api("test",{},true).then(()=>render()).catch(()=>{})}};
+  });
+}
+function decoRawSheet(){
+  sheet(`<h3>${ic("text")} ویرایش متنی واسط‌ها</h3><div class="mut small">هر خط یک واسط؛ خط بالاتر = اولویت بالاتر. خطی که با # شروع شود نادیده گرفته می‌شود.</div>
+  <form id="rf2"><textarea class="in" name="t" style="min-height:200px">${esc(decoLines().join("\n"))}</textarea><button class="btn block" style="margin-top:12px">${ic("check")} ذخیره</button></form>`,el=>{
+    const f=$("#rf2",el);f.onsubmit=async e=>{e.preventDefault();const j=await saveDecos(f.t.value.split("\n"),$("button",f));if(j.ok)closeSheet()};
+  });
+}
 
 /* users */
 const FILTERS=[["all","همه"],["on","فعال"],["online","آنلاین"],["soon","رو به پایان"],["ended","منقضی/تمام"],["off","غیرفعال"]];
@@ -4214,10 +4655,9 @@ function filtered(){
   });
 }
 VIEWS.users=()=>{
-  const users=S.state.users;
   const count=f=>{const keep=S.filter;S.filter=f;const n=filtered().length;S.filter=keep;return n};
-  return `<div class="toolbar"><div class="search">${ic("search")}<input class="in" id="q" placeholder="جستجوی اسم…" value="${esc(S.q)}" autocomplete="off"></div><button class="btn" data-act="add-user">${ic("plus")}<span>جدید</span></button></div>
-  <div class="chips">${FILTERS.filter(([f])=>f!=="online"||S.state.panel.ok).map(([f,l])=>`<button class="chip ${S.filter===f?"on":""}" data-act="filter" data-f="${f}">${l}<b>${fa(count(f))}</b></button>`).join("")}</div>
+  return `<div class="toolbar"><div class="search">${ic("search")}<input class="in" id="q" placeholder="جستجو…" value="${esc(S.q)}" autocomplete="off"></div><button class="btn" data-act="add-user">${ic("plus")}<span>جدید</span></button></div>
+  <div class="chips nowrap">${FILTERS.filter(([f])=>f!=="online"||S.state.panel.ok).map(([f,l])=>`<button class="chip ${S.filter===f?"on":""}" data-act="filter" data-f="${f}">${l}<b>${fa(count(f))}</b></button>`).join("")}</div>
   <div id="ulist"></div>`;
 };
 function renderUserList(){
@@ -4226,8 +4666,8 @@ function renderUserList(){
   if(!list.length){el.innerHTML=`<div class="empty">${ic("search")}<p>کاربری با این فیلتر پیدا نشد.</p></div>`;return}
   el.innerHTML=list.map(u=>{
     const s=ustat(u),p=pct(u.used,u.total);
-    return `<div class="ucard"><div class="uhead"><div class="uname">${mono(u.name.slice(0,2).toUpperCase(),u.name,"sm")}<b>${esc(u.name)}</b>${u.online!==null?`<span class="dot ${u.online?"on":""}" title="${u.online?"آنلاین":"آفلاین"}"></span>`:""}</div><span class="badge b-${s[0]}">${s[1]}</span></div>
-    ${multiLoc()?`<div class="locs">${userLocs(u).map(l=>`<span class="loc-chip">${esc(l.name)}</span>`).join("")||`<span class="loc-chip">بدون لوکیشن</span>`}</div>`:""}
+    return `<div class="ucard u"><div class="uhead"><div class="uname">${mono(u.name.slice(0,2).toUpperCase(),u.online?"ok":"")}<b>${esc(u.name)}</b></div><span class="tag ${STAT_CLS[s[0]]}">${s[1]}</span></div>
+    ${multiLoc()?`<div class="chips" style="padding:6px 0 0">${userLocs(u).map(l=>`<span class="tag">${esc(l.name)}</span>`).join("")||`<span class="tag">بدون خروجی</span>`}</div>`:""}
     <div class="bar"><i class="${barCls(p)}" style="width:${u.total?p:4}%"></i></div>
     <div class="umeta"><span>${usage(u)}</span><span>${daysText(u)}</span></div>
     <div class="uacts"><button data-act="share" data-sub="${esc(u.sub)}" ${u.sub?"":"disabled"}>${ic("share")}<span>لینک</span></button><button data-act="edit" data-sub="${esc(u.sub)}">${ic("edit")}<span>تمدید</span></button><button data-act="umore" data-sub="${esc(u.sub)}" aria-label="بیشتر">${ic("more")}</button></div></div>`;
@@ -4238,16 +4678,16 @@ const userBy=sub=>S.state.users.find(u=>u.sub===sub);
 const locOfInbound=id=>{const ib=S.state.inbounds.find(x=>x.id===id);if(!ib)return null;return S.state.locations.find(l=>l.main?!ib.node:l.id===ib.node)||null};
 const userLocs=u=>{const out=[];u.inbounds.forEach(id=>{const l=locOfInbound(id);if(l&&!out.includes(l))out.push(l)});return out};
 const multiLoc=()=>S.state.locations.length>1;
-
 function shareSheet(u){
-  const link=linkOf(u);
+  const link=linkOf(u);const ping=(S.state.pings||{})[u.sub];
   sheet(`<h3>${ic("share")} لینک <span class="ltr">${esc(u.name)}</span></h3>
-  <div class="mut small">این لینک رو در اپ کاربر به‌عنوان Subscription اضافه کن. FlClash و Clash Meta و v2rayNG و Streisand و V2Box و Happ خودکار تشخیص داده می‌شن.</div>
+  <div class="mut small">این لینک رو در اپ کاربر به‌عنوان Subscription اضافه کن. FlClash، Clash Meta، v2rayNG، Streisand، V2Box و Happ خودکار تشخیص داده می‌شن.</div>
   <div class="linkbox">${esc(link)}</div>
-  <div class="row-btns"><button class="btn" data-act="copy" data-text="${esc(link)}">${ic("copy")} کپی</button><a class="btn ghost" href="${esc(link)}?page=1" target="_blank" rel="noopener">${ic("users")} صفحه</a>${navigator.share?`<button class="btn ghost" data-act="nshare" data-text="${esc(link)}">${ic("share")} اشتراک</button>`:""}</div>
+  <div class="bar-btns"><button class="btn" data-act="copy" data-text="${esc(link)}">${ic("copy")} کپی</button><a class="btn ghost" href="${esc(link)}?page=1" target="_blank" rel="noopener">${ic("users")} صفحه</a><button class="btn ghost icon" data-act="ping-user" data-sub="${esc(u.sub)}" title="پینگ کانفیگ‌ها">${ic("wifi")}</button>${navigator.share?`<button class="btn ghost icon" data-act="nshare" data-text="${esc(link)}">${ic("share")}</button>`:""}</div>
+  ${ping?`<div class="sec"><h3>پینگ کانفیگ‌ها</h3><span class="mut xs">${ago(ping.at)}</span></div><table class="tbl"><tr><th>کانفیگ</th><th>پورت</th><th>اتصال</th></tr>${ping.rows.map(r=>`<tr class="${r.ok?"":"off"}"><td>${esc(r.name)}</td><td class="ltr">${ms_(r.tcp_ms)}</td><td class="ltr">${r.ok?ms_(r.ms):r.ok===null?"—":esc(r.error||"قطع")}</td></tr>`).join("")}</table>`:""}
   <div class="qr" id="qrbox"></div>`,el=>{
     const box=$("#qrbox",el);
-    const draw=()=>{if(window.QRCode){new QRCode(box,{text:link,width:220,height:220,correctLevel:QRCode.CorrectLevel.M})}else box.innerHTML=`<div class="mut small" style="color:#555">QR بارگذاری نشد</div>`};
+    const draw=()=>{if(window.QRCode){new QRCode(box,{text:link,width:200,height:200,correctLevel:QRCode.CorrectLevel.M})}else box.innerHTML=`<div class="mut small" style="color:#555">QR بارگذاری نشد</div>`};
     window.QRCode?draw():setTimeout(draw,800);
   });
 }
@@ -4257,19 +4697,19 @@ function userForm(u){
   const gbv=u?(u.total?+(u.total/GB).toFixed(2):0):30;
   const ibs=st.inbounds;
   return `${isNew?field("uname","اسم کاربر (انگلیسی و یکتا)","",'class="in ltr" required pattern="[A-Za-z0-9_.@\\-]+" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="ali"'):""}
-  ${isNew?`<div class="chips" style="margin-top:6px">${[[30,30,"۳۰ گیگ، یک ماه"],[50,30,"۵۰ گیگ، یک ماه"],[100,30,"۱۰۰ گیگ، یک ماه"],[100,90,"۱۰۰ گیگ، سه ماه"],[0,30,"نامحدود، یک ماه"]].map(([g,d,l])=>`<button type="button" class="chip" data-preset="${g},${d}">${l}</button>`).join("")}</div>`:
-   `<div class="chips" style="margin-top:6px">${[["gb",10,"+۱۰ گیگ"],["gb",50,"+۵۰ گیگ"],["days",30,"+۳۰ روز"],["days",90,"+۹۰ روز"]].map(([k,v,l])=>`<button type="button" class="chip" data-add="${k},${v}">${l}</button>`).join("")}</div>`}
+  ${isNew?`<div class="chips">${[[30,30,"۳۰ گیگ، یک ماه"],[50,30,"۵۰ گیگ، یک ماه"],[100,30,"۱۰۰ گیگ، یک ماه"],[100,90,"۱۰۰ گیگ، سه ماه"],[0,30,"نامحدود، یک ماه"]].map(([g,d,l])=>`<button type="button" class="chip" data-preset="${g},${d}">${l}</button>`).join("")}</div>`:
+   `<div class="chips">${[["gb",10,"+۱۰ گیگ"],["gb",50,"+۵۰ گیگ"],["days",30,"+۳۰ روز"],["days",90,"+۹۰ روز"]].map(([k,v,l])=>`<button type="button" class="chip" data-add="${k},${v}">${l}</button>`).join("")}</div>`}
   <div class="cols">
    <label class="f"><span>حجم (GB)</span><input class="in ltr" name="gb" value="${gbv}" inputmode="decimal"></label>
    <label class="f"><span>${isNew?"مدت (روز)":"روز از امروز"}</span><input class="in ltr" name="days" value="${days}" inputmode="numeric"></label>
    <label class="f"><span>دستگاه</span><input class="in ltr" name="devices" value="${u?u.devices:0}" inputmode="numeric"></label>
   </div><div class="hint">۰ یعنی نامحدود</div>
   ${sw("first_use",u?u.expiry<0:false,"روزها از اولین اتصال شروع شود","تا کاربر وصل نشده، زمانش نمی‌گذره")}
-  ${isNew?(ibs.length?`<div class="mut small" style="margin-top:6px">${multiLoc()?"لوکیشن‌ها و inboundها":"روی کدام inbound"}</div>${st.locations.map(l=>{const list=ibs.filter(ib=>l.main?!ib.node:ib.node===l.id);if(!list.length)return "";return `${multiLoc()?`<div class="ib-head">${ic("globe")} ${esc(l.name)}</div>`:""}${list.map((ib,k)=>`<label class="check"><input type="checkbox" name="inbound" value="${ib.id}" ${k===0?"checked":""}><span><b>${esc(ib.remark||"#"+ib.id)}</b> <span class="mut small ltr">${esc(ib.protocol)} · ${ib.port}</span></span></label>`).join("")}`}).join("")}`:
+  ${isNew?(ibs.length?`<div class="mut small" style="margin-top:6px">${multiLoc()?"خروجی‌ها و inboundها":"روی کدام inbound"}</div>${st.locations.map(l=>{const list=ibs.filter(ib=>l.main?!ib.node:ib.node===l.id);if(!list.length)return "";return `${multiLoc()?`<div class="mut xs" style="margin:8px 2px 0">${esc(l.name)}</div>`:""}${list.map((ib,k)=>`<label class="check"><input type="checkbox" name="inbound" value="${ib.id}" ${k===0?"checked":""}><span><b>${esc(ib.remark||"#"+ib.id)}</b> <span class="mut small ltr">${esc(ib.protocol)} · ${ib.port}</span></span></label>`).join("")}`}).join("")}`:
    `<div class="err">${st.panel.configured?esc(st.panel.error||"inboundی پیدا نشد"):"اول پنل 3x-ui را در تنظیمات وصل کن."}</div>`):sw("zero",false,"مصرف صفر شود","برای شروع دوره‌ی جدید")}`;
 }
 function addUserSheet(){
-  if(!S.state.panel.configured){sheet(`<h3>${ic("info")} اول پنل رو وصل کن</h3><p class="mut">${S.state.settings.auto_note?esc(S.state.settings.auto_note):"برای ساخت کاربر باید پنل 3x-ui وصل باشه."}</p><button class="btn block" data-act="goto-panel">رفتن به تنظیمات پنل</button>`);return}
+  if(!S.state.panel.configured){sheet(`<h3>اول پنل رو وصل کن</h3><p class="mut">${S.state.settings.auto_note?esc(S.state.settings.auto_note):"برای ساخت کاربر باید پنل 3x-ui وصل باشه."}</p><button class="btn block" data-act="goto-panel">رفتن به تنظیمات پنل</button>`);return}
   sheet(`<h3>${ic("plus")} کاربر جدید</h3><form id="uf">${userForm(null)}<button class="btn block" style="margin-top:14px">${ic("check")} ساخت و گرفتن لینک</button></form>`,el=>{
     const f=$("#uf",el);
     $$("[data-preset]",el).forEach(b=>b.onclick=()=>{const[g,d]=b.dataset.preset.split(",");f.gb.value=g;f.days.value=d;$$("[data-preset]",el).forEach(x=>x.classList.toggle("on",x===b))});
@@ -4292,355 +4732,11 @@ function editSheet(u){
 function moreSheet(u){
   sheet(`<h3><span class="ltr">${esc(u.name)}</span></h3><div class="mut small">${u.emails.length>1?"شامل: "+u.emails.map(esc).join("، "):""}</div><div class="menu">
   <button data-act="share" data-sub="${esc(u.sub)}">${ic("qr")} لینک و QR</button>
+  <button data-act="ping-user" data-sub="${esc(u.sub)}">${ic("wifi")} پینگ کانفیگ‌هاش</button>
   <button data-act="edit" data-sub="${esc(u.sub)}">${ic("edit")} تمدید و ویرایش</button>
   <button data-act="u-enable" data-sub="${esc(u.sub)}" data-v="${u.enable?0:1}">${ic("power")} ${u.enable?"غیرفعال کردن":"فعال کردن"}</button>
   <button data-act="u-reset" data-sub="${esc(u.sub)}">${ic("refresh")} صفر کردن مصرف</button>
   <button class="danger" data-act="u-del" data-sub="${esc(u.sub)}">${ic("trash")} حذف کاربر</button></div>`);
-}
-
-/* locations */
-const FLAGS=["🇩🇪 آلمان","🇳🇱 هلند","🇫🇮 فنلاند","🇫🇷 فرانسه","🇬🇧 انگلیس","🇸🇪 سوئد","🇺🇸 آمریکا","🇨🇦 کانادا","🇹🇷 ترکیه","🇦🇪 امارات"];
-const NODE_CMD="bash <(curl -Ls https://raw.githubusercontent.com/saeedcrazy/xui-chain/main/node.sh)";
-const flagChips=()=>`<div class="chips">${FLAGS.map(f=>`<button type="button" class="chip" data-flag="${esc(f)}">${esc(f)}</button>`).join("")}</div>`;
-const bindFlags=(el,input)=>$$("[data-flag]",el).forEach(b=>b.onclick=()=>{input.value=b.dataset.flag;$$("[data-flag]",el).forEach(x=>x.classList.toggle("on",x===b))});
-const mainInbounds=()=>S.state.inbounds.filter(ib=>!ib.node);
-const templateSelect=()=>{const list=mainInbounds();const best=list.find(ib=>ib.security==="reality")||list[0];
-  return `<select class="in" name="template">${list.map(ib=>`<option value="${ib.id}" ${best&&ib.id===best.id?"selected":""}>${esc(ib.remark||"#"+ib.id)} · ${esc(ib.protocol)}${ib.security&&ib.security!=="none"?" · "+esc(ib.security):""} · ${ib.port}</option>`).join("")}</select>`};
-const usersOn=l=>S.state.users.filter(u=>u.inbounds.some(id=>l.inbounds.includes(id))).length;
-VIEWS.locations=()=>{
-  const st=S.state,p=st.panel;
-  if(!p.ok)return `<div class="card"><h2>${ic("globe")} لوکیشن‌ها</h2><p class="mut">${p.configured?esc(p.error||"پنل در دسترس نیست"):"اول پنل 3x-ui را در تنظیمات وصل کن."}</p><button class="btn sm" data-act="goto-panel">تنظیمات پنل</button></div>`;
-  if(p.version!==3)return `<div class="card"><h2>${ic("globe")} لوکیشن‌ها</h2><p class="mut">لوکیشن‌ها به 3x-ui نسخه‌ی ۳ نیاز دارند. روی سرور بزن <span class="cmd">x-ui update</span></p></div>`;
-  return `<div class="card"><h2>${ic("globe")} لوکیشن‌ها</h2><p class="mut small">سرورهای دیگه رو به‌عنوان لوکیشن اضافه کن. هر کاربر توی لینکش همه‌ی لوکیشن‌هایی که بهشون اضافه شده رو می‌بینه، هر کدوم هم با Decoها.</p>
-  <button class="btn block" data-act="loc-add">${ic("plus")} لوکیشن جدید</button></div>
-  ${st.locations.map(l=>{
-    const on=l.status==="online";const n=usersOn(l);
-    const ibs=st.inbounds.filter(ib=>l.inbounds.includes(ib.id));
-    return `<div class="lcard"><div class="lhead">${mono((l.name.match(/\p{Regional_Indicator}{2}/u)||[l.name.slice(0,2)])[0],l.name,l.main?"acc":"")}<div class="t"><b>${esc(l.name)}</b><small>${esc(l.address||"")}</small></div>
-    <span class="badge ${l.main||on?"b-on":l.status==="offline"?"b-exp":"b-off"}">${l.main?"این سرور":on?"آنلاین":l.status==="offline"?"آفلاین":"در حال اتصال"}</span></div>
-    <div class="lmeta"><span>${ic("users")} ${fa(n)} کاربر</span>${l.latency!=null&&!l.main?`<span>${ic("zap")} پینگ ${fa(l.latency)}ms</span>`:""}${l.cpu!=null&&!l.main?`<span>CPU ${fa(Math.round(l.cpu))}٪</span>`:""}${l.mem!=null&&!l.main?`<span>رم ${fa(Math.round(l.mem))}٪</span>`:""}</div>
-    ${l.error?`<div class="err">${esc(l.error)}</div>`:""}
-    <div class="locs">${ibs.map(ib=>`<span class="loc-chip ltr">${esc(ib.remark||ib.protocol)} · ${ib.port}</span>`).join("")||`<span class="loc-chip">هنوز inbound ندارد</span>`}</div>
-    <div class="row-btns">${l.main?`<button class="btn sm ghost" data-act="loc-rename">${ic("edit")} اسم این سرور</button>`:
-      (ibs.length?`<button class="btn sm ghost" data-act="loc-attach" data-id="${l.id}">${ic("users")} افزودن همه‌ی کاربرها</button>`:`<button class="btn sm" data-act="loc-setup" data-id="${l.id}">${ic("zap")} آماده‌سازی</button>`)+
-      `<button class="btn sm ghost icon" data-act="loc-del" data-id="${l.id}" aria-label="حذف">${ic("trash")}</button>`}</div></div>`}).join("")}`;
-};
-function locAddSheet(){
-  sheet(`<h3>${ic("plus")} لوکیشن جدید</h3><form id="lf">
-  <div class="step"><span class="n">۱</span>روی سرور جدید (با SSH) این رو بزن:</div>
-  <div class="code">${esc(NODE_CMD)}</div><button type="button" class="btn sm ghost" data-act="copy" data-text="${esc(NODE_CMD)}">${ic("copy")} کپی دستور</button>
-  <div class="hint">اگه 3x-ui روی اون سرور نیست، خودش نصبش می‌کنه. آخرش یه کد می‌ده که با <span class="cmd">EZXUI-</span> شروع می‌شه.</div>
-  <div class="step"><span class="n">۲</span>اسم لوکیشن</div>
-  <input class="in" name="lname" placeholder="🇩🇪 آلمان" required autocomplete="off">${flagChips()}
-  <div class="step"><span class="n">۳</span>کد رو اینجا بذار</div>
-  <textarea class="in" name="code" style="min-height:90px" placeholder="EZXUI-…"></textarea>
-  ${mainInbounds().length?`${sw("setup",true,"inbound مثل این سرور بساز","با همون پروتکل و پورت، روی سرور جدید")}<div id="tplbox">${templateSelect()}</div>${sw("attach",true,"همه‌ی کاربرها رو به این لوکیشن اضافه کن","لینک ساب همه‌شون این لوکیشن رو هم می‌گیره")}`:""}
-  <details style="margin-top:10px"><summary class="mut">کد ندارم (آدرس پنل و توکن)</summary>
-  ${field("purl","آدرس پنل سرور جدید","",'class="in ltr" placeholder="https://1.2.3.4:2053/path/"')}${field("ptoken","توکن API سرور جدید","",'class="in ltr" type="password" autocomplete="off"')}</details>
-  <button class="btn block" style="margin-top:14px">${ic("check")} افزودن لوکیشن</button></form>`,el=>{
-    const f=$("#lf",el);bindFlags(el,f.lname);
-    const setup=f.elements.namedItem("setup"),attach=f.elements.namedItem("attach");
-    if(setup)setup.onchange=()=>{$("#tplbox",el).style.display=setup.checked?"":"none"};
-    f.onsubmit=async e=>{e.preventDefault();
-      const body={name:f.lname.value.trim(),code:f.code.value.trim(),url:f.purl.value.trim(),token:f.ptoken.value.trim(),
-        template:setup&&setup.checked?+f.template.value:0,attach:!!(setup&&setup.checked&&attach&&attach.checked)};
-      if(!body.code&&!body.url){toast("کد لوکیشن رو بذار","bad");return}
-      const j=await act($("button:not([type=button])",f),"loc_add",body);
-      if(j.ok){closeSheet();S.tab="locations";render();setTimeout(()=>api("state",{},true).then(render).catch(()=>{}),6000)}};
-  });
-}
-function locSetupSheet(l){
-  sheet(`<h3>${ic("zap")} آماده‌سازی ${esc(l.name)}</h3><p class="mut small">یه inbound مثل inboundهای این سرور روی ${esc(l.name)} ساخته می‌شه.</p><form id="sf">
-  ${templateSelect()}${sw("attach",true,"همه‌ی کاربرها رو اضافه کن","")}
-  <button class="btn block" style="margin-top:12px">${ic("check")} انجام بده</button></form>`,el=>{
-    const f=$("#sf",el);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button",f),"loc_setup",{node:l.id,template:+f.template.value,attach:f.elements.namedItem("attach").checked});if(j.ok)closeSheet()}});
-}
-function locRenameSheet(){
-  sheet(`<h3>${ic("edit")} اسم این سرور</h3><form id="rnf"><input class="in" name="lname" value="${esc(S.state.settings.main_location)}" placeholder="🇫🇮 فنلاند" autocomplete="off">${flagChips()}
-  <div class="hint">توی اپ کاربرها، کانفیگ‌های این سرور با این اسم نشون داده می‌شن.</div>
-  <button class="btn block" style="margin-top:12px">${ic("check")} ذخیره</button></form>`,el=>{
-    const f=$("#rnf",el);bindFlags(el,f.lname);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button:not([type=button])",f),"settings",{main_location:f.lname.value.trim()});if(j.ok)closeSheet()}});
-}
-
-/* network: servers, tunnels, tests */
-const SEGS=[["servers","سرورها"],["tunnels","تانل‌ها"],["locations","لوکیشن‌ها"],["decos","Decoها"]];
-S.seg=S.seg||"servers";try{S.seg=localStorage.getItem("xc_seg")||"servers"}catch(e){}
-const srvBy=id=>S.state.net.servers.find(s=>s.id===id);
-const srvName=id=>{const s=srvBy(id);return s?s.name:"؟"};
-const roleName=r=>r==="iran"?"ایران":"خارج";
-const roleFlag=s=>s.local?"⌂":s.role==="iran"?"IR":"EX";
-const hue=str=>{let h=0;for(const c of String(str))h=(h*31+c.charCodeAt(0))>>>0;return h%360};
-const mono=(text,seed,cls="")=>`<span class="mono ${cls}" style="--h:${hue(seed||text)}">${esc(String(text).slice(0,3))}</span>`;
-const fmtAgo=ms=>ms?ago(ms):"—";
-const mb=v=>v==null||v<0?"—":fa(v>=100?Math.round(v):v.toFixed(1))+" Mb";
-const ms_=v=>v==null||v<0?"—":fa(v)+"ms";
-VIEWS.net=()=>`<div class="seg wide">${SEGS.map(([k,l])=>`<button data-act="seg" data-seg="${k}" class="${S.seg===k?"on":""}">${l}</button>`).join("")}</div>${(NETVIEWS[S.seg]||NETVIEWS.servers)()}`;
-const NETVIEWS={locations:()=>VIEWS.locations(),decos:()=>VIEWS.decos()};
-function jobsBox(){
-  const jobs=S.state.net.jobs||[];if(!jobs.length)return "";
-  return jobs.map(j=>`<div class="card job"><div class="jh"><span class="spin"></span><b>${esc(j.title)}</b></div><div class="mut small ltr-auto">${esc((j.log||[]).slice(-1)[0]||"…")}</div></div>`).join("");
-}
-NETVIEWS.servers=()=>{
-  const n=S.state.net,srvs=n.servers;
-  return `${jobsBox()}<div class="card"><h2>${ic("server")} سرورها</h2><p class="mut small">سرور ایران و خارجت رو با یوزر و پس root اضافه کن. رمز فقط یه بار برای نصب کلید استفاده می‌شه و ذخیره نمی‌شه. بعدش همه چیز (تانل، نود، بهینه‌سازی، تست) از همین‌جا انجام می‌شه.</p>
-  <button class="btn block" data-act="srv-add">${ic("plus")} افزودن سرور</button></div>
-  ${srvs.map(s=>{const f=s.facts||{};const on=!s.error&&f.ip;const tuned=f.cc==="bbr";
-    const tools=Object.entries(f.tools||{}).filter(([k,v])=>v).map(([k])=>k);
-    const ent=(S.state.entries||[]).find(e=>s.local?e.kind==="main":e.kind==="tunnel"&&e.server_id===s.id);
-    return `<div class="lcard"><div class="lhead">${mono(roleFlag(s),s.id,s.local?"acc":"")}<div class="t"><b>${esc(s.name)}</b><small>${esc(f.ip||s.host||"")}${f.os?" · "+esc(f.os):""}</small></div>
-    <span class="badge ${on?"b-on":s.error?"b-exp":"b-off"}">${s.local?"این پنل":on?"وصل":s.error?"خطا":"؟"}</span></div>
-    <div class="lmeta"><span class="pill ${s.role==="iran"?"ir":""}">${roleName(s.role)}</span>${f.cpus?`<span>${fa(f.cpus)} هسته</span>`:""}${f.mem?`<span>${gb(f.mem)} GB رم</span>`:""}${f.load!=null&&f.cpus?`<span>بار ${fa(Math.round(f.load*100/f.cpus))}٪</span>`:""}${f.cc?`<span class="${tuned?"st-ok":""}">${tuned?"BBR ✓":"TCP "+esc(f.cc)}</span>`:""}${f.xui?`<span>3x-ui ✓</span>`:""}${s.node_id?`<span>لوکیشن ✓</span>`:""}${ent&&ent.used!=null&&!ent.quota_gb?`<span>${gb(ent.used)} GB ${fa(esc(ent.period))}</span>`:""}</div>
-    ${ent&&ent.quota_gb?entryVolume(ent):""}
-    ${s.error?`<div class="err">${esc(s.error)}</div>`:""}
-    ${tools.length?`<div class="locs">${tools.map(t=>`<span class="loc-chip ltr">${esc(t)}</span>`).join("")}</div>`:""}
-    <div class="row-btns">${!tuned?`<button class="btn sm" data-act="srv-tune" data-id="${s.id}">${ic("zap")} بهینه‌سازی</button>`:""}
-    ${!s.local?`<button class="btn sm ghost" data-act="srv-more" data-id="${s.id}">${ic("more")} بیشتر</button>`:`<button class="btn sm ghost" data-act="srv-refresh" data-id="${s.id}">${ic("refresh")}</button>`}</div></div>`}).join("")}
-  ${srvs.length<2?`<div class="card note-card"><div class="note">${ic("info")}<div class="mut small">با یه <b>سرور ایران</b>، کاربرها به آی‌پی ایران وصل می‌شن و فیلتر شدن آی‌پی خارج دیگه اثری نداره. سریع‌ترین و پایدارترین راه همینه؛ Decoها برای وقتی‌ان که سرور ایران نداری.</div></div></div>`:""}`;
-};
-NETVIEWS.tunnels=()=>{
-  const n=S.state.net,ts=n.tunnels,irans=n.servers.filter(s=>s.role==="iran"),others=n.servers.filter(s=>s.role!=="iran");
-  const pair=irans.length&&others.length?irans[0].id+"|"+others[0].id:null;
-  const trial=pair?n.trials[pair]:null;
-  return `${jobsBox()}<div class="card"><h2>${ic("link")} تانل‌ها</h2><p class="mut small">کاربر به سرور ایران وصل می‌شه و ترافیکش از تانل به سرور خارج می‌رسه. ورودی = ایران، خروجی = خارج.</p>
-  ${irans.length&&others.length?`<div class="row-btns"><button class="btn" data-act="tun-add">${ic("plus")} تانل جدید</button><button class="btn ghost" data-act="trial">${ic("chart")} مقایسه‌ی روش‌ها</button><button class="btn ghost icon" data-act="path" title="تست مسیر" aria-label="تست مسیر">${ic("zap")}</button></div>`:
-   `<div class="err">برای تانل یه سرور با نقش «ایران» و یکی «خارج» لازمه. ${irans.length?"":"سرور ایران نداری؛ "}در بخش سرورها اضافه کن.</div>`}</div>
-  ${trial?`<div class="card"><h2>${ic("chart")} مقایسه‌ی روش‌ها</h2><div class="mut small">${esc(srvName(pair.split("|")[0]))} ← ${esc(srvName(pair.split("|")[1]))} · ${fmtAgo(trial.at)}</div>
-   <table class="tbl"><tr><th>روش</th><th>دانلود</th><th>آپلود</th><th>اتصال</th></tr>${trial.results.map(r=>`<tr class="${trial.best&&trial.best.label===r.label?"best":""} ${r.ok?"":"bad"}"><td>${esc(r.label)}${trial.best&&trial.best.label===r.label?" ★":""}</td><td class="ltr">${r.ok?mb(r.down_mbps):"—"}</td><td class="ltr">${r.ok?mb(r.up_mbps):"—"}</td><td class="ltr">${r.ok?ms_(r.connect_ms):esc((r.error||"").slice(0,40))}</td></tr>`).join("")}</table>
-   ${trial.best?`<button class="btn sm" style="margin-top:10px" data-act="tun-add" data-engine="${trial.best.engine}" data-transport="${esc(trial.best.transport||"")}">${ic("plus")} ساخت تانل با ${esc(trial.best.label)}</button>`:""}</div>`:""}
-  ${Object.entries(n.paths).map(([k,p])=>{const [a,b]=k.split("|");return `<div class="card"><h2>${ic("zap")} مسیر ${esc(srvName(a))} ← ${esc(srvName(b))}</h2><div class="lmeta"><span>پینگ ${p.ping_ms>=0?fa(p.ping_ms.toFixed(0))+"ms":"—"}</span><span>افت ${fa(p.loss)}٪</span><span>MTU ${p.mtu==="1380ok"?"✓":"کوچک"}</span></div>
-   <div class="locs">${Object.entries(p.tcp).map(([port,v])=>`<span class="loc-chip ltr ${v>=0?"ok":"no"}">:${port} ${v>=0?fa(v)+"ms":"بسته"}</span>`).join("")}</div><div class="hint">${fmtAgo(p.at)}</div></div>`}).join("")}
-  ${ts.map(t=>{const e=n.engines[t.engine]||{name:t.engine};const b=t.bench_result;const c=t.check||{};const ent=(S.state.entries||[]).find(x=>x.key==="tunnel:"+t.id);
-    return `<div class="lcard"><div class="lhead">${mono(e.name.slice(0,2),t.id)}<div class="t"><b>${esc(t.name)}</b><small>${esc(srvName(t.entry))} ← ${esc(srvName(t.exit))} · ${esc(e.name)}${t.transport?" · "+esc(t.transport):""}${t.via_name?" · از راه "+esc(t.via_name):""}</small></div>
-    <span class="badge ${t.status==="up"?"b-on":t.status==="down"||t.status==="failed"?"b-exp":"b-wait"}">${t.status==="up"?"بالا":t.status==="down"?"پایین":t.status==="failed"?"خطا":"در حال ساخت"}</span></div>
-    <div class="lmeta"><span>پورت‌ها <span class="ltr">${esc(t.ports)}</span></span><span>کنترل <span class="ltr">${fa(t.cport)}</span></span>${b?`<span class="st-ok">↓ ${mb(b.down_mbps)}</span><span>↑ ${mb(b.up_mbps)}</span>`:""}${ent?`<span class="${ent.show||ent.auto?"st-ok":"st-mut"}">${ent.show||ent.auto?"توی ساب ✓":"توی ساب نیست"}</span>`:""}</div>
-    ${t.error?`<div class="err">${esc(t.error)}</div>`:""}
-    ${c.entry&&c.entry.active!=="active"?`<div class="err">ورودی: ${esc(c.entry.active||"")} ${esc((c.entry.log||c.entry.error||"").slice(0,120))}</div>`:""}
-    ${c.exit&&c.exit.active&&c.exit.active!=="active"&&t.engine!=="direct"?`<div class="err">خروجی: ${esc(c.exit.active)} ${esc((c.exit.log||c.exit.error||"").slice(0,120))}</div>`:""}
-    <div class="row-btns"><button class="btn sm ghost" data-act="tun-status" data-id="${t.id}">${ic("refresh")} وضعیت</button><button class="btn sm ghost" data-act="tun-bench" data-id="${t.id}">${ic("chart")} سرعت</button><button class="btn sm ghost icon" data-act="tun-more" data-id="${t.id}">${ic("more")}</button></div></div>`}).join("")}`;
-};
-function srvAddSheet(){
-  sheet(`<h3>${ic("plus")} افزودن سرور</h3><form id="sf2">
-  ${field("sname","اسم","",'placeholder="🇮🇷 ایران ۱"')}${flagChipsAll()}
-  <div class="cols2">${field("shost","آدرس (IP یا دامنه)","",'class="in ltr" required autocomplete="off" placeholder="1.2.3.4"')}${field("sport","پورت SSH","22",'class="in ltr" inputmode="numeric"')}</div>
-  <div class="cols2">${field("suser","یوزر","root",'class="in ltr" autocomplete="off"')}${field("spass","رمز","",'class="in ltr" type="password" required autocomplete="new-password"')}</div>
-  <div class="mut small" style="margin:8px 0 4px">نقش</div><div class="seg"><button type="button" data-role="iran">ایران (ورودی کاربرها)</button><button type="button" data-role="foreign" class="on">خارج (خروجی)</button></div>
-  <div class="hint">رمز فقط برای نصب کلید SSH استفاده می‌شه و ذخیره نمی‌شه.</div>
-  <button class="btn block" style="margin-top:14px">${ic("check")} افزودن</button></form>`,el=>{
-    const f=$("#sf2",el);let role="foreign";bindFlags(el,f.sname);
-    $$("[data-role]",el).forEach(b=>b.onclick=()=>{role=b.dataset.role;$$("[data-role]",el).forEach(x=>x.classList.toggle("on",x===b))});
-    f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"net_server_add",{name:f.sname.value.trim(),host:f.shost.value.trim(),port:f.sport.value,user:f.suser.value.trim(),password:f.spass.value,role});if(j.ok){closeSheet();watchJob(j.job)}};
-  });
-}
-const flagChipsAll=()=>`<div class="chips">${["🇮🇷 ایران","🇩🇪 آلمان","🇳🇱 هلند","🇫🇮 فنلاند","🇫🇷 فرانسه","🇬🇧 انگلیس","🇹🇷 ترکیه","🇦🇪 امارات"].map(f=>`<button type="button" class="chip" data-flag="${esc(f)}">${esc(f)}</button>`).join("")}</div>`;
-function srvMoreSheet(s){
-  const ibs=mainInbounds();
-  sheet(`<h3>${mono(roleFlag(s),s.id)} ${esc(s.name)}</h3><div class="mut small ltr">${esc((s.facts||{}).ip||s.host)} · ${esc(s.user||"root")}@${esc(s.host)}:${fa(s.port||22)}</div><div class="menu">
-  <button data-act="srv-refresh" data-id="${s.id}">${ic("refresh")} به‌روزرسانی مشخصات</button>
-  <button data-act="srv-tune" data-id="${s.id}">${ic("zap")} بهینه‌سازی شبکه (BBR، بافرها)</button>
-  <button data-act="srv-role" data-id="${s.id}" data-role="${s.role==="iran"?"foreign":"iran"}">${ic("globe")} تغییر نقش به ${s.role==="iran"?"خارج":"ایران"}</button>
-  ${S.state.panel.ok&&S.state.panel.version===3&&!s.node_id?`<button data-act="srv-node" data-id="${s.id}">${ic("plus")} تبدیل به لوکیشن (نود 3x-ui)</button>`:""}
-  ${s.role==="iran"?`<button data-act="probe-pick" data-id="${s.id}">${ic("chart")} تست کانفیگ‌ها از این سرور</button>`:""}
-  <button class="danger" data-act="srv-del" data-id="${s.id}">${ic("trash")} حذف سرور</button></div>`);
-}
-function srvNodeSheet(s){
-  sheet(`<h3>${ic("plus")} لوکیشن از ${esc(s.name)}</h3><p class="mut small">روی این سرور 3x-ui نصب می‌شه (اگه نباشه)، به پنل اصلی وصل می‌شه و یه inbound مثل این سرور روش ساخته می‌شه.</p><form id="nf">
-  ${field("lname","اسم لوکیشن",s.name,'autocomplete="off"')}${flagChips()}
-  ${mainInbounds().length?`${sw("setup",true,"inbound مثل این سرور بساز","")}<div id="tplbox">${templateSelect()}</div>${sw("attach",true,"همه‌ی کاربرها رو اضافه کن","")}`:""}
-  <button class="btn block" style="margin-top:12px">${ic("check")} شروع</button></form>`,el=>{
-    const f=$("#nf",el);bindFlags(el,f.lname);const setup=f.elements.namedItem("setup"),attach=f.elements.namedItem("attach");
-    if(setup)setup.onchange=()=>{$("#tplbox",el).style.display=setup.checked?"":"none"};
-    f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"net_node_from_server",{id:s.id,name:f.lname.value.trim(),template:setup&&setup.checked?+f.template.value:0,attach:!!(setup&&setup.checked&&attach&&attach.checked)});if(j.ok){closeSheet();watchJob(j.job)}};
-  });
-}
-function tunAddSheet(engine,transport){
-  const n=S.state.net,irans=n.servers.filter(s=>s.role==="iran"),others=n.servers.filter(s=>s.role!=="iran");
-  const decos=S.state.decos.flatMap(d=>d.nodes);
-  const sel=(name,list,cur)=>`<select class="in" name="${name}">${list.map(s=>`<option value="${s.id}" ${s.id===cur?"selected":""}>${esc(s.name)}</option>`).join("")}</select>`;
-  const eng=engine||"backhaul";
-  const engOpts=Object.entries(n.engines).map(([k,e])=>`<option value="${k}" ${k===eng?"selected":""}>${esc(e.name)}</option>`).join("");
-  const trOpts=k=>{const e=n.engines[k];return e.transports.length?`<select class="in" name="transport">${e.transports.map(t=>`<option value="${t}" ${t===transport?"selected":""}>${t}</option>`).join("")}</select>`:`<div class="hint">ترنسپورت ندارد</div>`};
-  sheet(`<h3>${ic("plus")} تانل جدید</h3><form id="tf">
-  <div class="cols2"><label class="f"><span>ورودی (ایران)</span>${sel("entry",irans,irans[0]&&irans[0].id)}</label><label class="f"><span>خروجی (خارج)</span>${sel("exit",others,(others.find(s=>s.local)||others[0]).id)}</label></div>
-  <label class="f"><span>روش</span><select class="in" name="engine">${engOpts}</select></label><div id="engnote" class="hint"></div>
-  <div id="trbox">${trOpts(eng)}</div>
-  ${field("ports","پورت‌ها (ایران ← خارج)","443",'class="in ltr" placeholder="443, 2053=8443, 10000-10050"',"هر پورتی که کاربرها بهش وصل می‌شن. «2053=8443» یعنی پورت ۲۰۵۳ ایران به ۸۴۴۳ خارج.")}
-  ${field("tname","اسم (اختیاری)","",'autocomplete="off"')}
-  <details><summary class="mut">پیشرفته</summary>${field("cport","پورت کنترل تانل (خالی = تصادفی)","",'class="in ltr" inputmode="numeric"')}
-  ${sw("udp",false,"UDP هم رد شود","برای Backhaul با ترنسپورت tcp")}
-  ${decos.length?`<label class="f"><span>فقط Xray: رسیدن به خروجی از راه یک Deco</span><select class="in" name="via"><option value="">مستقیم</option>${decos.map(d=>`<option value="${esc(d.key)}">${esc(d.name)}</option>`).join("")}</select></label>`:""}</details>
-  <button class="btn block" style="margin-top:14px">${ic("check")} ساخت تانل</button></form>`,el=>{
-    const f=$("#tf",el);const note=()=>{const e=n.engines[f.engine.value];$("#engnote",el).textContent=e?e.note:"";$("#trbox",el).innerHTML=trOpts(f.engine.value)};note();f.engine.onchange=note;
-    f.onsubmit=async e=>{e.preventDefault();const tr=f.elements.namedItem("transport");const via=f.elements.namedItem("via");
-      const j=await act($("button.btn",f),"net_tunnel_add",{entry:f.entry.value,exit:f.exit.value,engine:f.engine.value,transport:tr?tr.value:"",ports:f.ports.value,name:f.tname.value,cport:f.cport.value,udp:f.udp.checked,via:via?via.value:""});
-      if(j.ok){closeSheet();watchJob(j.job)}};
-  });
-}
-function tunMoreSheet(t){
-  sheet(`<h3>${esc(t.name)}</h3><div class="menu">
-  <button data-act="tun-status" data-id="${t.id}">${ic("refresh")} بررسی وضعیت</button>
-  <button data-act="tun-bench" data-id="${t.id}">${ic("chart")} تست سرعت (iperf3)</button>
-  <button data-act="tun-apply" data-id="${t.id}">${ic("zap")} راه‌اندازی دوباره</button>
-  <button class="danger" data-act="tun-del" data-id="${t.id}">${ic("trash")} حذف تانل</button></div>`);
-}
-function trialSheet(){
-  const n=S.state.net,irans=n.servers.filter(s=>s.role==="iran"),others=n.servers.filter(s=>s.role!=="iran");
-  const sel=(name,list)=>`<select class="in" name="${name}">${list.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select>`;
-  const combos=[["direct","","انتقال مستقیم"],["backhaul","tcpmux","Backhaul tcpmux"],["backhaul","wssmux","Backhaul wssmux"],["gost","tls","GOST tls"],["xray","reality","Xray Reality"],["wireguard","","WireGuard"],["gre","","GRE"]];
-  sheet(`<h3>${ic("chart")} مقایسه‌ی روش‌های تانل</h3><p class="mut small">هر روش موقتاً با یه پورت تست راه‌اندازی می‌شه، سرعتش با iperf3 اندازه گرفته می‌شه و پاک می‌شه. حدود ۱ تا ۲ دقیقه برای هر روش. تانل‌های فعلی دست نمی‌خورن.</p><form id="trf">
-  <div class="cols2"><label class="f"><span>ایران</span>${sel("entry",irans)}</label><label class="f"><span>خارج</span>${sel("exit",others)}</label></div>
-  ${combos.map(([e,t,l],i)=>`<label class="check"><input type="checkbox" name="c" value="${e}|${t}" ${i<5?"checked":""}><span>${l}</span></label>`).join("")}
-  <button class="btn block" style="margin-top:12px">${ic("check")} شروع مقایسه</button></form>`,el=>{
-    const f=$("#trf",el);f.onsubmit=async e=>{e.preventDefault();const cs=$$("input[name=c]:checked",f).map(x=>{const [engine,transport]=x.value.split("|");return {engine,transport}});
-      const j=await act($("button.btn",f),"net_trial",{entry:f.entry.value,exit:f.exit.value,combos:cs});if(j.ok){closeSheet();watchJob(j.job)}}});
-}
-function probeSheet(serverId){
-  const irans=S.state.net.servers.filter(s=>s.role==="iran");if(!irans.length){toast("برای تست از ایران یه سرور با نقش ایران اضافه کن","bad");return}
-  const users=S.state.users.filter(u=>u.sub);
-  sheet(`<h3>${ic("chart")} تست از ایران</h3><p class="mut small">از سرور ایران، به هر مسیر (Main، Decoها، کانفیگ خود Decoها) وصل می‌شه و پینگ، زمان پاسخ و سرعت دانلود واقعی رو اندازه می‌گیره؛ همون چیزی که کاربر می‌بینه.</p><form id="pf">
-  <label class="f"><span>از سرور</span><select class="in" name="server">${irans.map(s=>`<option value="${s.id}" ${s.id===serverId?"selected":""}>${esc(s.name)}</option>`).join("")}</select></label>
-  <label class="f"><span>کانفیگ‌های کدام کاربر</span><select class="in" name="sub"><option value="">فقط Decoها (بدون سرور خودم)</option>${users.slice(0,50).map(u=>`<option value="${esc(u.sub)}">${esc(u.name)}</option>`).join("")}</select></label>
-  <button class="btn block" style="margin-top:12px">${ic("check")} شروع تست</button></form>`,el=>{
-    const f=$("#pf",el);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"net_probe",{server:f.server.value,sub:f.sub.value});if(j.ok){closeSheet();watchJob(j.job)}}});
-}
-function probeCard(){
-  const probes=Object.values(S.state.net.probes||{});if(!probes.length)return "";
-  const p=probes.sort((a,b)=>b.at-a.at)[0];
-  const best=p.rows.filter(r=>r.ok&&r.mbps).sort((a,b)=>b.mbps-a.mbps)[0];
-  return `<div class="card"><h2>${ic("chart")} تست از ایران</h2><div class="mut small">از ${esc(p.server)} · ${fmtAgo(p.at)}${p.sub?" · کاربر "+esc((userBy(p.sub)||{}).name||"")	:""}</div>
-  <table class="tbl"><tr><th>مسیر</th><th>پینگ</th><th>پاسخ</th><th>دانلود</th></tr>${p.rows.map(r=>`<tr class="${best&&r===best?"best":""} ${r.ok?"":"bad"}"><td>${esc(r.name)}${best&&r===best?" ★":""}</td><td class="ltr">${ms_(r.tcp_ms)}</td><td class="ltr">${r.ok?ms_(r.ttfb_ms):"قطع"}</td><td class="ltr">${r.ok?mb(r.mbps):"—"}</td></tr>`).join("")}</table></div>`;
-}
-let jobTimer=null;
-function watchJob(id){
-  clearInterval(jobTimer);
-  const tick=async()=>{try{const r=await fetch("api/net_job",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json","X-XC":"1"},body:JSON.stringify({id})});const j=await r.json();
-    if(j.state){S.state=j.state}
-    if(j.job&&j.job.status!=="running"){clearInterval(jobTimer);jobTimer=null;toast(j.job.status==="done"?(j.job.log.slice(-1)[0]||j.job.title+" انجام شد"):j.job.error||"خطا",j.job.status==="done"?"ok":"bad");render();return}
-    render()}catch(e){}};
-  jobTimer=setInterval(tick,2500);tick();
-}
-const NET_ACTS={
-  seg:b=>{S.seg=b.dataset.seg;try{localStorage.setItem("xc_seg",S.seg)}catch(e){}render()},
-  "srv-add":()=>srvAddSheet(),
-  "srv-more":b=>{const s=srvBy(b.dataset.id);if(s)srvMoreSheet(s)},
-  "srv-refresh":b=>{closeSheet();act(b,"net_server_refresh",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
-  "srv-tune":async b=>{const s=srvBy(b.dataset.id);closeSheet();if(await confirmSheet("بهینه‌سازی شبکه","روی "+esc(s.name)+": BBR و fq، بافرهای TCP بزرگ‌تر، TCP Fast Open، و بالا بردن محدودیت فایل‌ها. برگشت‌پذیره (فایل /etc/sysctl.d/99-ez-xui.conf).","انجام بده")){const j=await act(null,"net_server_tune",{id:s.id});if(j.ok)watchJob(j.job)}},
-  "srv-role":b=>{closeSheet();act(null,"net_server_role",{id:b.dataset.id,role:b.dataset.role})},
-  "srv-node":b=>{const s=srvBy(b.dataset.id);if(s)srvNodeSheet(s)},
-  "srv-del":async b=>{const s=srvBy(b.dataset.id);if(await confirmSheet("حذف سرور",esc(s.name)+" از فهرست حذف می‌شه. چیزی روی خود سرور پاک نمی‌شه.","حذف کن",true))act(null,"net_server_delete",{id:s.id})},
-  "tun-add":b=>tunAddSheet(b.dataset.engine,b.dataset.transport),
-  "tun-more":b=>{const t=S.state.net.tunnels.find(x=>x.id===b.dataset.id);if(t)tunMoreSheet(t)},
-  "tun-status":b=>{closeSheet();act(b,"net_tunnel_status",{id:b.dataset.id})},
-  "tun-bench":b=>{closeSheet();act(b,"net_tunnel_bench",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
-  "tun-apply":b=>{closeSheet();act(b,"net_tunnel_apply",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
-  "tun-del":async b=>{const t=S.state.net.tunnels.find(x=>x.id===b.dataset.id);if(await confirmSheet("حذف تانل",esc(t.name)+" از هر دو سرور پاک می‌شه.","حذف کن",true)){const j=await act(null,"net_tunnel_delete",{id:t.id});if(j.ok)watchJob(j.job)}},
-  trial:()=>trialSheet(),
-  path:b=>{const n=S.state.net,i=n.servers.find(s=>s.role==="iran"),o=n.servers.find(s=>s.role!=="iran");act(b,"net_path_test",{entry:i.id,exit:o.id}).then(j=>j.ok&&watchJob(j.job))},
-  "probe-pick":b=>probeSheet(b.dataset.id),
-  probe:()=>probeSheet(),
-};
-
-/* decos */
-VIEWS.decos=()=>{
-  const st=S.state,ds=st.decos,lab=st.settings.label_deco;
-  return `<div class="card"><h2>${ic("link")} Decoها</h2><p class="mut small">کانفیگ‌های بقیه که کاربر از راه اون‌ها به سرورت می‌رسه. ترتیب = اولویت: اول ${esc(lab)}۱ امتحان می‌شه، اگه قطع بود بعدی. لینک ساب بذاری، حجم و انقضاش هم دیده می‌شه.</p>
-  <div class="row-btns"><button class="btn" data-act="deco-add">${ic("plus")} افزودن</button><button class="btn ghost" data-act="layout">${ic("text")} ورودی‌ها و قیمت</button><button class="btn ghost icon" data-act="test" title="تست از سرور" aria-label="تست">${ic("refresh")}</button><button class="btn ghost icon" data-act="probe" title="تست از ایران" aria-label="تست از ایران">${ic("chart")}</button><button class="btn ghost icon" data-act="deco-raw" title="ویرایش متنی" aria-label="ویرایش متنی">${ic("edit")}</button></div>
-  <div class="hint">آخرین تست: ${ago(st.monitor.last_run)}${st.monitor.xray?"، تست واقعی با هسته‌ی Xray پنل":""}</div>${st.monitor.note?`<div class="hint">${ic("info")} ${esc(st.monitor.note)}</div>`:""}</div>
-  ${ds.length?ds.map((d,i)=>{
-    const q=d.quota;let qh="";
-    if(q){const left=Math.max(0,(q.total||0)-(q.upload||0)-(q.download||0));const p=q.total?pct((q.upload||0)+(q.download||0),q.total):0;
-      const days=q.expire?Math.ceil((q.expire*1000-Date.now())/864e5):null;
-      qh=`<div class="meter"><div class="row"><span class="small">${q.total?gb(left)+" از "+gb(q.total)+" GB مانده":gb((q.upload||0)+(q.download||0))+" GB مصرف"}</span><span class="small ${days!==null&&days<=2?"st-bad":"mut"}">${days===null?"":days>0?fa(days)+" روز":"منقضی"}</span></div>${q.total?`<div class="bar"><i class="${barCls(p)}" style="width:${p}%"></i></div>`:""}</div>`}
-    return `<div class="dcard"><div class="dhead"><span class="prio">${fa(i+1)}</span><div class="dtitle"><b class="ltr" style="text-align:right">${esc(d.title)}</b><small>${d.kind==="sub"?"لینک ساب، "+fa(d.nodes.length)+" کانفیگ":esc(d.nodes[0]?d.nodes[0].proto+" · "+d.nodes[0].server+":"+d.nodes[0].port:"")}</small></div>
-    <div class="dacts"><button data-act="deco-move" data-i="${i}" data-d="-1" ${i===0?"disabled":""} aria-label="بالا">${ic("up")}</button><button data-act="deco-move" data-i="${i}" data-d="1" ${i===ds.length-1?"disabled":""} aria-label="پایین">${ic("down")}</button><button data-act="deco-del" data-i="${i}" aria-label="حذف">${ic("trash")}</button></div></div>
-    ${d.nodes.map(n=>{const s=n.status;let sh;
-      if(!s)sh=`<span class="st-mut small">تست‌نشده</span>`;else if(s.ok===null)sh=`<span class="st-mut small">UDP</span>`;
-      else sh=s.ok?`<span class="st-ok small">${ic("check")} ${fa(s.ms)}ms</span>`:`<span class="st-bad small">${ic("x")} قطع</span>`;
-      const o=n.opt||{chain:true,own:false};
-      return `<div class="node"><span class="tag">${esc(lab)}${n.n}</span><span class="nn">${esc(n.name)}</span>${sh}<div class="hint" style="width:100%;margin:0">${o.chain?"سرور تو از این مسیر":"بدون سرور تو"}${o.own?"، خود کانفیگ هم توی ساب":""}</div>${s&&!s.ok&&s.error?`<div class="err" style="width:100%;margin:0">${esc(s.error)}</div>`:""}</div>`}).join("")}
-    ${d.error?`<div class="err">${esc(d.error)}</div>`:""}${qh}</div>`}).join(""):`<div class="empty">${ic("link")}<p>هنوز Decoای نیست.<br>کانفیگ یا لینک ساب یکی دیگه رو اضافه کن.</p><button class="btn" data-act="deco-add">${ic("plus")} افزودن Deco</button></div>`}`;
-};
-const decoLines=()=>S.state.decos.map(d=>d.line);
-function saveDecos(lines,btn){return act(btn,"decos",{lines})}
-function decoAddSheet(){
-  sheet(`<h3>${ic("plus")} افزودن Deco</h3><div class="mut small">کانفیگ (vless, vmess, trojan, ss, hysteria2) یا لینک ساب. هر خط یکی.</div>
-  <form id="df"><textarea class="in" name="t" placeholder="ss://… یا https://…/sub/…" required></textarea>
-  ${sw("first",false,"بالاترین اولویت","اول از همه امتحان بشه")}
-  <button class="btn block" style="margin-top:12px">${ic("check")} افزودن</button></form>`,el=>{
-    const f=$("#df",el);
-    f.onsubmit=async e=>{e.preventDefault();const add=f.t.value.split("\n").map(x=>x.trim()).filter(Boolean);if(!add.length)return;
-      const lines=f.first.checked?[...add,...decoLines()]:[...decoLines(),...add];
-      const j=await saveDecos(lines,$("button",f));if(j.ok){closeSheet();api("test",{},true).then(()=>render()).catch(()=>{})}};
-  });
-}
-const lrow=(name,on,input,value,ph,title,hint)=>`<div class="lrow ${on?"":"off"}"><label class="tg"><input type="checkbox" ${name} ${on?"checked":""}><span class="t"></span></label>
-  <div class="b"><div style="font-weight:600;margin-bottom:4px">${title}</div><input class="in" ${input} value="${esc(value)}" placeholder="${esc(ph)}" autocomplete="off"><div class="hint">${hint}</div></div></div>`;
-/* entries: everything a user's subscription offers, in priority order */
-const KIND_MONO={main:"⌂",tunnel:"IR",chain_any:"D*"};
-const entryMono=e=>mono(e.kind==="chain"?S.state.settings.label_deco.slice(0,1).toUpperCase()+e.idx:e.kind==="own"?"C"+e.idx:KIND_MONO[e.kind],e.key,e.kind==="main"?"acc":"");
-function entryDesc(e){const lab=esc(S.state.settings.label_deco);
-  switch(e.kind){
-    case "main":return "مستقیم به سرور خودت؛ تا آی‌پی‌ش فیلتر نیست سریع‌ترینه";
-    case "tunnel":return `سرور ایران «${esc(e.server_name)}» <span class="ltr">${esc(e.entry_ip)}</span> ← تانل «${esc(e.label)}» ← سرور خودت`;
-    case "chain":return `سرور خودت از راه ${lab}${fa(e.idx)} (<span class="ltr">${esc(e.label)}</span>)؛ دو مرحله‌ای، حجم روی سرور خودته`;
-    case "own":return `خود کانفیگ ${lab}${fa(e.idx)} (<span class="ltr">${esc(e.label)}</span>) همون‌طور که هست؛ یک مرحله‌ای و سریع‌تر`;
-    default:return "سرور خودت از اولین Deco سالم (فقط FlClash/Clash)";
-  }}
-const toman=v=>v==null?"—":fa(Math.round(v).toLocaleString("en-US"));
-const entryBadge=e=>e.down?`<span class="badge b-exp">قطع</span>`:e.exhausted?`<span class="badge b-exp">حجم تموم</span>`:!e.show&&!e.auto?`<span class="badge b-off">خاموش</span>`:`<span class="badge b-on">${e.show?"فعال":"فقط خودکار"}</span>`;
-function entryVolume(e){
-  if(e.quota_gb){const total=e.quota_gb*GB,used=e.used||0,p=pct(used,total);
-    return `<div class="meter"><div class="row"><span class="small">${e.used==null?"هنوز مصرفی ثبت نشده":gb(Math.max(0,total-used))+" از "+num(e.quota_gb)+" GB مانده"}</span><span class="small mut">${fa(esc(e.period||""))}</span></div><div class="bar"><i class="${barCls(p)}" style="width:${e.used==null?0:p}%"></i></div></div>`}
-  if(e.used!=null)return `<div class="hint">${gb(e.used)} GB مصرف ${fa(esc(e.period||""))}</div>`;
-  return "";
-}
-const priceSummary=e=>e.price==null||e.price===""?"قیمت و حجم (تنظیم نشده)":`${toman(e.price)} تومان${e.unit==="gb"?" برای هر GB":" در ماه"}${e.quota_gb?" · "+num(e.quota_gb)+" GB":""}${e.cost!=null?" · ≈ "+toman(e.cost)+" ت/GB":""}`;
-function entriesSheet(){
-  const s=S.state.settings,ents=S.state.entries||[];let om=s.order_mode||"manual",mode=s.auto_mode||"priority";
-  const inp=(k,v,attrs)=>`<input class="in ltr" data-k="${k}" value="${esc(v==null?"":v)}" ${attrs} autocomplete="off">`;
-  const row=(e,i)=>`<div class="ecard ${e.skip?"skip":""}" data-key="${esc(e.key)}">
-   <div class="ehead">${entryMono(e)}<div class="t"><input class="in ename" value="${esc(e.name)}" placeholder="${esc(e.name)}" maxlength="40" autocomplete="off"><small>${entryDesc(e)}</small></div>
-    <div class="dacts"><button type="button" data-mv="-1" aria-label="بالا">${ic("up")}</button><button type="button" data-mv="1" aria-label="پایین">${ic("down")}</button></div></div>
-   <div class="eflags"><label class="check small-check"><input type="checkbox" data-k="show" ${e.show?"checked":""}><span>توی ساب</span></label>${e.kind==="chain_any"?"":`<label class="check small-check"><input type="checkbox" data-k="auto" ${e.auto?"checked":""}><span>توی ⚡ خودکار</span></label>`}${entryBadge(e)}</div>
-   ${e.kind==="chain_any"?"":`<details class="eprice"><summary>${priceSummary(e)}</summary>
-    <div class="cols2"><label class="f"><span>قیمت (تومان)</span>${inp("price",e.price,'inputmode="numeric" placeholder="مثلاً 1200000"')}</label><label class="f"><span>واحد</span><select class="in" data-k="unit"><option value="month" ${e.unit!=="gb"?"selected":""}>در ماه</option><option value="gb" ${e.unit==="gb"?"selected":""}>برای هر GB</option></select></label></div>
-    <div class="cols2"><label class="f"><span>حجم ماهانه (GB)</span>${inp("quota_gb",e.quota_gb||"",'inputmode="decimal" placeholder="'+(e.quota_from_sub?"از لینک ساب":"خالی = نامحدود")+'"')}</label><label class="f"><span>روز شارژ (شمسی)</span>${inp("bill_day",e.bill_day||1,'inputmode="numeric" min="1" max="30"')}</label></div>
-    ${e.kind==="tunnel"||e.kind==="main"?`<label class="f"><span>حجم چطور حساب بشه</span><select class="in" data-k="count"><option value="both" ${e.count!=="out"&&e.count!=="in"?"selected":""}>رفت و برگشت (بیشتر سرورها)</option><option value="out" ${e.count==="out"?"selected":""}>فقط خروجی سرور</option><option value="in" ${e.count==="in"?"selected":""}>فقط ورودی سرور</option></select></label>`:""}
-    <div class="hint">قیمت برای چیدن «ارزون‌ترین اول» استفاده می‌شه. ماهانه بدون حجم = ۵۰۰ GB فرض می‌شه.</div></details>`}
-   ${entryVolume(e)}</div>`;
-  sheet(`<h3>${ic("text")} ورودی‌های ساب</h3><p class="mut small">هر چیزی که توی اپ کاربر میاد یه «ورودی»ـه: سرور خودت، سرورهای ایران تانل‌شده و Decoها. ترتیب = اولویت ⚡ خودکار: اولی که سالم بود. قیمت و حجم هر کدوم رو بذار تا هزینه‌ت مدیریت بشه و حجم مانده رو ببینی.</p>
-  <form id="ef">
-  <div class="mut small" style="margin:6px 0">ترتیب اولویت</div>
-  <div class="seg wide"><button type="button" data-om="manual" class="${om==="manual"?"on":""}">دستی (با فلش‌ها)</button><button type="button" data-om="price" class="${om==="price"?"on":""}">ارزون‌ترین اول</button></div>
-  <div class="hint" id="omhint"></div>
-  <div class="mut small" style="margin:10px 0 6px">رفتار ⚡ خودکار</div>
-  <div class="seg wide"><button type="button" data-mode="priority" class="${mode!=="fastest"?"on":""}">به ترتیب اولویت</button><button type="button" data-mode="fastest" class="${mode==="fastest"?"on":""}">سریع‌ترین</button></div>
-  <div class="hint" id="modehint"></div>
-  ${lrow('name="show_auto"',s.show_auto,'name="label_auto"',s.label_auto,"Auto","⚡ خودکار توی ساب","اپ خودش بین ورودی‌ها جابه‌جا می‌شه")}
-  ${sw("skip_down",s.skip_down,"ورودی قطع‌شده موقتاً از ساب برداشته بشه","تانل پایین یا Deco قطع؛ با وصل شدن دوباره برمی‌گرده. اپ‌ها در هر به‌روزرسانی ساب می‌گیرن.")}
-  ${sw("skip_exhausted",s.skip_exhausted,"ورودی با حجم تموم‌شده برداشته بشه","تا شروع دوره‌ی بعدش")}
-  <div class="sec-title"><h3>ورودی‌ها به ترتیب</h3><span class="mut small">${fa(ents.length)}</span></div>
-  <div id="elist">${ents.map(row).join("")}</div>
-  <button class="btn block" style="margin-top:12px">${ic("check")} ذخیره</button></form>`,el=>{
-    const f=$("#ef",el),list=$("#elist",el);
-    const arrows=()=>{const cards=$$(".ecard",list);cards.forEach((c,i)=>{$("[data-mv='-1']",c).disabled=om==="price"||i===0;$("[data-mv='1']",c).disabled=om==="price"||i===cards.length-1})};
-    const hints=()=>{$("#omhint",el).textContent=om==="price"?"بعد از ذخیره، ورودی‌ها از ارزون‌ترین (تومان به ازای هر GB) چیده می‌شن؛ بدون قیمت‌ها آخر.":"با فلش‌ها بالا و پایین کن. بالاترین، اول امتحان می‌شه.";
-      $("#modehint",el).textContent=mode==="fastest"?"اپ هر چند دقیقه همه رو تست می‌کنه و سریع‌ترین رو برمی‌داره (url-test / leastPing).":"اپ به ترتیب لیست می‌ره: اولی که سالم بود. ارزون‌ترها رو بالاتر بذار.";arrows()};hints();
-    $$("[data-om]",el).forEach(b=>b.onclick=()=>{om=b.dataset.om;$$("[data-om]",el).forEach(x=>x.classList.toggle("on",x===b));hints()});
-    $$("[data-mode]",el).forEach(b=>b.onclick=()=>{mode=b.dataset.mode;$$("[data-mode]",el).forEach(x=>x.classList.toggle("on",x===b));hints()});
-    $$(".tg input",el).forEach(x=>x.onchange=()=>x.closest(".lrow").classList.toggle("off",!x.checked));
-    list.addEventListener("click",ev=>{const b=ev.target.closest("[data-mv]");if(!b||b.disabled)return;const c=b.closest(".ecard"),d=+b.dataset.mv,sib=d<0?c.previousElementSibling:c.nextElementSibling;if(!sib)return;d<0?sib.before(c):sib.after(c);arrows();c.scrollIntoView({block:"nearest",behavior:"smooth"})});
-    f.onsubmit=async e=>{e.preventDefault();
-      const g=n=>f.elements.namedItem(n);const body={order_mode:om,auto_mode:mode,show_auto:g("show_auto").checked,label_auto:g("label_auto").value.trim(),skip_down:g("skip_down").checked,skip_exhausted:g("skip_exhausted").checked};
-      body.entries=$$(".ecard",list).map((c,i)=>{const v=k=>{const x=$(`[data-k="${k}"]`,c);return x?(x.type==="checkbox"?x.checked:x.value.trim()):undefined};
-        return {key:c.dataset.key,order:i,name:$(".ename",c).value.trim(),show:v("show"),auto:v("auto")??false,price:v("price")??null,unit:v("unit"),quota_gb:v("quota_gb")||0,bill_day:v("bill_day")||1,count:v("count")}});
-      const j=await act($("button.btn",f),"entries_save",body);if(j.ok)closeSheet()};
-  });
-}
-function decoRawSheet(){
-  sheet(`<h3>${ic("text")} ویرایش متنی</h3><div class="mut small">هر خط یک Deco؛ خط بالاتر = اولویت بالاتر. خطی که با # شروع شود نادیده گرفته می‌شود.</div>
-  <form id="rf"><textarea class="in" name="t" style="min-height:220px">${esc(decoLines().join("\n"))}</textarea><button class="btn block" style="margin-top:12px">${ic("check")} ذخیره</button></form>`,el=>{
-    const f=$("#rf",el);f.onsubmit=async e=>{e.preventDefault();const j=await saveDecos(f.t.value.split("\n"),$("button",f));if(j.ok)closeSheet()};
-  });
 }
 
 /* settings */
@@ -4648,53 +4744,52 @@ VIEWS.settings=()=>{
   const s=S.state.settings,p=S.state.panel;
   const ph=(set,txt)=>set?"ذخیره شده":txt;
   return `
-  <form class="card" data-sec="conn"><h2>${ic("zap")} رفتار اتصال</h2>
+  <form class="card" data-sec="conn"><h2>اتصال</h2>
    ${sw("iran_direct",s.iran_direct,"سایت‌های ‎.ir بدون تونل","سایت‌های ایرانی مستقیم باز می‌شن")}
-   ${field("probe_url","لینک تست سرعت از ایران",s.probe_url,'class="in ltr" placeholder="https://speed.cloudflare.com/__down?bytes=10000000"',"فایلی که برای اندازه‌گیری سرعت دانلود می‌شه")}
-   <div class="hint" style="margin-top:10px">${ic("info")} اینکه چه چیزهایی توی ساب کاربرها باشه، ترتیب، اسم، قیمت و حجم هر کدوم: خانه ← ورودی‌های ساب (یا Decoها ← ورودی‌ها و قیمت)</div>
    ${field("title","اسم پروفایل در اپ",s.title,'placeholder="EZ-XUI"')}
-   <button class="btn block">${ic("check")} ذخیره</button></form>
+   ${field("probe_url","لینک تست سرعت از ایران",s.probe_url,'class="in ltr" placeholder="https://speed.cloudflare.com/__down?bytes=10000000"',"فایلی که برای اندازه‌گیری سرعت دانلود می‌شه")}
+   ${field("label_deco","پیشوند اسم واسط‌ها در اپ",s.label_deco,'class="in ltr" placeholder="Deco"',"مثلاً Deco1، Deco2…")}
+   <div class="hint" style="margin-top:8px">${ic("info")} ترتیب، اسم، قیمت و حجم هر مسیر: تب مسیرها.</div>
+   <button class="btn block" style="margin-top:10px">${ic("check")} ذخیره</button></form>
 
-  <form class="card" data-sec="panel" id="panel-sec"><h2>${ic("server")} پنل 3x-ui</h2>
-   <div class="badge ${p.ok?"b-on":p.configured?"b-exp":"b-off"}" style="margin:4px 0 8px">${p.ok?"وصل"+(s.panel_source==="auto"?"، خودکار":"، دستی")+"، API نسخه‌ی "+fa(p.version||""):p.configured?"خطا":"وصل نیست"}</div>
+  <form class="card" data-sec="panel" id="panel-sec"><h2>پنل 3x-ui <span class="tag ${p.ok?"ok":p.configured?"bad":""}">${p.ok?"وصل"+(s.panel_source==="auto"?"، خودکار":"، دستی")+"، API v"+fa(p.version||""):p.configured?"خطا":"وصل نیست"}</span></h2>
    ${p.error?`<div class="err">${esc(p.error)}</div>`:""}
-   <p class="mut small">برای ساخت و مدیریت کاربر از همین‌جا.</p>
-   ${sw("panel_auto",s.panel_auto,"اتصال خودکار از روی سرور","EZ-XUI خودش از روی همین سرور به پنل وصل می‌شه و یه توکن به اسم xui-chain در پنل می‌سازه (در Settings ← API Tokens پنل دیده می‌شه).")}
-   ${s.panel_auto&&s.auto_note?`<div class="hint">${ic("info")} ${esc(s.auto_note)}</div>`:""}
-   <div class="row-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="panel-auto">${ic("zap")} اتصال خودکار الان</button></div>
-   <details style="margin-top:12px" ${s.panel_source==="manual"||(!s.panel_auto)?"open":""}><summary class="mut" style="cursor:pointer">اتصال دستی (اختیاری)</summary>
-   <p class="mut small">اگه اتصال خودکار نشد: توکن API (در پنل: Settings ← Security ← API Token) یا نام کاربری و رمز ورود پنل. چیزی که دستی بذاری از اتصال خودکار مهم‌تره.</p>
+   ${sw("panel_auto",s.panel_auto,"اتصال خودکار از روی سرور","EZ-XUI خودش به پنل وصل می‌شه و یه توکن به اسم xui-chain می‌سازه (Settings ← API Tokens پنل).")}
+   ${s.panel_auto&&s.auto_note?`<div class="hint">${esc(s.auto_note)}</div>`:""}
+   <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="panel-auto">${ic("zap")} اتصال خودکار الان</button></div>
+   <details style="margin-top:10px" ${s.panel_source==="manual"||(!s.panel_auto)?"open":""}><summary>اتصال دستی (اختیاری)</summary>
+   <p class="mut small">توکن API (Settings ← Security ← API Token) یا نام کاربری و رمز پنل. چیزی که دستی بذاری از اتصال خودکار مهم‌تره.</p>
    ${field("panel_token","توکن API","",`class="in ltr" type="password" autocomplete="off" placeholder="${ph(s.panel_token_set,"اختیاری")}"`)}
    <div class="cols2">${field("panel_user","نام کاربری",s.panel_user,'class="in ltr" autocomplete="off" autocapitalize="off"')}${field("panel_pass","رمز","",`class="in ltr" type="password" autocomplete="new-password" placeholder="${ph(s.panel_pass_set,"")}"`)}</div>
-   ${field("panel_url","آدرس پنل",s.panel_url,'class="in ltr"',"auto یعنی خودکار از تنظیمات پنل: <span class=\"ltr\">"+esc(s.panel_rt)+"</span>")}
-   <div class="row-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="panel-test">${ic("refresh")} تست</button>${s.panel_token_set||s.panel_pass_set?`<button type="button" class="btn ghost icon" data-act="clear" data-keys="panel_token,panel_pass" title="پاک کردن" aria-label="پاک کردن">${ic("trash")}</button>`:""}</div>
+   ${field("panel_url","آدرس پنل",s.panel_url,'class="in ltr"',"auto یعنی خودکار: <span class=\"ltr\">"+esc(s.panel_rt)+"</span>")}
+   <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="panel-test">${ic("refresh")} تست</button>${s.panel_token_set||s.panel_pass_set?`<button type="button" class="btn ghost icon" data-act="clear" data-keys="panel_token,panel_pass" title="پاک کردن">${ic("trash")}</button>`:""}</div>
    </details></form>
 
-  <form class="card" data-sec="page"><h2>${ic("users")} صفحه‌ی کاربر</h2>
-   <p class="mut small">وقتی کاربر لینک ساب رو توی مرورگر باز کنه، یه صفحه با حجم، روزهای مانده، نمودار مصرف روزانه، لوکیشن‌ها و دکمه‌ی افزودن به اپ می‌بینه. اپ‌ها مثل قبل کانفیگ می‌گیرن.</p>
+  <form class="card" data-sec="page"><h2>صفحه‌ی کاربر</h2>
+   <p class="mut small">وقتی کاربر لینکش رو توی مرورگر باز کنه: حجم و روزهای مانده، نمودار مصرف، خروجی‌ها و دکمه‌ی افزودن به اپ.</p>
    ${sw("user_page",s.user_page,"صفحه‌ی کاربر روشن باشد")}
-   ${field("support_url","لینک پشتیبانی و تمدید",s.support_url,'class="in ltr" placeholder="https://t.me/your_id"',"دکمه‌ی «پشتیبانی و تمدید» توی صفحه‌ی کاربر")}
-   <label class="f"><span>پیام برای همه‌ی کاربرها</span><textarea class="in" name="announce" style="min-height:70px;direction:rtl;font-family:inherit" placeholder="مثلاً: سرورها امشب ساعت ۲ چند دقیقه قطع می‌شن.">${esc(s.announce)}</textarea></label>
+   ${field("support_url","لینک پشتیبانی و تمدید",s.support_url,'class="in ltr" placeholder="https://t.me/your_id"')}
+   <label class="f"><span>پیام برای همه‌ی کاربرها</span><textarea class="in" name="announce" style="min-height:64px;direction:rtl;font-family:inherit" placeholder="مثلاً: سرورها امشب ساعت ۲ چند دقیقه قطع می‌شن.">${esc(s.announce)}</textarea></label>
    <button class="btn block">${ic("check")} ذخیره</button></form>
 
-  <form class="card" data-sec="tg"><h2>${ic("bell")} هشدار تلگرام</h2>
-   <p class="mut small">قطع و وصل شدن Decoها، قطع شدن همه، و تموم شدن حجم یا زمان Deco. ${s.tg_source==="panel"?"الان از ربات خود پنل 3x-ui استفاده می‌شه.":""}</p>
+  <form class="card" data-sec="tg"><h2>هشدار تلگرام</h2>
+   <p class="mut small">قطع و وصل شدن واسط‌ها و تانل‌ها، و تموم شدن حجم یا زمان. ${s.tg_source==="panel"?"الان از ربات خود پنل 3x-ui استفاده می‌شه.":""}</p>
    ${sw("tg_enable",s.tg_enable,"هشدار روشن باشد")}
    ${field("tg_token","توکن ربات","",`class="in ltr" type="password" autocomplete="off" placeholder="${s.tg_token_set?"ذخیره شده":s.tg_source==="panel"?"ربات پنل (خودکار)":"123456:ABC…"}"`)}
    ${field("tg_chat","Chat ID",s.tg_chat,`class="in ltr" placeholder="${esc(s.tg_chat_rt||"123456789")}"`,"چندتا را با , جدا کن")}
-   ${field("monitor_minutes","فاصله‌ی تست Decoها (دقیقه)",s.monitor_minutes,'class="in ltr" inputmode="numeric"')}
-   <div class="row-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="tg-test">${ic("bell")} پیام آزمایشی</button></div></form>
+   ${field("monitor_minutes","فاصله‌ی تست خودکار (دقیقه)",s.monitor_minutes,'class="in ltr" inputmode="numeric"',"واسط‌ها، تانل‌ها و ترافیک سرورها")}
+   <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="tg-test">${ic("bell")} پیام آزمایشی</button></div></form>
 
-  <form class="card" data-sec="links"><h2>${ic("globe")} لینک‌ها</h2>
+  <form class="card" data-sec="links"><h2>لینک‌ها</h2>
    ${field("public_host","دامنه برای لینک کاربرها",s.public_host,'class="in ltr" placeholder="sub.example.com"',"خالی = همان آدرسی که پنل را با آن باز کردی. الان: <span class=\"ltr\">"+esc(S.state.base)+"</span>")}
    ${field("xui_sub_url","آدرس ساب 3x-ui",s.xui_sub_url,'class="in ltr"',"auto = خودکار: <span class=\"ltr\">"+esc(s.xui_rt)+"</span>")}
    <button class="btn block">${ic("check")} ذخیره</button></form>
 
-  <form class="card" id="pwf"><h2>${ic("lock")} امنیت</h2>
+  <form class="card" id="pwf"><h2>امنیت</h2>
    <div class="cols2">${field("old","رمز فعلی","",'class="in ltr" type="password" autocomplete="current-password" required')}${field("new","رمز جدید","",'class="in ltr" type="password" autocomplete="new-password" required minlength="6"')}</div>
-   <div class="row-btns"><button class="btn">${ic("check")} عوض کردن رمز</button><button type="button" class="btn ghost" data-act="logout">${ic("logout")} خروج</button></div></form>
+   <div class="bar-btns"><button class="btn">${ic("check")} عوض کردن رمز</button><button type="button" class="btn ghost" data-act="logout">${ic("logout")} خروج</button></div></form>
 
-  <div class="card"><h2>${ic("info")} درباره</h2>
+  <div class="card"><h2>درباره</h2>
    <div class="kv"><span>نسخه</span><span class="ltr">${esc(S.state.version)}</span></div>
    <div class="kv"><span>به‌روزرسانی</span><span class="cmd">ez-xui update</span></div>
    <div class="kv"><span>رمز یادت رفت؟</span><span class="cmd">ez-xui password</span></div></div>`;
@@ -4711,7 +4806,8 @@ document.addEventListener("submit",async e=>{
 
 /* actions */
 const ACTS={
-  tab:b=>{let t=b.dataset.tab;if(TAB_ALIAS[t]){S.seg=TAB_ALIAS[t][1];try{localStorage.setItem("xc_seg",S.seg)}catch(e){}t="net"}if(S.tab===t&&!$("#ov")){scrollTo({top:0,behavior:"smooth"});return}S.tab=t;S.fade=true;try{localStorage.setItem("xc_tab",S.tab)}catch(e){}closeSheet();render();scrollTo(0,0)},
+  tab:b=>{const t=b.dataset.tab;if(S.tab===t&&!$("#ov")){scrollTo({top:0,behavior:"smooth"});return}S.tab=t;S.fade=true;try{localStorage.setItem("xc_tab",S.tab)}catch(e){}closeSheet();render();scrollTo(0,0)},
+  seg:b=>{S.seg=b.dataset.seg;S.tab="routes";try{localStorage.setItem("xc_seg",S.seg);localStorage.setItem("xc_tab","routes")}catch(e){}closeSheet();render()},
   theme:()=>{const dark=document.documentElement.dataset.theme==="dark";S.theme=dark?"light":"dark";try{localStorage.setItem("xc_theme",S.theme)}catch(e){}applyTheme();render()},
   refresh:b=>act(b,"state",{}),
   test:b=>act(b,"test",{}),
@@ -4725,26 +4821,46 @@ const ACTS={
   "u-enable":b=>{closeSheet();act(null,"user_enable",{sub:b.dataset.sub,enable:b.dataset.v==="1"})},
   "u-reset":async b=>{const u=userBy(b.dataset.sub);if(await confirmSheet("صفر کردن مصرف","مصرف "+esc(u.name)+" صفر می‌شه.","صفر کن"))act(null,"user_reset",{sub:u.sub})},
   "u-del":async b=>{const u=userBy(b.dataset.sub);if(await confirmSheet("حذف کاربر","<b class=\"ltr\">"+esc(u.name)+"</b> از پنل 3x-ui هم حذف می‌شه و قابل برگشت نیست.","حذف کن",true))act(null,"user_delete",{sub:u.sub})},
+  "ping-user":b=>{closeSheet();act(b,"net_route_test",{sub:b.dataset.sub}).then(j=>{if(j.ok)watchJob(j.job)})},
+  route:b=>{const r=routeBy(b.dataset.key);if(r)routeSheet(r)},
+  "route-add":b=>routeAddSheet(b.dataset.engine,b.dataset.transport),
+  "route-move":b=>moveRoute(b.dataset.key,+b.dataset.d),
+  "route-del":async b=>{const r=routeBy(b.dataset.key);if(r&&await confirmSheet("حذف مسیر",esc(r.name)+" حذف بشه؟","حذف کن",true)){const j=await act(null,"route_delete",{key:r.key});if(j.ok)closeSheet()}},
+  ping:()=>pingSheet(),
+  "auto-cfg":()=>autoSheet(),
   "deco-add":()=>decoAddSheet(),
   "deco-raw":()=>decoRawSheet(),
-  layout:()=>entriesSheet(),
   "deco-move":b=>{const l=decoLines(),i=+b.dataset.i,j=i+(+b.dataset.d);[l[i],l[j]]=[l[j],l[i]];saveDecos(l,null)},
-  "deco-del":async b=>{const i=+b.dataset.i,d=S.state.decos[i];if(await confirmSheet("حذف Deco","<span class=\"ltr\">"+esc(d.title)+"</span> از فهرست حذف بشه؟","حذف کن",true)){const l=decoLines();l.splice(i,1);saveDecos(l,null)}},
+  "deco-del":async b=>{const i=+b.dataset.i,d=S.state.decos[i];if(await confirmSheet("حذف واسط","<span class=\"ltr\">"+esc(d.title)+"</span> و مسیرهاش حذف بشن؟","حذف کن",true)){const l=decoLines();l.splice(i,1);saveDecos(l,null)}},
   "panel-test":b=>act(b,"panel_test",{}),
-  "loc-add":()=>locAddSheet(),
-  "loc-rename":()=>locRenameSheet(),
-  "loc-setup":b=>{const l=S.state.locations.find(x=>x.id===+b.dataset.id);if(l)locSetupSheet(l)},
-  "loc-attach":async b=>{const l=S.state.locations.find(x=>x.id===+b.dataset.id);if(l&&await confirmSheet("افزودن همه‌ی کاربرها","همه‌ی کاربرها به "+esc(l.name)+" اضافه می‌شن و لینک‌شون این لوکیشن رو هم می‌گیره.","اضافه کن"))act(null,"loc_attach",{node:l.id})},
-  "loc-del":async b=>{const l=S.state.locations.find(x=>x.id===+b.dataset.id);if(l&&await confirmSheet("حذف لوکیشن",esc(l.name)+" و inboundهاش از پنل حذف می‌شن. خود 3x-ui روی اون سرور دست نمی‌خوره.","حذف کن",true))act(null,"loc_delete",{node:l.id})},
   "panel-auto":b=>act(b,"panel_auto",{}),
   "tg-test":b=>act(b,"tgtest",{}),
   "goto-panel":()=>{closeSheet();S.tab="settings";render();setTimeout(()=>{const p=$("#panel-sec");p&&p.scrollIntoView({behavior:"smooth"})},50)},
   clear:async b=>{const body={};b.dataset.keys.split(",").forEach(k=>body[k]=null);act(b,"settings",body)},
   logout:async()=>{try{await api("logout",{})}catch(e){}S.state=null;S.auth="login";render()},
+  "exit-more":b=>{const l=S.state.locations.find(x=>x.id===+b.dataset.id);if(l)exitMoreSheet(l)},
+  "loc-add":()=>locAddSheet(),
+  "loc-rename":()=>locRenameSheet(),
+  "loc-setup":b=>{const l=S.state.locations.find(x=>x.id===+b.dataset.id);if(l)locSetupSheet(l)},
+  "loc-attach":async b=>{const l=S.state.locations.find(x=>x.id===+b.dataset.id);if(l&&await confirmSheet("افزودن همه‌ی کاربرها","همه‌ی کاربرها به "+esc(l.name)+" اضافه می‌شن و لینک‌شون این خروجی رو هم می‌گیره.","اضافه کن"))act(null,"loc_attach",{node:l.id})},
+  "loc-del":async b=>{const l=S.state.locations.find(x=>x.id===+b.dataset.id);if(l&&await confirmSheet("حذف خروجی",esc(l.name)+" و inboundهاش از پنل حذف می‌شن. خود 3x-ui روی اون سرور دست نمی‌خوره.","حذف کن",true))act(null,"loc_delete",{node:l.id})},
+  "srv-add":b=>srvAddSheet(b.dataset.role),
+  "srv-more":b=>{const s=srvBy(b.dataset.id);if(s)srvMoreSheet(s)},
+  "srv-refresh":b=>{closeSheet();act(b,"net_server_refresh",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
+  "srv-tune":async b=>{const s=srvBy(b.dataset.id);closeSheet();if(await confirmSheet("بهینه‌سازی شبکه","روی "+esc(s.name)+": BBR و fq، بافرهای TCP بزرگ‌تر، TCP Fast Open و بالا بردن محدودیت فایل‌ها. برگشت‌پذیره (/etc/sysctl.d/99-ez-xui.conf).","انجام بده")){const j=await act(null,"net_server_tune",{id:s.id});if(j.ok)watchJob(j.job)}},
+  "srv-role":b=>{closeSheet();act(null,"net_server_role",{id:b.dataset.id,role:b.dataset.role})},
+  "srv-node":b=>{const s=srvBy(b.dataset.id);if(s)srvNodeSheet(s)},
+  "srv-del":async b=>{const s=srvBy(b.dataset.id);if(await confirmSheet("حذف سرور",esc(s.name)+" از فهرست حذف می‌شه. چیزی روی خود سرور پاک نمی‌شه.","حذف کن",true))act(null,"net_server_delete",{id:s.id})},
+  "tun-status":b=>{closeSheet();act(b,"net_tunnel_status",{id:b.dataset.id})},
+  "tun-bench":b=>{closeSheet();act(b,"net_tunnel_bench",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
+  "tun-apply":b=>{closeSheet();act(b,"net_tunnel_apply",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
+  "tun-del":async b=>{const t=S.state.net.tunnels.find(x=>x.id===b.dataset.id);if(t&&await confirmSheet("حذف تانل و مسیر",esc(t.name)+" از هر دو سرور پاک می‌شه.","حذف کن",true)){closeSheet();const j=await act(null,"net_tunnel_delete",{id:t.id});if(j.ok)watchJob(j.job)}},
+  trial:()=>trialSheet(),
+  path:b=>{const n=S.state.net,i=srvBy(b.dataset.id)||n.servers.find(s=>s.role==="iran"),o=n.servers.find(s=>s.local)||n.servers.find(s=>s.role!=="iran");closeSheet();act(null,"net_path_test",{entry:i.id,exit:o.id}).then(j=>j.ok&&watchJob(j.job))},
+  "probe-pick":b=>{closeSheet();pingSheet()},
 };
 document.addEventListener("click",e=>{const b=e.target.closest("[data-act]");if(!b||b.disabled)return;const f=ACTS[b.dataset.act];if(f){e.preventDefault();f(b)}});
 
-Object.assign(ACTS,NET_ACTS);
 /* start + auto refresh */
 async function boot(){render();try{await api("state",{},true);render()}catch(e){}}
 boot();

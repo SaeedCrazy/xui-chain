@@ -344,11 +344,14 @@ class NetTests(unittest.TestCase):
         j = self.job("probe", lambda log: self.net.probe(iran["id"], "abc", log))
         self.assertEqual(j["status"], "done", j)
         rows = j["result"]["rows"]
-        self.assertEqual([r["name"] for r in rows][:3], ["Main", "Deco1", "DE1"])
+        self.assertEqual([(r["name"], r["key"][:5]) for r in rows], [("Main", "direc"), ("Deco1", "deco:")])
         self.assertEqual((rows[0]["tcp_ms"], rows[0]["ttfb_ms"], rows[0]["mbps"]), (50, 400, 10.0))
-        self.assertEqual(rows[2]["mbps"], 30.0)
+        self.assertEqual(rows[1]["mbps"], 20.0)
         probe_script = [s for s in scripts("iran.example") if "run_one" in s][0]
-        self.assertEqual(len(re.findall(r"^run_one \d", probe_script, re.M)), 3)
+        self.assertEqual(len(re.findall(r"^run_one \d", probe_script, re.M)), 2)
+        clear()
+        j = self.job("probe", lambda log: self.net.probe(iran["id"], "", log))  # the Decos' own configs only
+        self.assertEqual([r["name"] for r in j["result"]["rows"]], ["DE1"])
         # location from a server runs node.sh there and registers the node (no panel connected here)
         j = self.job("node", lambda log: self.net.node_from_server(de["id"], "DE", 0, False, log))
         self.assertEqual(j["status"], "failed")  # the panel API is not configured in this test
@@ -424,7 +427,7 @@ class NetTests(unittest.TestCase):
             self.assertIn("قطع شد", msgs[0])
             self.assertEqual(self.net.check_tunnels(), [])  # no repeat
             self.assertEqual(next(x for x in self.net.tunnels() if x["id"] == t["id"])["status"], "down")
-            e = next(x for x in xc.live_entries(self.app, self.app.rt, []) if x["key"] == "tunnel:" + t["id"])
+            e = next(x for x in xc.live_routes(self.app, self.app.rt, []) if x["key"] == "tun:" + t["id"])
             self.assertTrue(e["down"] and e["skip"])
             self.assertEqual(e["used"], total)
         finally:
