@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import html
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -43,7 +44,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.2.1"
+VERSION = "5.3.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -80,6 +81,13 @@ DEFAULTS = {
     "sub_templates": [],       # named subscription templates: [{id, name, order_mode, include_new, items: [{key, name, show, auto}]}]
     "user_subs": {},           # per user (subId): {"template": "default" | <template id> | "custom", items, order_mode, include_new, collapse}
     "collapse": {},            # default template: Deco subscriptions shown as one entry in the apps {group id: {"name"}}
+    "cf_token": "",            # Cloudflare API token (DNS of the domain, Workers); never sent to the browser
+    "cf_zone": "",             # the domain whose subdomains the panel manages, and its zone id
+    "cf_zone_id": "",
+    "cf_account_id": "",
+    "cf_zones": [],
+    "cf_perms": {},
+    "cf_auto": True,           # a new Iran server gets its own subdomain (ir1, ir2, ...)
     "routes_custom": [],       # extra routes: [{id, entry: "deco:<key>", via: "deco:<key>"|"", exit: "main"|"x:<addr>"|"self"}]
                                # routes_cfg (saved on first change): per route key -> name, show, auto, price, unit,
                                #   quota_gb, bill_day, count, order
@@ -715,7 +723,7 @@ def tunnel_port_map(t):
         return {}
 
 
-IP_RE = re.compile(r"\[?[0-9a-fA-F:.]+\]?")
+IP_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F]*:[0-9a-fA-F:.]*\]?")
 
 
 def rewrite_for_tunnel(n, entry_ip, port_map):
@@ -898,7 +906,8 @@ def routes(cfg, ups, usage=None, statuses=None, deco_down=None, nodes=None):
         entry_srv = servers.get(t.get("entry"))
         exit_id = exit_for_server(servers.get(t.get("exit")), cfg, nodes)
         ip = ((entry_srv or {}).get("facts") or {}).get("ip") or (entry_srv or {}).get("host") or ""
-        entry = {"type": "server", "id": t.get("entry"), "name": (entry_srv or {}).get("name") or "ایران", "ip": ip}
+        entry = {"type": "server", "id": t.get("entry"), "name": (entry_srv or {}).get("name") or "ایران", "ip": ip,
+                 "host": (entry_srv or {}).get("domain") or ip}
         via = {"type": "deco", "name": t["via_name"]} if t.get("via_name") else None
         exit_ = exit_by.get(exit_id) or {"id": exit_id or "", "name": "؟"}
         r = add("tun:" + t["id"], "tunnel", t.get("name") or entry["name"], 100 + k, entry, via, exit_, tunnel=t,
@@ -971,7 +980,7 @@ def route_items(r, own, cfg):
     items = []
     for n in mine:
         if r["kind"] == "tunnel":
-            m = rewrite_for_tunnel(n, r["entry"]["ip"], r["port_map"])
+            m = rewrite_for_tunnel(n, r["entry"].get("host") or r["entry"]["ip"], r["port_map"])
             if m is None:
                 continue
             hops = []
@@ -1415,6 +1424,139 @@ def route_tests(app, sub, log=None, limit=24):
 
 
 JALALI_MONTHS = ["فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور", "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"]
+
+
+
+GEO_API = "http://ip-api.com/batch?fields=status,country,countryCode,city,isp,query"
+LOCAL_NETS = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7")]
+GEO_CACHE = {}
+
+
+def flag_of(cc):
+    cc = (cc or "").upper()
+    return "".join(chr(0x1F1E6 + ord(c) - 65) for c in cc) if len(cc) == 2 and cc.isalpha() else ""
+
+
+def resolve_hosts(hosts, timeout=4):
+    """{host: IPv4} for every host, resolved in parallel ("" when it does not resolve in time)."""
+    out = {h: "" for h in hosts}
+
+    def work(h):
+        bare = h.strip("[]")
+        if IP_RE.fullmatch(h):
+            out[h] = bare
+            return
+        try:
+            out[h] = socket.getaddrinfo(bare, None, socket.AF_INET)[0][4][0]
+        except (OSError, IndexError):
+            pass
+
+    threads = [threading.Thread(target=work, args=(h,), daemon=True) for h in hosts]
+    for t in threads:
+        t.start()
+    deadline = time.time() + timeout
+    for t in threads:
+        t.join(max(0, deadline - time.time()))
+    return out
+
+
+def geo_lookup(ips, timeout=4):
+    """{ip: {cc, country, city, isp}} from a free geo-IP service, cached; {} for what it cannot tell."""
+    need = []
+    for ip in ips:
+        if not ip or ip in GEO_CACHE:
+            continue
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if addr.is_loopback or addr.is_link_local or addr.is_multicast or any(addr in net for net in LOCAL_NETS if net.version == addr.version):
+            continue
+        need.append(ip)
+    if need and GEO_API:
+        try:
+            req = urllib.request.Request(GEO_API, data=json.dumps(need[:100]).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                for row in json.loads(r.read().decode("utf-8")):
+                    if row.get("status") == "success":
+                        GEO_CACHE[row["query"]] = {"cc": row.get("countryCode", ""), "country": row.get("country", ""),
+                                                   "city": row.get("city", ""), "isp": row.get("isp", "")}
+        except (OSError, ValueError):
+            pass
+    return {ip: GEO_CACHE.get(ip) or {} for ip in ips if ip}
+
+
+def chain_nodes(cfg, r, it, ups):
+    """The way one config takes: app -> (relays) -> entry -> (tunnel) -> exit -> internet."""
+    decos = {node_key(n): i for i, n in enumerate(ups, 1)}
+    nodes = [{"t": "app"}]
+    for h in it["hops"]:
+        nodes.append({"t": "relay", "name": "%s · %s" % (deco_label(cfg, decos.get(node_key(h), 0)), h["name"]),
+                      "host": h["server"], "port": h["port"], "proto": h["proto"]})
+    tgt = it["target"]
+    if r["kind"] == "tunnel":
+        t = r.get("tunnel") or {}
+        nodes.append({"t": "iran", "name": r["entry"].get("name", ""), "host": tgt["server"], "port": tgt["port"], "proto": tgt["proto"]})
+        eng = ENGINES.get(t.get("engine"), (t.get("engine", ""),))[0]
+        nodes.append({"t": "tunnel", "name": ("%s %s" % (eng, t.get("transport") or "")).strip()})
+        own = it.get("own") or tgt
+        nodes.append({"t": "server", "name": r["exit"]["name"], "host": own["server"], "port": own["port"], "proto": own["proto"]})
+    elif r["kind"] == "own" or r.get("exit_id") == "self":
+        nodes.append({"t": "deco", "name": tgt["name"], "host": tgt["server"], "port": tgt["port"], "proto": tgt["proto"]})
+    else:
+        nodes.append({"t": "server", "name": r["exit"]["name"], "host": tgt["server"], "port": tgt["port"], "proto": tgt["proto"]})
+    nodes.append({"t": "net"})
+    return nodes
+
+
+def sub_map(app, sub):
+    """Everything one user's subscription offers, in the order the apps list it, each with its
+    way from the app to the internet; hosts resolved and located."""
+    rt = app.rt
+    own, hdrs = sub_configs(rt, sub)
+    ups = UPSTREAMS.nodes()
+    rts = view_routes(rt, live_routes(app, rt, ups), sub, ups)
+    entries, folds, auto_names, auto_routes = [], {}, [], set()
+    for r in active_routes(rts):
+        try:
+            items = route_items(r, own, rt)
+        except ValueError:
+            continue
+        for it in items:
+            rec = {"kind": r["kind"], "name": it["name"], "route": r["key"], "auto": r["auto"], "show": r["show"],
+                   "down": r["down"], "chain": chain_nodes(rt, r, it, ups)}
+            if r["auto"]:
+                auto_names.append(it["name"])
+                auto_routes.add(r["key"])
+            if not r["show"]:
+                continue
+            if r.get("fold"):
+                f = folds.get(r["fold"])
+                if f is None:
+                    f = folds[r["fold"]] = {"kind": "fold", "name": r["fold"], "configs": []}
+                    entries.append(f)
+                f["configs"].append(rec)
+            else:
+                entries.append(rec)
+    head = []
+    if rt.get("show_auto", True) and len(auto_routes) >= 2:
+        head.append({"kind": "auto", "name": auto_name(rt), "members": auto_names,
+                     "mode": "fastest" if (rt.get("auto_mode") or "priority") == "fastest" else "priority"})
+    if rt.get("info_config", True) and (head or entries):
+        head.insert(0, {"kind": "info", "name": info_line(rt, sub, own, hdrs, app),
+                        "uses": (head or entries)[0]["name"]})
+    entries = head + entries
+    hosts = sorted({n["host"] for e in entries for c in ([e] + e.get("configs", [])) for n in c.get("chain", []) if n.get("host")})
+    ips = resolve_hosts(hosts)
+    geo = geo_lookup(sorted(set(ips.values())))
+    where = {}
+    for h in hosts:
+        g = geo.get(ips[h]) or {}
+        where[h] = {"ip": ips[h], "cc": g.get("cc", ""), "flag": flag_of(g.get("cc")), "country": g.get("country", ""),
+                    "city": g.get("city", ""), "isp": g.get("isp", "")}
+    users = group_users([c for c in read_clients(app.db_path) if c["sub"] == sub])
+    return {"sub": sub, "user": users[0]["name"] if users else sub, "at": int(time.time() * 1000), "entries": entries,
+            "hosts": where}
 
 
 def g2j(gy, gm, gd):
@@ -3306,6 +3448,169 @@ class Jobs:
             return [dict(j, log=j["log"][-3:]) for j in self.jobs.values() if j["status"] == "running"]
 
 
+# ---------------------------------------------------------------- Cloudflare: domain and subdomains of the entry servers
+#
+# One API token (made from a pre-filled link) lets the panel manage the DNS of the user's domain:
+# every Iran server gets its own subdomain (A record, DNS only, TTL 60) and the subscriptions use
+# that name instead of the bare IP. The same token carries Workers permissions for later use.
+
+CF_API = "https://api.cloudflare.com/client/v4"
+CF_PERMS = [("dns", "edit"), ("zone", "read"), ("workers_scripts", "edit"), ("workers_routes", "edit"),
+            ("workers_kv_storage", "edit"), ("account_settings", "read")]
+LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?")
+
+
+def cf_token_url(name="EZ-XUI"):
+    """Cloudflare's token page with every permission the panel needs already chosen."""
+    keys = json.dumps([{"key": k, "type": t} for k, t in CF_PERMS], separators=(",", ":"))
+    return "https://dash.cloudflare.com/profile/api-tokens?" + urllib.parse.urlencode(
+        {"permissionGroupKeys": keys, "accountId": "*", "zoneId": "all", "name": name}, quote_via=urllib.parse.quote)
+
+
+class CFError(PanelError):
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        self.code = code
+
+
+class Cloudflare:
+    """Minimal Cloudflare API v4 client (Bearer token)."""
+
+    def __init__(self, token, base=None):
+        self.token = token
+        self.base = base or CF_API
+
+    def call(self, method, path, body=None, timeout=15):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers={
+            "Authorization": "Bearer " + self.token, "Content-Type": "application/json",
+            "User-Agent": "%s/%s" % (NAME, VERSION)})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                out = json.loads(r.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as e:
+            try:
+                out = json.loads(e.read().decode("utf-8") or "{}")
+            except ValueError:
+                raise CFError("کلادفلر: HTTP %d" % e.code)
+        except (OSError, ValueError) as e:
+            raise CFError("کلادفلر در دسترس نیست: %s" % (getattr(e, "reason", None) or e))
+        if not out.get("success"):
+            err = (out.get("errors") or [{}])[0]
+            raise CFError("کلادفلر: %s" % (err.get("message") or "خطا"), err.get("code"))
+        return out.get("result")
+
+    def verify(self):
+        return self.call("GET", "/user/tokens/verify")
+
+    def zones(self):
+        return self.call("GET", "/zones?per_page=50") or []
+
+    def records(self, zone, name):
+        return self.call("GET", "/zones/%s/dns_records?type=A&name=%s" % (zone, urllib.parse.quote(name))) or []
+
+    def set_a(self, zone, name, ip):
+        """Create or update the A record name -> ip (DNS only: no Cloudflare proxy in the way)."""
+        body = {"type": "A", "name": name, "content": ip, "ttl": 60, "proxied": False, "comment": "EZ-XUI"}
+        found = self.records(zone, name)
+        if found:
+            return self.call("PUT", "/zones/%s/dns_records/%s" % (zone, found[0]["id"]), body)
+        return self.call("POST", "/zones/%s/dns_records" % zone, body)
+
+    def delete_a(self, zone, name):
+        for rec in self.records(zone, name):
+            self.call("DELETE", "/zones/%s/dns_records/%s" % (zone, rec["id"]))
+
+    def can(self, zone, account):
+        """Which parts the token reaches: {"dns", "workers"}."""
+        out = {"dns": False, "workers": False}
+        try:
+            self.call("GET", "/zones/%s/dns_records?per_page=1" % zone)
+            out["dns"] = True
+        except CFError:
+            pass
+        if account:
+            try:
+                self.call("GET", "/accounts/%s/workers/scripts" % account)
+                out["workers"] = True
+            except CFError:
+                pass
+        return out
+
+
+def cf_ready(cfg):
+    return bool(cfg.get("cf_token") and cfg.get("cf_zone_id") and cfg.get("cf_zone"))
+
+
+def cf_client(cfg):
+    if not cf_ready(cfg):
+        raise PanelError("اول کلادفلر رو وصل کن و دامنه رو انتخاب کن")
+    return Cloudflare(cfg["cf_token"])
+
+
+def cf_pick_zone(zones, host):
+    """The zone the panel's own domain belongs to, else the only one."""
+    host = (host or "").lower().rstrip(".")
+    best = None
+    for z in zones:
+        name = z["name"].lower()
+        if (host == name or host.endswith("." + name)) and (best is None or len(name) > len(best["name"])):
+            best = z
+    return best or (zones[0] if len(zones) == 1 else None)
+
+
+def cf_public(cfg):
+    """Cloudflare state for the admin page; the token itself never leaves the server."""
+    return {"connected": bool(cfg.get("cf_token")), "zone": cfg.get("cf_zone", ""), "zone_id": cfg.get("cf_zone_id", ""),
+            "zones": [{"id": z["id"], "name": z["name"]} for z in cfg.get("cf_zones") or []],
+            "perms": cfg.get("cf_perms") or {}, "auto": cfg.get("cf_auto", True), "token_url": cf_token_url()}
+
+
+def cf_label_for(srv, servers):
+    """A free label for a new subdomain: ir1, ir2, ... (or ex1 for other servers)."""
+    taken = {(s.get("domain") or "").split(".")[0] for s in servers}
+    prefix = "ir" if srv.get("role") == "iran" else "ex"
+    k = 1
+    while "%s%d" % (prefix, k) in taken:
+        k += 1
+    return "%s%d" % (prefix, k)
+
+
+def cf_set_server(cfg, srv, label):
+    """Point label.<zone> at the server's IP and remember it on the server."""
+    label = (label or "").strip().lower()
+    if not LABEL_RE.fullmatch(label):
+        raise PanelError("اسم ساب‌دامین فقط حروف انگلیسی کوچک، عدد و - باشد (مثلاً ir1)")
+    ip = (srv.get("facts") or {}).get("ip") or (srv.get("host") if IP_RE.fullmatch(srv.get("host") or "") else "")
+    if not ip:
+        raise PanelError("آی‌پی این سرور معلوم نیست؛ اول «به‌روزرسانی مشخصات» رو بزن")
+    cf = cf_client(cfg)
+    fqdn = "%s.%s" % (label, cfg["cf_zone"])
+    old = srv.get("domain")
+    cf.set_a(cfg["cf_zone_id"], fqdn, ip)
+    if old and old != fqdn:
+        try:
+            cf.delete_a(cfg["cf_zone_id"], old)
+        except CFError:
+            pass
+    srv["domain"], srv["domain_ip"] = fqdn, ip
+    return fqdn
+
+
+def cf_sync_server(cfg, srv):
+    """The server's IP changed: move its subdomain along. Errors are only reported."""
+    ip = (srv.get("facts") or {}).get("ip")
+    if not (srv.get("domain") and ip and ip != srv.get("domain_ip") and cf_ready(cfg)):
+        return False
+    try:
+        Cloudflare(cfg["cf_token"]).set_a(cfg["cf_zone_id"], srv["domain"], ip)
+        srv["domain_ip"] = ip
+        return True
+    except CFError as e:
+        print("cloudflare sync %s: %s" % (srv.get("name"), e), flush=True)
+        return False
+
+
 # ---------------------------------------------------------------- network manager
 
 class Net:
@@ -3381,6 +3686,12 @@ class Net:
             raise PanelError(str(e))
         log("کلید نصب شد. خواندن مشخصات سرور…")
         srv["facts"] = server_facts(srv)
+        cfg = load_config()
+        if srv["role"] == "iran" and cfg.get("cf_auto", True) and cf_ready(cfg):
+            try:
+                log("ساب‌دامین: %s" % cf_set_server(cfg, srv, cf_label_for(srv, self.servers())))
+            except PanelError as e:
+                log("ساب‌دامین ساخته نشد: %s" % e)
         self.save_server(srv)
         log("سرور %s اضافه شد (%s، %s)" % (srv["name"], srv["facts"].get("os", ""), srv["facts"].get("ip", "")))
         return srv
@@ -3392,6 +3703,8 @@ class Net:
             srv["error"] = ""
         except SSHError as e:
             srv["error"] = str(e)
+        if not srv.get("local"):
+            cf_sync_server(load_config(), srv)
         self.save_server(srv)
         return srv
 
@@ -3410,6 +3723,12 @@ class Net:
         if any(sid in (t["entry"], t["exit"]) for t in self.tunnels()):
             raise PanelError("اول تانل‌های این سرور را حذف کن")
         cfg = load_config()
+        srv = next((s for s in cfg.get("servers") or [] if s["id"] == sid), None)
+        if srv and srv.get("domain") and cf_ready(cfg):
+            try:
+                Cloudflare(cfg["cf_token"]).delete_a(cfg["cf_zone_id"], srv["domain"])
+            except CFError as e:
+                print("cloudflare delete %s: %s" % (srv["domain"], e), flush=True)
         cfg["servers"] = [s for s in (cfg.get("servers") or []) if s["id"] != sid]
         save_config(cfg)
         self.app.reload()
@@ -3870,6 +4189,7 @@ def admin_state(app, host):
         },
         "decos": deco_lines(app),
         "routes": rts,
+        "cf": cf_public(cfg),
         "groups": deco_groups(cfg, ups),
         "exits": exits_of(cfg, panel.get("nodes")),
         "pings": app.net.pings,
@@ -3911,7 +4231,8 @@ def user_sub_public(cfg, sub):
 
 
 def public_server(s):
-    out = {k: s.get(k) for k in ("id", "name", "host", "port", "user", "role", "local", "created", "error", "node_id")}
+    out = {k: s.get(k) for k in ("id", "name", "host", "port", "user", "role", "local", "created", "error", "node_id", "domain",
+                                 "domain_ip")}
     f = s.get("facts") or {}
     out["facts"] = {k: f.get(k) for k in ("hostname", "arch", "os", "ip", "cc", "qdisc", "fwd", "cpus", "mem", "load",
                                           "uptime", "xui", "xui_port", "tools", "ipv6", "units", "at", "tuned")}
@@ -4212,6 +4533,80 @@ def do_action(app, action, body, host):
             save_config(cfg)
             app.reload()
             return done("ساب %s ذخیره شد" % u["name"])
+
+        if action == "cf_connect":
+            token = str(body.get("token") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_\-]{20,200}", token):
+                return fail("توکن کلادفلر درست کپی نشده")
+            cf = Cloudflare(token)
+            cf.verify()
+            zones = cf.zones()
+            if not zones:
+                return fail("این توکن به هیچ دامنه‌ای دسترسی نداره. اول دامنه رو توی کلادفلر اضافه کن، یا موقع ساخت توکن «All zones» رو بذار.")
+            cfg = load_config()
+            cfg["cf_token"] = token
+            cfg["cf_zones"] = [{"id": z["id"], "name": z["name"], "account": (z.get("account") or {}).get("id", "")} for z in zones]
+            z = cf_pick_zone(cfg["cf_zones"], cfg.get("public_host") or app.rt.get("public_host") or host.rsplit(":", 1)[0])
+            if z:
+                cfg["cf_zone"], cfg["cf_zone_id"], cfg["cf_account_id"] = z["name"], z["id"], z["account"]
+                cfg["cf_perms"] = cf.can(z["id"], z["account"])
+            save_config(cfg)
+            app.reload()
+            return done("کلادفلر وصل شد" + ("؛ دامنه: %s" % z["name"] if z else "؛ دامنه رو انتخاب کن"))
+
+        if action == "cf_zone":
+            cfg = load_config()
+            z = next((x for x in cfg.get("cf_zones") or [] if x["id"] == str(body.get("id", ""))), None)
+            if not z or not cfg.get("cf_token"):
+                return fail("این دامنه پیدا نشد")
+            cfg["cf_zone"], cfg["cf_zone_id"], cfg["cf_account_id"] = z["name"], z["id"], z.get("account", "")
+            cfg["cf_perms"] = Cloudflare(cfg["cf_token"]).can(z["id"], z.get("account"))
+            save_config(cfg)
+            app.reload()
+            return done("دامنه: %s" % z["name"])
+
+        if action == "cf_disconnect":
+            cfg = load_config()
+            for k in ("cf_token", "cf_zone", "cf_zone_id", "cf_account_id"):
+                cfg[k] = ""
+            cfg["cf_zones"], cfg["cf_perms"] = [], {}
+            save_config(cfg)
+            app.reload()
+            return done("کلادفلر جدا شد؛ رکوردهای DNS سر جاشون موندن")
+
+        if action in ("cf_sub_set", "cf_sub_delete", "cf_sub_auto"):
+            cfg = load_config()
+            if "auto" in body:
+                cfg["cf_auto"] = bool(body["auto"])
+                save_config(cfg)
+                app.reload()
+                if action == "cf_sub_auto" and not body.get("create"):
+                    return done("ذخیره شد")
+            net = app.net
+            if action == "cf_sub_auto":
+                made = []
+                for srv in net.servers():
+                    if srv.get("role") == "iran" and not srv.get("local") and not srv.get("domain"):
+                        made.append(cf_set_server(cfg, srv, cf_label_for(srv, net.servers())))
+                        net.save_server(srv)
+                return done("ساخته شد: %s" % "، ".join(made) if made else "همه‌ی سرورهای ایران ساب‌دامین دارن")
+            srv = net.server(str(body.get("id", "")))
+            if srv.get("local"):
+                return fail("برای این سرور، دامنه رو توی خود 3x-ui بذار")
+            if action == "cf_sub_delete" or not str(body.get("name") or "").strip():
+                if srv.get("domain"):
+                    cf_client(cfg).delete_a(cfg["cf_zone_id"], srv["domain"])
+                srv.pop("domain", None)
+                srv.pop("domain_ip", None)
+                net.save_server(srv)
+                return done("ساب‌دامین حذف شد؛ ساب کاربرها دوباره آی‌پی رو دارن")
+            fqdn = cf_set_server(cfg, srv, str(body.get("name")))
+            net.save_server(srv)
+            return done("%s → %s" % (fqdn, srv["domain_ip"]))
+
+        if action == "sub_map":
+            sub = str(body.get("sub", ""))
+            return 200, {"ok": True, "map": sub_map(app, sub)}
 
         if action == "route_add":
             cfg = load_config()
@@ -4533,6 +4928,17 @@ select.in{appearance:none;-webkit-appearance:none;background-image:linear-gradie
 .tblk.grp .gbody{border-top:1px solid var(--line)}.tblk.grp.off>.ghead .t{opacity:.45}
 .gfold{display:flex;gap:8px;align-items:center;padding:8px 0 4px}.gfold .check{margin:0;flex:none;padding:7px 10px}.gfold .in{flex:1;min-width:0;padding:7px 10px}
 .acc{color:var(--acc)}
+.seg.sub button{display:flex;align-items:center;justify-content:center;gap:6px}.seg.sub .i{width:16px;height:16px}
+.flow{display:flex;flex-wrap:wrap;align-items:center;gap:5px 3px;margin-top:6px}
+.fn{font-size:12px;border:1px solid var(--line2);border-radius:7px;padding:2px 7px;white-space:nowrap}.fn.end{border-color:var(--fg)}
+.farr{color:var(--mut);font-size:11px}
+.fsteps{padding:2px 0 6px}.fstep{display:flex;gap:10px;align-items:flex-start;padding:6px 0;position:relative}
+.fstep .fdot{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;border:1px solid var(--line2);flex:none;font-size:13px;background:var(--card)}
+.fstep:not(:last-child)::after{content:"";position:absolute;right:12px;top:31px;bottom:-5px;width:1px;background:var(--line2)}
+.fstep .t small{display:block;color:var(--mut);font-size:11.5px;line-height:1.5}
+.mapcard{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:10px 12px;margin:8px 0}
+.mapcard .ghead{border-bottom:0;padding:0;min-height:0}
+.guide a{color:var(--acc)}
 .tag.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 50%,var(--line2))}
 .warnbox{border:1px solid color-mix(in srgb,var(--warn) 45%,var(--line2));background:var(--warnbg);border-radius:10px;padding:10px 12px;margin:10px 0;font-size:13px}
 .warnbox .btn{margin-top:8px}
@@ -4608,6 +5014,7 @@ const toman=v=>v==null||v===""?"—":fa(Math.round(+v).toLocaleString("en-US"));
 const ms_=v=>v==null||v<0?"—":fa(v)+"ms";
 const mb=v=>v==null||v<0?"—":fa(v>=100?Math.round(v):(+v).toFixed(1))+" Mb";
 const S={state:null,auth:null,tab:"home",seg:"routes",filter:"all",q:"",theme:"auto"};
+try{S.eseg=localStorage.getItem("xc_eseg")||"srv"}catch(e){}
 try{S.tab=localStorage.getItem("xc_tab")||"home";S.theme=localStorage.getItem("xc_theme")||"auto";S.seg=localStorage.getItem("xc_seg")||"routes"}catch(e){}
 if(!["home","routes","users","settings"].includes(S.tab))S.tab="home";
 if(!["routes","templates","entries","exits"].includes(S.seg))S.seg="routes";
@@ -5137,15 +5544,93 @@ function routeAddSheet(engine,transport){
 }
 
 const exitPorts=sid=>{const s=srvBy(sid);if(!s)return [];return [...new Set(S.state.inbounds.filter(ib=>ib.enable!==false&&(s.local?!ib.node:(s.node_id&&ib.node===s.node_id))).map(ib=>ib.port))].sort((a,b)=>a-b)};
+/* domain (Cloudflare) */
+const cfSuggest=s=>{const taken=new Set(S.state.net.servers.map(x=>(x.domain||"").split(".")[0]));const pre=s.role==="iran"?"ir":"ex";let k=1;while(taken.has(pre+k))k++;return pre+k};
+function domainNote(){const c=S.state.cf;
+  return c.connected&&c.zone?`<div class="note">🌐 ساب‌دامین‌ها روی <span class="ltr">${esc(c.zone)}</span>؛ توی ساب به‌جای آی‌پی سرورهای ایران اسم خودشون میاد. <button class="lnk" data-act="cf-open">مدیریت دامنه</button></div>`
+    :`<div class="note">🌐 با وصل کردن کلادفلر، هر سرور ایران ساب‌دامین خودش رو می‌گیره (مثلاً <span class="ltr">ir1.domain.com</span>) و توی ساب به‌جای آی‌پی میاد. <button class="lnk" data-act="cf-connect">وصل کردن</button></div>`}
+function cfSheet(){
+  const c=S.state.cf;
+  sheet(`<h3>🌐 وصل کردن کلادفلر</h3>
+  <p class="mut small">با یه توکن، پنل DNS دامنه‌ت رو خودش مدیریت می‌کنه: برای هر سرور ایران یه ساب‌دامین می‌سازه و اگه آی‌پی عوض شد خودش درستش می‌کنه. دسترسی Workers هم برای ربات بدون سرور گرفته می‌شه.</p>
+  <form id="cff" class="guide">
+  <div class="step"><span class="n">۱</span>دامنه‌ت روی کلادفلره؟</div>
+  <div class="hint">اگه هست، برو مرحله‌ی ۲. اگه نه: <a href="https://dash.cloudflare.com/sign-up" target="_blank" rel="noopener">ساخت حساب کلادفلر</a> (رایگان)، بعد <a href="https://dash.cloudflare.com/?to=/:account/add-site" target="_blank" rel="noopener">افزودن دامنه</a> با پلن Free، و دو تا Nameserverی که کلادفلر می‌ده رو توی سایتی که دامنه رو ازش خریدی جایگزین کن. <a href="https://developers.cloudflare.com/dns/zone-setups/full-setup/setup/" target="_blank" rel="noopener">راهنمای کامل</a></div>
+  <div class="step"><span class="n">۲</span>ساخت توکن (دسترسی‌ها از قبل انتخاب شدن)</div>
+  <a class="btn block" href="${esc(c.token_url)}" target="_blank" rel="noopener">${ic("link")} باز کردن صفحه‌ی ساخت توکن</a>
+  <div class="hint">توی صفحه‌ای که باز می‌شه چیزی رو عوض نکن؛ برو پایین، «Continue to summary» و بعد «Create Token» رو بزن و توکن رو کپی کن. اگه وارد حسابت نبودی، اول وارد شو و دوباره همین دکمه رو بزن.</div>
+  <div class="step"><span class="n">۳</span>توکن رو اینجا بذار</div>
+  <input class="in ltr" name="cftoken" type="password" placeholder="توکن کلادفلر" autocomplete="off" required>
+  <button class="btn block" style="margin-top:10px">${ic("check")} اتصال</button>
+  <details style="margin-top:8px"><summary>توکن به چی دسترسی داره؟</summary>
+  <div class="hint">Zone ← DNS: ویرایش (ساخت ساب‌دامین)، Zone ← Zone: خواندن (دیدن دامنه‌ها)، Account ← Workers Scripts، Workers Routes و Workers KV: ویرایش (ربات بدون سرور)، Account Settings: خواندن. توکن فقط روی سرور خودت ذخیره می‌شه و توی پنل نشون داده نمی‌شه؛ هر وقت بخوای از <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener">صفحه‌ی توکن‌ها</a> باطلش کن.</div></details>
+  </form>`,el=>{const f=$("#cff",el);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"cf_connect",{token:f.cftoken.value.trim()});if(j.ok){closeSheet();S.tab="settings";render();setTimeout(()=>{const x=$("#cf-sec");x&&x.scrollIntoView({behavior:"smooth"})},60)}}});
+}
+function cfSubSheet(s){
+  const c=S.state.cf;if(!(c.connected&&c.zone)){cfSheet();return}
+  const cur=(s.domain||"").endsWith("."+c.zone)?s.domain.slice(0,-(c.zone.length+1)):"";
+  const ip=(s.facts||{}).ip||s.host;
+  sheet(`<h3>🌐 ساب‌دامین ${esc(s.name)}</h3><form id="cfs">
+  <label class="f"><span>اسم</span><div style="display:flex;gap:6px;align-items:center;direction:ltr"><input class="in ltr" name="label" value="${esc(cur||cfSuggest(s))}" style="flex:1" autocomplete="off" autocapitalize="off"><span class="mut">.${esc(c.zone)}</span></div></label>
+  <div class="hint">به آی‌پی <span class="ltr">${esc(ip)}</span> اشاره می‌کنه، به‌صورت DNS only (ابر خاکستری، بدون پروکسی کلادفلر؛ سریع‌ترین حالت و برای همه‌ی پروتکل‌ها درسته). توی ساب کاربرها به‌جای آی‌پی همین اسم میاد.</div>
+  <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button>${s.domain?`<button type="button" class="btn danger" data-del>${ic("trash")} حذف</button>`:""}</div></form>`,el=>{
+    const f=$("#cfs",el);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"cf_sub_set",{id:s.id,name:f.label.value.trim().toLowerCase()});if(j.ok)closeSheet()};
+    const d=$("[data-del]",el);if(d)d.onclick=async()=>{const j=await act(d,"cf_sub_delete",{id:s.id});if(j.ok)closeSheet()};
+  });
+}
+function cfCard(){
+  const c=S.state.cf,irans=S.state.net.servers.filter(s=>s.role==="iran"&&!s.local);
+  if(!c.connected)return `<div class="card" id="cf-sec"><h2>🌐 دامنه (کلادفلر)</h2><p class="mut small">هر سرور ایران ساب‌دامین خودش رو می‌گیره (مثلاً <span class="ltr">ir1.domain.com</span>) و توی ساب به‌جای آی‌پی میاد. آی‌پی عوض بشه، پنل خودش رکورد رو درست می‌کنه. دسترسی Workers هم برای ربات بدون سرور گرفته می‌شه.</p><button class="btn block" data-act="cf-connect">${ic("link")} وصل کردن کلادفلر</button></div>`;
+  return `<div class="card" id="cf-sec"><h2>🌐 دامنه (کلادفلر) <span class="tag ok">وصل</span></h2>
+  ${c.zones.length>1||!c.zone?`<label class="f"><span>دامنه</span><select class="in" data-cfzone>${!c.zone?'<option value="">انتخاب کن…</option>':""}${c.zones.map(z=>`<option value="${esc(z.id)}" ${z.id===c.zone_id?"selected":""}>${esc(z.name)}</option>`).join("")}</select></label>`:`<div class="kv"><span>دامنه</span><span class="ltr">${esc(c.zone)}</span></div>`}
+  ${c.zone?`<div class="kv"><span>دسترسی‌ها</span><span><span class="tag ${c.perms.dns?"ok":"bad"}">DNS</span> <span class="tag ${c.perms.workers?"ok":"bad"}">Workers</span></span></div>
+  <div class="sec" style="margin:14px 2px 4px"><h3>ساب‌دامین سرورهای ایران</h3><button class="lnk" data-act="cf-all">+ ساخت برای همه</button></div>
+  <div class="list">${irans.map(s=>`<div class="row btn-row" data-act="cf-sub" data-id="${s.id}">${mono("IR",s.domain?"ok":"")}<div class="t"><b>${esc(s.name)}</b><small>${s.domain?`<span class="ltr">${esc(s.domain)} → ${esc(s.domain_ip||"")}</span>`:"ساب‌دامین نداره؛ توی ساب آی‌پی میاد"}</small></div><div class="r">${ic("edit")}</div></div>`).join("")||`<div class="note">هنوز سرور ایران نداری.</div>`}</div>
+  <label class="sw" data-act="cf-auto"><div><div>ساب‌دامین خودکار برای سرور ایران جدید</div><div class="hint">ir1، ir2…</div></div><input type="checkbox" ${c.auto?"checked":""} disabled><span class="t"></span></label>`:""}
+  <div class="bar-btns"><button class="btn sm ghost" data-act="cf-connect">${ic("refresh")} توکن تازه</button><button class="btn sm danger" data-act="cf-off">جدا کردن</button></div></div>`;
+}
+document.addEventListener("change",e=>{if(e.target.matches("[data-cfzone]")&&e.target.value)act(null,"cf_zone",{id:e.target.value})});
+
+/* subscription map: every entry of a user's sub and its way to the internet */
+const NODE={app:["📱","اپ کاربر"],relay:["🔁","واسط"],iran:["🇮🇷","سرور ایران"],tunnel:["🔗","تانل"],server:["🖥","سرور تو"],deco:["🔚","خروجی واسط"],net:["🌐","اینترنت"]};
+function flowOf(chain,h){
+  const chips=[],steps=[];
+  chain.forEach((n,i)=>{const t=NODE[n.t]||["•",""],g=n.host?(h[n.host]||{}):{};
+    const short=n.t==="app"?"اپ":n.t==="net"?"اینترنت":n.t==="tunnel"?"تانل":n.t==="relay"?(n.name||"").split(" · ")[0]:(n.name||t[1]);
+    const flagged=/\p{Regional_Indicator}/u.test(short),icon=flagged?"":(g.flag||t[0]);
+    chips.push(`<span class="fn ${n.t==="net"?"end":""}">${icon?icon+" ":""}${esc(short)}</span>`);
+    const where=[g.city,g.country].filter(Boolean).join("، ");
+    const exitIp=n.t==="net"?(()=>{const last=chain[i-1]||{};const lg=last.host?(h[last.host]||{}):{};return lg.ip?`خروج با آی‌پی <span class="ltr">${esc(lg.ip)}</span>${lg.country?"، "+esc(lg.country):""}`:""})():"";
+    steps.push(`<div class="fstep"><span class="fdot">${g.flag||t[0]}</span><div class="t"><b>${esc(n.t==="app"?"اپ کاربر":n.t==="net"?"اینترنت":n.name||t[1])}</b><small>${n.t==="app"?"شروع":n.t==="net"?"پایان":t[1]}${n.host?`، <span class="ltr">${esc(n.host)}:${n.port}</span>`:""}${g.ip&&g.ip!==n.host?`، <span class="ltr">${esc(g.ip)}</span>`:""}${where?"، "+esc(where):""}${g.isp?"، "+esc(g.isp):""}${n.proto?"، "+esc(n.proto):""}${exitIp}</small></div></div>`)});
+  return {chips:`<div class="flow">${chips.join('<span class="farr">←</span>')}</div>`,steps:`<div class="fsteps">${steps.join("")}</div>`};
+}
+function mapCard(e,i,h){
+  const id="mp"+i+"-"+Date.now()%100000;
+  if(e.kind==="info")return `<div class="mapcard"><b style="unicode-bidi:plaintext;display:block;text-align:right">${esc(e.name)}</b><small class="mut">کانفیگ اطلاعات؛ انتخابش یعنی «${esc(e.uses)}»</small></div>`;
+  if(e.kind==="auto")return `<div class="mapcard" data-gbox><div class="ghead row btn-row" data-gtoggle="${id}">${chev(false)}<div class="t"><b>${esc(e.name)}</b><small>${e.mode==="fastest"?"سریع‌ترینِ":"اولین سالمِ"} ${fa(e.members.length)} کانفیگ، به این ترتیب</small></div></div><div class="gbody" hidden><div class="fsteps">${e.members.map((m,k)=>`<div class="fstep"><span class="fdot">${fa(k+1)}</span><div class="t"><b>${esc(m)}</b></div></div>`).join("")}</div></div></div>`;
+  if(e.kind==="fold")return `<div class="mapcard" data-gbox><div class="ghead row btn-row" data-gtoggle="${id}">${chev(false)}<div class="t"><b>${esc(e.name)}</b><small>یه گزینه توی اپ: سریع‌ترینِ ${fa(e.configs.length)} کانفیگ</small></div></div><div class="gbody" hidden>${e.configs.map(c=>{const f=flowOf(c.chain,h);return `<div style="padding:6px 0;border-top:1px solid var(--line)"><b class="small">${esc(c.name)}</b>${f.chips}</div>`}).join("")}</div></div>`;
+  const f=flowOf(e.chain,h);
+  return `<div class="mapcard" data-gbox><div class="ghead row btn-row" data-gtoggle="${id}">${chev(false)}<div class="t"><b><span class="mut xs">${fa(i)}</span> ${esc(e.name)}</b>${f.chips}</div><div class="r">${e.down?'<span class="tag bad">قطع</span>':""}${e.auto?`<span class="warn">${ic("zap")}</span>`:""}</div></div><div class="gbody" hidden>${f.steps}</div></div>`;
+}
+function subMapSheet(u){
+  sheet(`<h3>${ic("route")} نقشه‌ی ساب <span class="ltr">${esc(u.name)}</span></h3><div class="mut small">هر کانفیگی که این کاربر توی اپش می‌بینه، به همون ترتیب؛ از کجا شروع می‌شه، از کجاها رد می‌شه و ترافیک از کجا وارد اینترنت می‌شه. روی هر کدوم بزن تا آی‌پی و جاش رو ببینی.</div><div id="mapbox"><div class="skel"></div><div class="skel"></div></div>`,async el=>{
+    let j;try{j=await api("sub_map",{sub:u.sub},true)}catch(e){j={ok:false}}
+    const box=$("#mapbox",el);if(!box)return;
+    if(!j.ok){box.innerHTML=`<div class="err">${esc(j.error||"نقشه ساخته نشد")}</div>`;return}
+    let n=0;box.innerHTML=j.map.entries.map(e=>mapCard(e,(e.kind==="info"||e.kind==="auto")?0:++n,j.map.hosts)).join("")||`<div class="note">این کاربر کانفیگی توی ساب نداره.</div>`;
+  });
+}
 /* entries: Iran servers, Decos, direct */
 SEGV.entries=()=>{
   const st=S.state,n=st.net,irans=n.servers.filter(s=>s.role==="iran"),ds=st.decos;
   const usedBy=id=>(st.routes||[]).find(r=>r.kind==="tunnel"&&r.server_id===id);
-  return `<div class="sec"><h3>سرورهای ایران</h3><button class="lnk" data-act="srv-add" data-role="iran">+ افزودن</button></div>
+  const srvHtml=`<div class="sec"><h3>سرورهای ایران</h3><button class="lnk" data-act="srv-add" data-role="iran">+ افزودن</button></div>
   <div class="list">${irans.map(s=>{const f=s.facts||{},on=!s.error&&f.ip,r=usedBy(s.id);
-    return `<div class="row btn-row" data-act="srv-more" data-id="${s.id}">${mono("IR",on?"ok":s.error?"bad":"")}<div class="t"><b>${esc(s.name)}</b><small><span class="ltr">${esc(f.ip||s.host||"")}</span>${f.os?"، "+esc(f.os):""}${f.cc==="bbr"?"، BBR":""}${r?"، "+(r.remaining!=null?gb(r.remaining)+" GB مانده":r.used!=null?gb(r.used)+" GB":"تانل دارد"):"، بدون تانل"}</small></div>
+    return `<div class="row btn-row" data-act="srv-more" data-id="${s.id}">${mono("IR",on?"ok":s.error?"bad":"")}<div class="t"><b>${esc(s.name)}</b><small>${s.domain?`<span class="ltr">${esc(s.domain)}</span>، `:""}<span class="ltr">${esc(f.ip||s.host||"")}</span>${f.os?"، "+esc(f.os):""}${f.cc==="bbr"?"، BBR":""}${r?"، "+(r.remaining!=null?gb(r.remaining)+" GB مانده":r.used!=null?gb(r.used)+" GB":"تانل دارد"):"، بدون تانل"}</small></div>
     <div class="r">${s.error?`<span class="bad">خطا</span>`:""}<span class="dot ${on?"ok":s.error?"bad":""}"></span></div></div>`}).join("")||`<div class="note">سرور ایران نداری. کاربرها به آی‌پی ایران وصل می‌شن و ترافیک از تانل به سرور خودت می‌رسه؛ سریع‌ترین و پایدارترین ورودیه. با یوزر و پس root اضافه کن.</div>`}</div>
-  <div class="sec"><h3>واسط‌ها (کانفیگ بقیه)</h3><span><button class="lnk" data-act="deco-raw">متنی</button>، <button class="lnk" data-act="test">تست</button>، <button class="lnk" data-act="deco-add">+ افزودن</button></span></div>
+  ${domainNote()}
+  <div class="note">${ic("info")} ورودی «مستقیم» همیشه هست: کاربر مستقیم به آی‌پی سرور خودت وصل می‌شه.</div>`;
+  const cfgHtml=`<div class="sec"><h3>کانفیگ‌ها (واسط)</h3><span><button class="lnk" data-act="deco-raw">متنی</button>، <button class="lnk" data-act="test">تست</button>، <button class="lnk" data-act="deco-add">+ افزودن</button></span></div>
   ${ds.length?ds.map((d,i)=>{const q=d.quota;let qh="";
     if(q){const left=Math.max(0,(q.total||0)-(q.upload||0)-(q.download||0));const p=q.total?pct((q.upload||0)+(q.download||0),q.total):0;const days=q.expire?Math.ceil((q.expire*1000-Date.now())/864e5):null;
       qh=`<div class="meter"><div class="rw"><span>${q.total?gb(left)+" از "+gb(q.total)+" GB مانده":gb((q.upload||0)+(q.download||0))+" GB مصرف"}</span><span class="${days!==null&&days<=2?"bad":"mut"}">${days===null?"":days>0?fa(days)+" روز":"منقضی"}</span></div>${q.total?`<div class="bar"><i class="${barCls(p)}" style="width:${p}%"></i></div>`:""}</div>`}
@@ -5158,7 +5643,9 @@ SEGV.entries=()=>{
     return `<div class="list" data-gbox><div class="row btn-row ghead" data-gtoggle="${esc(gid)}">${chev(open)}<div class="t"><b class="ltr" style="text-align:right">${esc(d.title)}</b><small>${d.kind==="sub"?"لینک ساب، ":""}${fa(d.nodes.length)} کانفیگ${okN?`، <span class="ok">${fa(okN)} سالم</span>`:""}${badN?`، <span class="bad">${fa(badN)} قطع</span>`:""}${left!=null?`، ${gb(left)} GB مانده`:""}</small></div>${moves}</div>
      <div class="gbody" ${open?"":"hidden"}>${d.nodes.map(nd=>node(nd)).join("")}${qh?`<div style="padding:0 0 10px">${qh}</div>`:""}</div>
      ${d.error?`<div class="err" style="padding-bottom:8px">${esc(d.error)}</div>`:""}</div>`}).join(""):`<div class="list"><div class="note">واسط = کانفیگ یا لینک ساب یکی دیگه. کاربر اول به اون وصل می‌شه و از اونجا به سرور تو می‌رسه؛ یا خود کانفیگش همون‌طور که هست توی ساب میاد. آخرین تست: ${ago(st.monitor.last_run)}</div></div>`}
-  <div class="note">${ic("info")} ورودی «مستقیم» همیشه هست: کاربر مستقیم به آی‌پی سرور خودت وصل می‌شه. ${st.monitor.note?esc(st.monitor.note):""}</div>`;
+  ${st.monitor.note?`<div class="note">${ic("info")} ${esc(st.monitor.note)}</div>`:""}`;
+  const e=S.eseg||"srv";
+  return `<div class="seg sub"><button data-act="eseg" data-e="srv" class="${e==="srv"?"on":""}">${ic("server")} سرور</button><button data-act="eseg" data-e="cfg" class="${e==="cfg"?"on":""}">${ic("link")} کانفیگ</button></div>${e==="srv"?srvHtml:cfgHtml}`;
 };
 /* exits: own servers */
 SEGV.exits=()=>{
@@ -5250,6 +5737,7 @@ function srvMoreSheet(s){
   sheet(`<h3>${mono(s.local?"⌂":s.role==="iran"?"IR":"EX","",true)} ${esc(s.name)}</h3><div class="mut small ltr" style="text-align:right">${esc(f.ip||s.host)}${s.local?"":" · "+esc(s.user||"root")+"@"+esc(s.host)+":"+fa(s.port||22)}</div>
   <div class="chips">${f.os?`<span class="tag">${esc(f.os)}</span>`:""}${f.cpus?`<span class="tag">${fa(f.cpus)} هسته</span>`:""}${f.mem?`<span class="tag">${gb(f.mem)} GB</span>`:""}${f.load!=null&&f.cpus?`<span class="tag">بار ${fa(Math.round(f.load*100/f.cpus))}٪</span>`:""}${f.cc?`<span class="tag ${tuned?"ok":""}">${tuned?"BBR":"TCP "+esc(f.cc)}</span>`:""}${f.xui?`<span class="tag">3x-ui</span>`:""}${tools.map(t=>`<span class="tag">${esc(t)}</span>`).join("")}</div>
   ${s.error?`<div class="err">${esc(s.error)}</div>`:""}
+  ${!s.local?`<div class="kv"><span>ساب‌دامین</span><span>${s.domain?`<span class="ltr">${esc(s.domain)}</span>`:'<span class="mut">ندارد</span>'} <button type="button" class="lnk" data-act="cf-sub" data-id="${s.id}">${s.domain?"تغییر":"ساختن"}</button></span></div>`:""}
   ${r&&r.used!=null?`<div class="kv"><span>ترافیک این دوره</span><span>${gb(r.used)} GB${r.quota_gb?" از "+num(r.quota_gb):""} <span class="mut xs">${fa(esc(r.period||""))}</span></span></div>`:""}
   <div class="menu">
   <button data-act="srv-refresh" data-id="${s.id}">${ic("refresh")} به‌روزرسانی مشخصات</button>
@@ -5355,7 +5843,7 @@ function shareSheet(u){
   <div class="mut small">این لینک رو در اپ کاربر به‌عنوان Subscription اضافه کن. FlClash، Clash Meta، v2rayNG، Streisand، V2Box و Happ خودکار تشخیص داده می‌شن.</div>
   <div class="linkbox">${esc(link)}</div>
   ${u.sub?`<div class="kv"><span>محتوای ساب</span><span>${esc(tplName(u.tpl||"default"))} <button type="button" class="lnk" data-act="user-sub" data-sub="${esc(u.sub)}">تغییر</button></span></div>`:""}
-  <div class="bar-btns"><button class="btn" data-act="copy" data-text="${esc(link)}">${ic("copy")} کپی</button><a class="btn ghost" href="${esc(link)}?page=1" target="_blank" rel="noopener">${ic("users")} صفحه</a><button class="btn ghost icon" data-act="ping-user" data-sub="${esc(u.sub)}" title="پینگ کانفیگ‌ها">${ic("wifi")}</button>${navigator.share?`<button class="btn ghost icon" data-act="nshare" data-text="${esc(link)}">${ic("share")}</button>`:""}</div>
+  <div class="bar-btns"><button class="btn" data-act="copy" data-text="${esc(link)}">${ic("copy")} کپی</button><a class="btn ghost" href="${esc(link)}?page=1" target="_blank" rel="noopener">${ic("users")} صفحه</a><button class="btn ghost icon" data-act="sub-map" data-sub="${esc(u.sub)}" title="نقشه‌ی ساب">${ic("route")}</button><button class="btn ghost icon" data-act="ping-user" data-sub="${esc(u.sub)}" title="پینگ کانفیگ‌ها">${ic("wifi")}</button>${navigator.share?`<button class="btn ghost icon" data-act="nshare" data-text="${esc(link)}">${ic("share")}</button>`:""}</div>
   ${ping?`<div class="sec"><h3>پینگ کانفیگ‌ها</h3><span class="mut xs">${ago(ping.at)}</span></div><table class="tbl"><tr><th>کانفیگ</th><th>پورت</th><th>اتصال</th></tr>${ping.rows.map(r=>`<tr class="${r.ok?"":"off"}"><td>${esc(r.name)}</td><td class="ltr">${ms_(r.tcp_ms)}</td><td class="ltr">${r.ok?ms_(r.ms):r.ok===null?"—":esc(r.error||"قطع")}</td></tr>`).join("")}</table>`:""}
   <div class="qr" id="qrbox"></div>`,el=>{
     const box=$("#qrbox",el);
@@ -5408,6 +5896,7 @@ function moreSheet(u){
   sheet(`<h3><span class="ltr">${esc(u.name)}</span></h3><div class="mut small">${u.emails.length>1?"شامل: "+u.emails.map(esc).join("، "):""}</div><div class="menu">
   <button data-act="share" data-sub="${esc(u.sub)}">${ic("qr")} لینک و QR</button>
   <button data-act="user-sub" data-sub="${esc(u.sub)}">${ic("text")} محتوای ساب <span class="mut small">${esc(tplName(u.tpl||"default"))}</span></button>
+  <button data-act="sub-map" data-sub="${esc(u.sub)}">${ic("route")} نقشه‌ی ساب (هر کانفیگ از کجا به کجا)</button>
   <button data-act="ping-user" data-sub="${esc(u.sub)}">${ic("wifi")} پینگ کانفیگ‌هاش</button>
   <button data-act="edit" data-sub="${esc(u.sub)}">${ic("edit")} تمدید و ویرایش</button>
   <button data-act="u-enable" data-sub="${esc(u.sub)}" data-v="${u.enable?0:1}">${ic("power")} ${u.enable?"غیرفعال کردن":"فعال کردن"}</button>
@@ -5429,6 +5918,8 @@ VIEWS.settings=()=>{
    ${field("label_deco","اسم واسط‌ها در اپ",s.label_deco,'placeholder="واسط"',"«واسط ۱»، «واسط ۲»… با اسم لاتین مثل Deco: Deco1، Deco2")}
    <div class="hint" style="margin-top:8px">${ic("info")} چه کانفیگ‌هایی با چه اسم و ترتیبی توی ساب باشن: مسیرها ← تمپلیت‌ها.</div>
    <button class="btn block" style="margin-top:10px">${ic("check")} ذخیره</button></form>
+
+  ${cfCard()}
 
   <form class="card" data-sec="panel" id="panel-sec"><h2>پنل 3x-ui <span class="tag ${p.ok?"ok":p.configured?"bad":""}">${p.ok?"وصل"+(s.panel_source==="auto"?"، خودکار":"، دستی")+"، API v"+fa(p.version||""):p.configured?"خطا":"وصل نیست"}</span></h2>
    ${p.error?`<div class="err">${esc(p.error)}</div>`:""}
@@ -5533,6 +6024,14 @@ const ACTS={
   "srv-del":async b=>{const s=srvBy(b.dataset.id);if(await confirmSheet("حذف سرور",esc(s.name)+" از فهرست حذف می‌شه. چیزی روی خود سرور پاک نمی‌شه.","حذف کن",true))act(null,"net_server_delete",{id:s.id})},
   "tun-status":b=>{closeSheet();act(b,"net_tunnel_status",{id:b.dataset.id})},
   "tun-bench":b=>{closeSheet();act(b,"net_tunnel_bench",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
+  eseg:b=>{S.eseg=b.dataset.e;try{localStorage.setItem("xc_eseg",S.eseg)}catch(e){}render()},
+  "cf-connect":()=>cfSheet(),
+  "cf-open":()=>{closeSheet();S.tab="settings";render();setTimeout(()=>{const x=$("#cf-sec");x&&x.scrollIntoView({behavior:"smooth"})},60)},
+  "cf-sub":b=>{const s=srvBy(b.dataset.id);if(s)cfSubSheet(s)},
+  "cf-all":b=>act(b,"cf_sub_auto",{create:true}),
+  "cf-auto":()=>act(null,"cf_sub_auto",{auto:!S.state.cf.auto}),
+  "cf-off":async()=>{if(await confirmSheet("جدا کردن کلادفلر","توکن از پنل پاک می‌شه. ساب‌دامین‌هایی که ساخته شدن سر جاشون می‌مونن.","جدا کن",true))act(null,"cf_disconnect",{})},
+  "sub-map":b=>{const u=userBy(b.dataset.sub);if(u)subMapSheet(u)},
   "tun-ports":async b=>{const t=S.state.net.tunnels.find(x=>x.id===b.dataset.id);if(!t)return;const box=b.closest("details")||b.closest(".sheet");
     const inp=box&&$("[data-tports]",box);const ports=b.dataset.ports||(inp?inp.value.trim():"");if(!ports)return;
     if(!await confirmSheet("پورت‌های تانل","تانل «"+esc(t.name)+"» با پورت‌های <span class=\"ltr\">"+esc(ports)+"</span> روی هر دو سرور دوباره راه‌اندازی می‌شه (چند ثانیه قطعی).","انجام بده"))return;

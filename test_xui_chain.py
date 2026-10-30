@@ -299,6 +299,18 @@ class ProfileTests(unittest.TestCase):
         r = xc.routes(dict(cfg, tunnels=[dict(tunnels[0], ports="443")]), [])[1]
         self.assertIsNone(xc.rewrite_for_tunnel(own[1], r["entry"]["ip"], r["port_map"]))
 
+    def test_map_helpers(self):
+        self.assertEqual((xc.flag_of("ir"), xc.flag_of(""), xc.flag_of("X1")), ("🇮🇷", "", ""))
+        self.assertEqual(xc.resolve_hosts(["1.2.3.4", "[::1]"]), {"1.2.3.4": "1.2.3.4", "[::1]": "::1"})
+        self.assertTrue(xc.IP_RE.fullmatch("10.0.0.1") and xc.IP_RE.fullmatch("2001:db8::1"))
+        self.assertFalse(xc.IP_RE.fullmatch("cafe.be") or xc.IP_RE.fullmatch("vip2.example.com"))
+        self.assertEqual(xc.geo_lookup(["10.0.0.1", "", "nope"]), {"10.0.0.1": {}, "nope": {}})  # private / bad: not looked up
+        self.assertEqual(xc.cf_pick_zone([{"name": "a.com"}, {"name": "shelbyping.com"}], "sub.shelbyping.com")["name"], "shelbyping.com")
+        self.assertIsNone(xc.cf_pick_zone([{"name": "a.com"}, {"name": "b.com"}], "x.org"))
+        self.assertEqual(xc.cf_pick_zone([{"name": "a.com"}], "x.org")["name"], "a.com")
+        servers = [{"domain": "ir1.a.com"}, {"domain": "ir3.a.com"}, {}]
+        self.assertEqual((xc.cf_label_for({"role": "iran"}, servers), xc.cf_label_for({"role": "foreign"}, servers)), ("ir2", "ex1"))
+
     def test_tunnel_keeps_tls_name_and_checks_ports(self):
         n = xc.parse_link("vless://11111111-2222-3333-4444-555555555555@vip2.example.com:1080?type=ws&security=tls&path=%2Fw#me")
         m = xc.rewrite_for_tunnel(n, "5.6.7.8", {1080: 443})
@@ -357,7 +369,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual([r["key"] for r in xc.routes(cfg2, ups)][:3], ["tun:t1", "direct>main", "deco:%s>main" % ka])
         pub = xc.routes_public(xc.routes(cfg, ups, usage={"srv:ir1": 980 * xc.GB_BYTES}), {"tun:t1": {"ok": True, "ms": 80}})
         self.assertEqual((pub[4]["entry"], pub[4]["exit"], pub[4]["tunnel"]["engine"], pub[4]["ping"]["ms"]),
-                         ({"type": "server", "id": "ir1", "name": "ایران", "ip": "5.6.7.8"}, {"id": "main", "name": "سرور اصلی"}, "backhaul", 80))
+                         ({"type": "server", "id": "ir1", "name": "ایران", "ip": "5.6.7.8", "host": "5.6.7.8"}, {"id": "main", "name": "سرور اصلی"}, "backhaul", 80))
         self.assertTrue(pub[4]["period"].startswith("از "))
         self.assertNotIn("node", pub[1])
 
@@ -791,6 +803,44 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(json.loads(body)[0]["remarks"], "ali - 0 GB از 0 GB")
         finally:
             self.admin("settings", {"info_config": False, "info_format": ""})
+
+    def test_sub_map(self):
+        class Geo(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                ips = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                rows = [{"status": "success", "query": ip, "countryCode": "DE", "country": "Germany", "city": "Falkenstein",
+                         "isp": "Hetzner"} for ip in ips]
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps(rows).encode())
+        geo = start(ThreadingHTTPServer(("127.0.0.1", 0), Geo))
+        keep = xc.GEO_API
+        xc.GEO_API = "http://127.0.0.1:%d/batch" % geo.server_address[1]
+        xc.GEO_CACHE.clear()
+        self.login()
+        try:
+            self.admin("settings", {"info_config": True})
+            out = self.admin("sub_map", {"sub": "abc"})[1]
+            self.assertTrue(out["ok"], out)
+            m = out["map"]
+            self.assertEqual(m["user"], "ali")
+            kinds = [e["kind"] for e in m["entries"]]
+            self.assertEqual(kinds[:3], ["info", "auto", "direct"])
+            self.assertEqual(m["entries"][0]["uses"], "⚡ Auto")
+            self.assertEqual(m["entries"][1]["members"][:2], ["Main · user1-reality", "Main · user1-ws"])
+            relay = next(e for e in m["entries"] if e["name"] == "واسط ۱ · user1-reality")
+            self.assertEqual([n["t"] for n in relay["chain"]], ["app", "relay", "server", "net"])
+            self.assertEqual((relay["chain"][1]["host"], relay["chain"][2]["host"], relay["chain"][2]["port"]), ("198.51.100.6", "203.0.113.10", 443))
+            self.assertEqual(m["hosts"]["203.0.113.10"], {"ip": "203.0.113.10", "cc": "DE", "flag": "🇩🇪", "country": "Germany",
+                                                           "city": "Falkenstein", "isp": "Hetzner"})
+            self.assertFalse(self.admin("sub_map", {"sub": "nobody"})[1]["ok"])
+        finally:
+            self.admin("settings", {"info_config": False})
+            xc.GEO_API = keep
+            geo.shutdown()
 
     def test_route_ping(self):
         d = tempfile.mkdtemp()

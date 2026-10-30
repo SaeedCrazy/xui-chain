@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TMP = tempfile.mkdtemp()
@@ -219,6 +220,67 @@ class FakeSub(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+
+class FakeCF(BaseHTTPRequestHandler):
+    """Cloudflare API v4: one token, two zones, A records of zone z1, Workers of account a1."""
+    TOKEN = "good_token_0123456789abcdef"
+    records = {}
+    calls = []
+
+    def log_message(self, *a):
+        pass
+
+    def reply(self, code, result=None, errors=None):
+        body = json.dumps({"success": not errors, "errors": errors or [], "result": result}).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_any(self, method):
+        FakeCF.calls.append((method, self.path))
+        if self.headers.get("Authorization") != "Bearer " + FakeCF.TOKEN:
+            return self.reply(401, errors=[{"code": 1000, "message": "Invalid API Token"}])
+        path, _, query = self.path.partition("?")
+        q = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        if path == "/user/tokens/verify":
+            return self.reply(200, {"status": "active"})
+        if path == "/zones":
+            return self.reply(200, [{"id": "z1", "name": "example.com", "account": {"id": "a1"}},
+                                    {"id": "z2", "name": "other.net", "account": {"id": "a1"}}])
+        if path == "/accounts/a1/workers/scripts":
+            return self.reply(200, [])
+        m = re.match(r"/zones/z1/dns_records(?:/(\w+))?$", path)
+        if not m:
+            return self.reply(404, errors=[{"code": 7003, "message": "Could not route"}])
+        rid = m.group(1)
+        if method == "GET":
+            name = urllib.parse.unquote(q.get("name", ""))
+            return self.reply(200, [r for r in FakeCF.records.values() if not name or r["name"] == name])
+        if method == "POST":
+            rid = "r%d" % (len(FakeCF.records) + 1 + len(FakeCF.calls))
+            FakeCF.records[rid] = dict(body, id=rid)
+            return self.reply(200, FakeCF.records[rid])
+        if method == "PUT":
+            FakeCF.records[rid] = dict(body, id=rid)
+            return self.reply(200, FakeCF.records[rid])
+        if method == "DELETE":
+            FakeCF.records.pop(rid, None)
+            return self.reply(200, {"id": rid})
+
+    def do_GET(self):
+        self.handle_any("GET")
+
+    def do_POST(self):
+        self.handle_any("POST")
+
+    def do_PUT(self):
+        self.handle_any("PUT")
+
+    def do_DELETE(self):
+        self.handle_any("DELETE")
 
 
 class NetTests(unittest.TestCase):
@@ -446,6 +508,65 @@ class NetTests(unittest.TestCase):
         self.assertFalse(xc.do_action(self.app, "net_tunnel_ports", {"id": t["id"], "ports": "abc"}, "h")[1]["ok"])
         self.assertFalse(xc.do_action(self.app, "net_tunnel_ports", {"id": "nope", "ports": "443"}, "h")[1]["ok"])
         self.job("remove", lambda log: self.net.remove_tunnel(t["id"], log))
+
+    def test_09_cloudflare_subdomains(self):
+        cf = ThreadingHTTPServer(("127.0.0.1", 0), FakeCF)
+        threading.Thread(target=cf.serve_forever, daemon=True).start()
+        keep = xc.CF_API
+        xc.CF_API = "http://127.0.0.1:%d" % cf.server_address[1]
+        try:
+            act = lambda a, b=None: xc.do_action(self.app, a, b or {}, "main.example")[1]
+            self.assertIn("permissionGroupKeys=", xc.cf_token_url())
+            self.assertIn("%22dns%22", xc.cf_token_url())
+            self.assertFalse(act("cf_connect", {"token": "short"})["ok"])
+            out = act("cf_connect", {"token": "wrong_token_0123456789abcdef"})
+            self.assertIn("Invalid API Token", out["error"])
+            out = act("cf_connect", {"token": FakeCF.TOKEN})
+            self.assertTrue(out["ok"], out)
+            st = out["state"]["cf"]
+            self.assertEqual((st["connected"], st["zone"], [z["name"] for z in st["zones"]]), (True, "", ["example.com", "other.net"]))
+            self.assertNotIn(FakeCF.TOKEN, json.dumps(out["state"]))  # the token never reaches the browser
+            out = act("cf_zone", {"id": "z1"})
+            self.assertEqual((out["state"]["cf"]["zone"], out["state"]["cf"]["perms"]), ("example.com", {"dns": True, "workers": True}))
+            # every Iran server gets its own subdomain, and the tunnel routes use it
+            out = act("cf_sub_auto", {"create": True})
+            self.assertTrue(out["ok"], out)
+            iran = next(s for s in self.net.servers() if s["host"] == "iran.example")
+            self.assertEqual((iran["domain"], iran["domain_ip"]), ("ir1.example.com", "5.6.7.8"))
+            rec = next(r for r in FakeCF.records.values() if r["name"] == "ir1.example.com")
+            self.assertEqual((rec["content"], rec["proxied"], rec["ttl"]), ("5.6.7.8", False, 60))
+            self.net.save_tunnel({"id": "tc1", "name": "تانل", "entry": iran["id"], "exit": "main", "engine": "backhaul",
+                                  "ports": "443", "cport": 4000, "created": 1, "status": "up"})
+            status, hdrs, text = xc.build_subscription("abc", "clash", self.app.rt, self.app)
+            self.assertIn('server: "ir1.example.com"', text)
+            self.assertNotIn('server: "5.6.7.8"', text)
+            self.net.drop_tunnel("tc1")
+            # the server's IP changed: its record follows
+            iran["domain_ip"] = "1.1.1.1"
+            self.net.save_server(iran)
+            self.net.refresh(iran["id"])
+            self.assertEqual(self.net.server(iran["id"])["domain_ip"], "5.6.7.8")
+            # rename, bad name, delete
+            self.assertFalse(act("cf_sub_set", {"id": iran["id"], "name": "Bad_Name"})["ok"])
+            self.assertTrue(act("cf_sub_set", {"id": iran["id"], "name": "vip-ir"})["ok"])
+            self.assertEqual(sorted(r["name"] for r in FakeCF.records.values()), ["vip-ir.example.com"])
+            self.assertFalse(act("cf_sub_set", {"id": "main", "name": "x"})["ok"])
+            self.assertTrue(act("cf_sub_delete", {"id": iran["id"]})["ok"])
+            self.assertEqual(FakeCF.records, {})
+            self.assertNotIn("domain", self.net.server(iran["id"]))
+            # a new Iran server gets one on its own; removing the server removes the record
+            j = self.job("add", lambda log: self.net.add_server("ایران ۳", "ir3.example", 22, "root", "pw123", "iran", log))
+            self.assertEqual(j["status"], "done", j)
+            self.assertEqual(j["result"]["domain"], "ir1.example.com")
+            self.assertIn("ir1.example.com", [r["name"] for r in FakeCF.records.values()])
+            self.net.remove_server(j["result"]["id"])
+            self.assertEqual(FakeCF.records, {})
+            out = act("cf_disconnect")
+            self.assertEqual((out["state"]["cf"]["connected"], xc.load_config()["cf_token"]), (False, ""))
+            self.assertFalse(act("cf_sub_auto", {"create": True})["ok"])  # not connected
+        finally:
+            xc.CF_API = keep
+            cf.shutdown()
 
 
 if __name__ == "__main__":
