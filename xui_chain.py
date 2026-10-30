@@ -43,7 +43,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.2.0"
+VERSION = "5.2.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -118,7 +118,8 @@ def conf_path(name):
     return os.path.join(CONF_DIR, name)
 
 
-CONFIG_SCHEMA = 6
+CONFIG_SCHEMA = 7
+OLD_DECO_NAME = re.compile(r"Deco\d+( · .+)?")
 
 
 def load_config():
@@ -133,6 +134,10 @@ def load_config():
     if raw and int(raw.get("schema") or 0) < CONFIG_SCHEMA:
         if (raw.get("label_deco") or "Deco") == "Deco":  # the old default name of the upstreams
             cfg["label_deco"] = DEFAULTS["label_deco"]
+        for st in list((cfg.get("routes_cfg") or {}).values()) + [it for t in cfg.get("sub_templates") or [] for it in t.get("items") or []] + \
+                [it for u in (cfg.get("user_subs") or {}).values() for it in (u or {}).get("items") or []]:
+            if isinstance(st, dict) and OLD_DECO_NAME.fullmatch(str(st.get("name") or "")):
+                st["name"] = ""  # an automatic name saved under the old label
         cfg["schema"] = CONFIG_SCHEMA
         save_config(cfg)
     if not cfg.get("admin_path"):
@@ -710,12 +715,54 @@ def tunnel_port_map(t):
         return {}
 
 
+IP_RE = re.compile(r"\[?[0-9a-fA-F:.]+\]?")
+
+
 def rewrite_for_tunnel(n, entry_ip, port_map):
-    """The user's config as reached through the Iran server: its IP and the mapped port."""
+    """The user's config as reached through the Iran server: its IP and the mapped port. A config
+    addressed by domain keeps that domain as its TLS name and Host header, as it had them before."""
     port = port_map.get(n["port"])
     if not port or not entry_ip:
         return None
-    return dict(n, server=entry_ip, port=port)
+    m = dict(n, server=entry_ip, port=port)
+    if not IP_RE.fullmatch(n["server"]):
+        if n.get("security") in ("tls", "reality") and not n.get("sni"):
+            m["sni"] = n["server"]
+        if n.get("net") in ("ws", "httpupgrade", "xhttp", "splithttp", "h2", "http") and not n.get("host"):
+            m["host"] = n["server"]
+    return m
+
+
+def fmt_ports(ports):
+    return ", ".join(e if e == x else "%s=%s" % (e, x) for e, x in ports)
+
+
+def exit_inbound_ports(exit_id, inbounds, nodes):
+    """Ports of the panel inbounds that live on an exit (this server or a node)."""
+    if exit_id == "main":
+        node = None
+    else:
+        n = next((x for x in nodes or [] if x.get("address") == (exit_id or "")[2:]), None)
+        if not n:
+            return []
+        node = n["id"]
+    return sorted({int(ib["port"]) for ib in inbounds or [] if ib.get("port") and ib.get("enable", True)
+                   and ib.get("protocol") in ("vless", "vmess", "trojan", "shadowsocks")
+                   and ((not ib.get("node")) if node is None else ib.get("node") == node)})
+
+
+def annotate_ports(rts, inbounds, nodes):
+    """Tunnel routes get missing_ports: inbound ports of their exit the tunnel does not carry
+    (configs on those ports cannot use the route)."""
+    for r in rts:
+        t = r.get("tunnel")
+        if r.get("kind") != "tunnel" or not t or not r.get("exit_id"):
+            continue
+        need = exit_inbound_ports(r["exit_id"], inbounds, nodes)
+        have = set(tunnel_port_map(t))
+        r["need_ports"] = need
+        r["missing_ports"] = [p for p in need if p not in have]
+    return rts
 
 
 def routes_store(cfg):
@@ -833,7 +880,7 @@ def routes(cfg, ups, usage=None, statuses=None, deco_down=None, nodes=None):
 
     def add(key, kind, default_name, default_order, entry, via, exit_, show=True, auto=True, price=None, **extra):
         st = route_settings(cfg, key, default_name, show, auto, price)
-        r = dict(st, key=key, kind=kind, entry=entry, via=via, exit=exit_, default_order=default_order,
+        r = dict(st, key=key, kind=kind, entry=entry, via=via, exit=exit_, default_order=default_order, auto_name=default_name,
                  used=None, remaining=None, down=False, exhausted=False, note="", **extra)
         out.append(r)
         return r
@@ -957,7 +1004,8 @@ def route_tag(r):
 def routes_public(rts, pings=None):
     """Routes for the admin page (no node or tunnel objects)."""
     keep = ("key", "kind", "idx", "name", "show", "auto", "price", "unit", "quota_gb", "bill_day", "count", "order",
-            "used", "remaining", "down", "exhausted", "skip", "cost", "quota_from_sub", "server_id", "exit_id", "note", "group")
+            "used", "remaining", "down", "exhausted", "skip", "cost", "quota_from_sub", "server_id", "exit_id", "note", "group",
+            "auto_name")
     out = []
     for r in rts:
         d = {k: r.get(k) for k in keep}
@@ -3393,7 +3441,7 @@ class Net:
             raise PanelError("این پورت‌ها روی سرور ورودی قبلاً در تانل دیگری هستند: " + ", ".join(clash[:5]))
         t = {"id": secrets.token_hex(3), "name": (body.get("name") or "").strip()[:40] or ENGINES[eng][0],
              "entry": entry["id"], "exit": exit_["id"], "engine": eng, "transport": body.get("transport") or (ENGINES[eng][2][0] if ENGINES[eng][2] else ""),
-             "ports": ", ".join(e if e == x else "%s=%s" % (e, x) for e, x in ports),
+             "ports": fmt_ports(ports),
              "cport": _int(body.get("cport")) or random.randint(20000, 60000), "udp": bool(body.get("udp")),
              "created": int(time.time() * 1000), "status": "setting-up", "error": ""}
         if ENGINES[eng][2] and t["transport"] not in ENGINES[eng][2]:
@@ -3783,7 +3831,7 @@ def admin_state(app, host):
     cfg, rt = app.cfg, app.rt
     ups = UPSTREAMS.nodes()
     live = live_routes(app, cfg, ups)
-    rts = routes_public(live, app.net.ping_by_key)
+    rts = annotate_ports(routes_public(live, app.net.ping_by_key), panel["inbounds"], panel.get("nodes"))
     clients = read_clients(app.db_path)
     source = "db"
     if not clients and panel["ok"]:
@@ -3936,6 +3984,24 @@ def net_action(app, action, body, host, done, fail):
         if not t:
             return fail("تانل پیدا نشد")
         return job("راه‌اندازی دوباره‌ی تانل", lambda log: net.apply_tunnel(t, log) and "ok")
+    if action == "tunnel_ports":
+        t = next((x for x in net.tunnels() if x["id"] == str(body.get("id", ""))), None)
+        if not t:
+            return fail("تانل پیدا نشد")
+        try:
+            ports = parse_ports(str(body.get("ports", "")))
+        except ValueError as e:
+            return fail("پورت‌ها درست نیستند: %s" % e)
+        if not ports:
+            return fail("حداقل یک پورت بده")
+        used = {p for x in net.tunnels() if x["entry"] == t["entry"] and x["id"] != t["id"]
+                for p, _ in expand_ports(parse_ports(x.get("ports", "")))}
+        clash = [str(p) for p, _ in expand_ports(ports) if p in used]
+        if clash:
+            return fail("این پورت‌ها روی سرور ورودی در تانل دیگری هستند: " + ", ".join(clash[:5]))
+        t["ports"] = fmt_ports(ports)
+        net.save_tunnel(t)
+        return job("پورت‌های تانل %s" % t.get("name", ""), lambda log: net.apply_tunnel(t, log) and "ok")
     if action == "tunnel_bench":
         return job("بنچمارک تانل", lambda log: net.benchmark(str(body.get("id", "")), log))
     if action == "path_test":
@@ -4027,7 +4093,7 @@ def do_action(app, action, body, host):
                 cfg["order_mode"] = body["order_mode"]
             if "label_auto" in body:
                 cfg["label_auto"] = str(body["label_auto"] or "").strip()[:30] or DEFAULTS["label_auto"]
-            valid = {r["key"] for r in routes(cfg, UPSTREAMS.nodes())}
+            valid = {r["key"]: r["auto_name"] for r in routes(cfg, UPSTREAMS.nodes())}
             stored = {k: v for k, v in routes_store(cfg).items() if k in valid}
             for pos, e in enumerate(body.get("routes") or []):
                 key = str(e.get("key", ""))
@@ -4046,6 +4112,8 @@ def do_action(app, action, body, host):
                     return fail("قیمت، حجم یا روز شارژ عدد نیست")
                 if "name" in e:
                     cur["name"] = str(e["name"] or "").strip()[:40]
+                    if cur["name"] == valid[key]:
+                        cur["name"] = ""
                 for k in ("show", "auto"):
                     if k in e:
                         cur[k] = bool(e[k])
@@ -4465,6 +4533,9 @@ select.in{appearance:none;-webkit-appearance:none;background-image:linear-gradie
 .tblk.grp .gbody{border-top:1px solid var(--line)}.tblk.grp.off>.ghead .t{opacity:.45}
 .gfold{display:flex;gap:8px;align-items:center;padding:8px 0 4px}.gfold .check{margin:0;flex:none;padding:7px 10px}.gfold .in{flex:1;min-width:0;padding:7px 10px}
 .acc{color:var(--acc)}
+.tag.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 50%,var(--line2))}
+.warnbox{border:1px solid color-mix(in srgb,var(--warn) 45%,var(--line2));background:var(--warnbg);border-radius:10px;padding:10px 12px;margin:10px 0;font-size:13px}
+.warnbox .btn{margin-top:8px}
 .lnk{border:0;background:none;color:var(--acc);font-size:12.5px;cursor:pointer;padding:0;font-family:inherit}
 .trow{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--line)}.trow:last-child{border-bottom:0}
 .trow .t{flex:1;min-width:0}.trow .t small{display:block;color:var(--mut);font-size:11.5px;margin-top:3px;line-height:1.45}
@@ -4677,6 +4748,8 @@ function groupSummary(gid,rts){
   return `${fa(g.count)} کانفیگ، ${fa(rts.length)} مسیر${down?`، <span class="bad">${fa(down)} قطع</span>`:""}${left!=null?`، ${gb(left)} GB مانده`:""}`;
 }
 const foldOf=(t,gid)=>((t&&t.collapse)||{})[gid];
+const portsMissing=r=>(r.missing_ports||[]).length>0;
+const portsText=l=>`<span class="ltr">${l.join(", ")}</span>`;
 
 /* routes: shared bits */
 const lab=()=>S.state.settings.label_deco;
@@ -4715,7 +4788,7 @@ function routeRow(r,i,all){
   const ir=iranPing(r),p=r.ping;
   const pv=ir?(ir.ok?`<span class="ok">${ms_(ir.ttfb_ms)}</span>`:`<span class="bad">قطع</span>`):p?(p.ok?`<span class="ok">${ms_(p.ms)}</span>`:`<span class="bad">قطع</span>`):"";
   const vol=r.remaining!=null&&!r.group?`، <span class="${r.exhausted?"bad":""}">${gb(r.remaining)} GB مانده</span>`:"";
-  const state=r.down?`<span class="tag bad">قطع</span>`:r.exhausted?`<span class="tag bad">حجم تموم</span>`:!used?`<span class="tag">${all?"استفاده نشده":"خاموش"}</span>`:!all&&!r.show?`<span class="tag">فقط خودکار</span>`:"";
+  const state=r.down?`<span class="tag bad">قطع</span>`:r.exhausted?`<span class="tag bad">حجم تموم</span>`:portsMissing(r)?`<span class="tag warn">پورت ناقص</span>`:!used?`<span class="tag">${all?"استفاده نشده":"خاموش"}</span>`:!all&&!r.show?`<span class="tag">فقط خودکار</span>`:"";
   return `<div class="row btn-row ${r.skip||!used?"dim":""}" data-act="route" data-key="${esc(r.key)}">${routeMono(r)}
   <div class="t"><b>${i!=null?`<span class="mut xs">${fa(i+1)}</span> `:""}${esc(r.name)}</b><small>${chainText(r)}${vol}</small></div>
   <div class="r">${state||pv}${routeDot(r)}</div></div>`;
@@ -4741,6 +4814,7 @@ VIEWS.home=()=>{
   let line;
   if(!rts.length)line=["bad","هیچ مسیری فعال نیست."];
   else if(us.length===1)line=["warn","کاربرها فقط یک مسیر دارن. با یه سرور ایران یا یه واسط، قطعی آی‌پی دیگه اثری نداره."];
+  else if(rts.some(portsMissing)){const r=rts.find(portsMissing);line=["warn",`تانل «${esc(r.name)}» پورت ${portsText(r.missing_ports)} رو نداره؛ کانفیگ‌های روی این پورت از این مسیر توی ساب نمیان. روی مسیر بزن و «افزودن به تانل».`]}
   else if(down.length)line=["warn",`${fa(down.length)} مسیر قطع: ${down.map(r=>esc(r.name)).join("، ")}. کاربرها از مسیرهای بعدی می‌رن.`];
   else if(ex.length)line=["warn",`حجم ${ex.map(r=>esc(r.name)).join("، ")} تموم شده.`];
   else line=["ok",`${fa(okR)} مسیر سالم. آخرین تست ${ago(st.monitor.last_run)}.`];
@@ -4823,7 +4897,7 @@ function tplRow(x,isDefault){
   const r=x.r,on=x.show||x.auto;
   return `<div class="trow ${on?"":"off"}" data-key="${esc(r.key)}">
   <label class="tk"><input type="checkbox" data-k="show" ${x.show?"checked":""} aria-label="توی ساب"></label>
-  <div class="t"><input class="in tn" value="${esc(isDefault?r.name:x.name)}" placeholder="${esc(isDefault?"اسم خودکار":r.name)}" maxlength="40" autocomplete="off"><small>${chainText(r)}${x.fresh&&!isDefault?"، جدید":""}${r.down?'، <span class="bad">قطع</span>':""}</small></div>
+  <div class="t"><input class="in tn" value="${esc(isDefault?(r.name===r.auto_name?"":r.name):x.name)}" placeholder="${esc(isDefault?(r.auto_name||r.name):r.name)}" maxlength="40" autocomplete="off"><small>${chainText(r)}${x.fresh&&!isDefault?"، جدید":""}${r.down?'، <span class="bad">قطع</span>':""}${portsMissing(r)?`، <span class="warn">پورت ${portsText(r.missing_ports)} توی تانل نیست</span>`:""}</small></div>
   <button type="button" class="zap ${x.auto?"on":""}" aria-pressed="${x.auto}" title="توی خودکار">${ic("zap")}</button>
   <div class="vmove"><button type="button" data-mv="-1" aria-label="بالاتر">${ic("up")}</button><button type="button" data-mv="1" aria-label="پایین‌تر">${ic("down")}</button></div></div>`;
 }
@@ -4964,10 +5038,14 @@ function routeSheet(r){
    <div class="cols2"><label class="f"><span>حجم ماهانه (GB)</span>${inp("quota_gb",r.quota_gb||"",'inputmode="decimal" placeholder="'+(r.quota_from_sub?"از لینک ساب":"خالی = نامحدود")+'"')}</label><label class="f"><span>روز شارژ (شمسی)</span>${inp("bill_day",r.bill_day||1,'inputmode="numeric"')}</label></div>
    ${r.kind==="tunnel"||r.kind==="direct"?`<label class="f"><span>حجم چطور حساب بشه</span><select class="in" name="count"><option value="both" ${r.count!=="out"&&r.count!=="in"?"selected":""}>رفت و برگشت (بیشتر سرورها)</option><option value="out" ${r.count==="out"?"selected":""}>فقط خروجی سرور</option><option value="in" ${r.count==="in"?"selected":""}>فقط ورودی سرور</option></select></label>`:""}
    <div class="hint">برای چیدن «ارزون‌ترین اول». ماهانه بدون حجم = ۵۰۰ GB فرض می‌شه.</div></details>
-  ${t?`<details><summary>تانل، ${esc(t.engine)}${t.transport?" "+esc(t.transport):""}، پورت‌ها <span class="ltr">${esc(t.ports)}</span>، ${t.status==="up"?'<span class="ok">بالا</span>':'<span class="bad">پایین</span>'}${t.bench_result?`، ↓ ${mb(t.bench_result.down_mbps)}`:""}</summary>
+  ${t&&portsMissing(r)?`<div class="warnbox">پورت ${portsText(r.missing_ports)} (inbound${r.missing_ports.length>1?"ها":""}ی ${esc(r.exit.name)}) توی این تانل نیست؛ کانفیگ‌هایی که روی این پورت هستن از این مسیر توی ساب نمیان.
+   <button type="button" class="btn sm block" data-act="tun-ports" data-id="${t.id}" data-ports="${esc(t.ports+", "+r.missing_ports.join(", "))}">${ic("plus")} افزودن ${r.missing_ports.length>1?"این پورت‌ها":"این پورت"} به تانل</button></div>`:""}
+  ${t?`<details ${portsMissing(r)?"open":""}><summary>تانل، ${esc(t.engine)}${t.transport?" "+esc(t.transport):""}، پورت‌ها <span class="ltr">${esc(t.ports)}</span>، ${t.status==="up"?'<span class="ok">بالا</span>':'<span class="bad">پایین</span>'}${t.bench_result?`، ↓ ${mb(t.bench_result.down_mbps)}`:""}</summary>
    ${t.error?`<div class="err">${esc(t.error)}</div>`:""}
    ${t.check&&t.check.entry&&t.check.entry.active!=="active"?`<div class="err">ورودی: ${esc(t.check.entry.active||"")} ${esc((t.check.entry.log||t.check.entry.error||"").slice(0,120))}</div>`:""}
    ${t.check&&t.check.exit&&t.check.exit.active&&t.check.exit.active!=="active"&&t.engine!=="direct"?`<div class="err">خروجی: ${esc(t.check.exit.active)} ${esc((t.check.exit.log||t.check.exit.error||"").slice(0,120))}</div>`:""}
+   <div class="cols2" style="align-items:end"><label class="f" style="margin:6px 0"><span>پورت‌ها (ایران ← خارج)</span><input class="in ltr" data-tports value="${esc(t.ports)}" autocomplete="off"></label><button type="button" class="btn sm ghost" style="margin:6px 0" data-act="tun-ports" data-id="${t.id}">${ic("check")} ذخیره‌ی پورت‌ها</button></div>
+   ${(r.need_ports||[]).length?`<div class="hint">inboundهای ${esc(r.exit.name)}: ${portsText(r.need_ports)}</div>`:""}
    <div class="bar-btns"><button type="button" class="btn sm ghost" data-act="tun-status" data-id="${t.id}">${ic("refresh")} وضعیت</button><button type="button" class="btn sm ghost" data-act="tun-bench" data-id="${t.id}">${ic("chart")} سرعت</button><button type="button" class="btn sm ghost" data-act="tun-apply" data-id="${t.id}">${ic("zap")} راه‌اندازی دوباره</button><button type="button" class="btn sm danger" data-act="tun-del" data-id="${t.id}">${ic("trash")}</button></div></details>`:""}
   <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost icon" data-act="ping" title="پینگ">${ic("wifi")}</button>${r.kind==="custom"?`<button type="button" class="btn danger icon" data-act="route-del" data-key="${esc(r.key)}" title="حذف">${ic("trash")}</button>`:""}</div>
   </form>`,el=>{
@@ -5027,7 +5105,8 @@ function routeAddSheet(engine,transport){
    <div class="step"><span class="n">۳</span>تانل</div>
    <label class="f"><span>روش</span><select class="in" name="engine">${engOpts}</select></label><div id="engnote" class="hint"></div>
    <div id="trbox">${trOpts(eng)}</div>
-   ${field("ports","پورت‌ها (ایران ← خارج)","443",'class="in ltr" placeholder="443, 2053=8443, 10000-10050"',"پورت‌هایی که کاربرها بهش وصل می‌شن. «2053=8443» یعنی ۲۰۵۳ ایران به ۸۴۴۳ خارج.")}
+   ${field("ports","پورت‌ها (ایران ← خارج)","",'class="in ltr" placeholder="443, 2053=8443, 10000-10050"',"باید پورت inboundهای سرور خروجی باشه (خودکار پر می‌شه). «2053=8443» یعنی ۲۰۵۳ ایران به ۸۴۴۳ خارج.")}
+   <div class="hint" id="exitports"></div>
    ${field("tname","اسم مسیر (اختیاری)","",'autocomplete="off" placeholder="ایران ۱"')}
    <details><summary>پیشرفته</summary>${field("cport","پورت کنترل تانل (خالی = تصادفی)","",'class="in ltr" inputmode="numeric"')}
    ${sw("udp",false,"UDP هم رد شود","برای Backhaul با ترنسپورت tcp")}
@@ -5047,6 +5126,9 @@ function routeAddSheet(engine,transport){
       if(entry.startsWith("deco:")){$$("option",df.via).forEach(o=>o.disabled=o.value&&"deco:"+o.value===entry);if("deco:"+df.via.value===entry)df.via.value=""}};
     pick();$$("[data-e]",el).forEach(b=>b.onclick=()=>{entry=b.dataset.e;pick()});
     const note=()=>{const e=n.engines[sf.engine.value];$("#engnote",el).textContent=e?e.note:"";$("#trbox",el).innerHTML=trOpts(sf.engine.value)};note();sf.engine.onchange=note;
+    let edited=false;sf.ports.oninput=()=>{edited=true};
+    const fillPorts=()=>{const ps=exitPorts(sf.exit.value);$("#exitports",el).innerHTML=ps.length?`inboundهای این سرور: ${portsText(ps)}`:"inboundی روی این سرور پیدا نشد؛ پورت کانفیگ‌ها رو خودت بنویس.";if(!edited)sf.ports.value=ps.join(", ")||"443"};
+    fillPorts();sf.exit.onchange=fillPorts;
     sf.onsubmit=async e=>{e.preventDefault();const tr=sf.elements.namedItem("transport"),via=sf.elements.namedItem("via");
       const j=await act($("button.btn:not([type=button])",sf),"net_tunnel_add",{entry:entry.slice(4),exit:sf.exit.value,engine:sf.engine.value,transport:tr?tr.value:"",ports:sf.ports.value,name:sf.tname.value,cport:sf.cport.value,udp:sf.udp.checked,via:via?via.value:""});
       if(j.ok){closeSheet();watchJob(j.job)}};
@@ -5054,6 +5136,7 @@ function routeAddSheet(engine,transport){
   });
 }
 
+const exitPorts=sid=>{const s=srvBy(sid);if(!s)return [];return [...new Set(S.state.inbounds.filter(ib=>ib.enable!==false&&(s.local?!ib.node:(s.node_id&&ib.node===s.node_id))).map(ib=>ib.port))].sort((a,b)=>a-b)};
 /* entries: Iran servers, Decos, direct */
 SEGV.entries=()=>{
   const st=S.state,n=st.net,irans=n.servers.filter(s=>s.role==="iran"),ds=st.decos;
@@ -5450,6 +5533,10 @@ const ACTS={
   "srv-del":async b=>{const s=srvBy(b.dataset.id);if(await confirmSheet("حذف سرور",esc(s.name)+" از فهرست حذف می‌شه. چیزی روی خود سرور پاک نمی‌شه.","حذف کن",true))act(null,"net_server_delete",{id:s.id})},
   "tun-status":b=>{closeSheet();act(b,"net_tunnel_status",{id:b.dataset.id})},
   "tun-bench":b=>{closeSheet();act(b,"net_tunnel_bench",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
+  "tun-ports":async b=>{const t=S.state.net.tunnels.find(x=>x.id===b.dataset.id);if(!t)return;const box=b.closest("details")||b.closest(".sheet");
+    const inp=box&&$("[data-tports]",box);const ports=b.dataset.ports||(inp?inp.value.trim():"");if(!ports)return;
+    if(!await confirmSheet("پورت‌های تانل","تانل «"+esc(t.name)+"» با پورت‌های <span class=\"ltr\">"+esc(ports)+"</span> روی هر دو سرور دوباره راه‌اندازی می‌شه (چند ثانیه قطعی).","انجام بده"))return;
+    const j=await act(null,"net_tunnel_ports",{id:t.id,ports});if(j.ok)watchJob(j.job)},
   "tun-apply":b=>{closeSheet();act(b,"net_tunnel_apply",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
   "tun-del":async b=>{const t=S.state.net.tunnels.find(x=>x.id===b.dataset.id);if(t&&await confirmSheet("حذف تانل و مسیر",esc(t.name)+" از هر دو سرور پاک می‌شه.","حذف کن",true)){closeSheet();const j=await act(null,"net_tunnel_delete",{id:t.id});if(j.ok)watchJob(j.job)}},
   trial:()=>trialSheet(),

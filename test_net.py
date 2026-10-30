@@ -435,6 +435,16 @@ class NetTests(unittest.TestCase):
         msgs = self.net.check_tunnels()
         self.assertEqual(len(msgs), 1, msgs)
         self.assertIn("بالا اومد", msgs[0])
+        # the ports of a tunnel change and it is set up again with them
+        clear()
+        status, out = xc.do_action(self.app, "net_tunnel_ports", {"id": t["id"], "ports": "443, 1080"}, "h")
+        self.assertTrue(out["ok"], out)
+        j = wait({"id": out["job"]}, self.net)
+        self.assertEqual(j["status"], "done", j)
+        self.assertEqual(next(x for x in self.net.tunnels() if x["id"] == t["id"])["ports"], "443, 1080")
+        self.assertTrue(any(":1080" in s for s in scripts("iran.example")))
+        self.assertFalse(xc.do_action(self.app, "net_tunnel_ports", {"id": t["id"], "ports": "abc"}, "h")[1]["ok"])
+        self.assertFalse(xc.do_action(self.app, "net_tunnel_ports", {"id": "nope", "ports": "443"}, "h")[1]["ok"])
         self.job("remove", lambda log: self.net.remove_tunnel(t["id"], log))
 
 

@@ -299,6 +299,27 @@ class ProfileTests(unittest.TestCase):
         r = xc.routes(dict(cfg, tunnels=[dict(tunnels[0], ports="443")]), [])[1]
         self.assertIsNone(xc.rewrite_for_tunnel(own[1], r["entry"]["ip"], r["port_map"]))
 
+    def test_tunnel_keeps_tls_name_and_checks_ports(self):
+        n = xc.parse_link("vless://11111111-2222-3333-4444-555555555555@vip2.example.com:1080?type=ws&security=tls&path=%2Fw#me")
+        m = xc.rewrite_for_tunnel(n, "5.6.7.8", {1080: 443})
+        self.assertEqual((m["server"], m["port"], m["sni"], m["host"]), ("5.6.7.8", 443, "vip2.example.com", "vip2.example.com"))
+        self.assertIsNone(xc.rewrite_for_tunnel(n, "5.6.7.8", {443: 443}))  # the tunnel does not carry 1080
+        ip = xc.parse_link(OWN[0])  # an IP address with its own SNI: unchanged
+        self.assertEqual(xc.rewrite_for_tunnel(ip, "5.6.7.8", {443: 443})["sni"], "www.speedtest.net")
+        inbounds = [{"port": 1080, "protocol": "vless", "enable": True, "node": None},
+                    {"port": 2096, "protocol": "trojan", "enable": True, "node": 0},
+                    {"port": 9999, "protocol": "vless", "enable": False, "node": None},
+                    {"port": 8443, "protocol": "vless", "enable": True, "node": 3},
+                    {"port": 54321, "protocol": "dokodemo-door", "enable": True, "node": None}]
+        nodes = [{"id": 3, "address": "de.example.com"}]
+        self.assertEqual(xc.exit_inbound_ports("main", inbounds, nodes), [1080, 2096])
+        self.assertEqual(xc.exit_inbound_ports("x:de.example.com", inbounds, nodes), [8443])
+        self.assertEqual(xc.exit_inbound_ports("x:gone", inbounds, nodes), [])
+        rts = [{"kind": "tunnel", "exit_id": "main", "tunnel": {"ports": "443, 2096"}},
+               {"kind": "tunnel", "exit_id": "x:de.example.com", "tunnel": {"ports": "443=8443"}}, {"kind": "direct", "exit_id": "main"}]
+        xc.annotate_ports(rts, inbounds, nodes)
+        self.assertEqual([(r.get("need_ports"), r.get("missing_ports")) for r in rts], [([1080, 2096], [1080]), ([8443], []), (None, None)])
+
     @unittest.skipIf(yaml is None, "PyYAML not installed")
     def test_price_order_and_quota(self):
         own, ups = self.own[:1], self.ups[:2]
@@ -635,6 +656,8 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(names[:2], ["⚡ Auto", "خونه · user1-reality"])
         self.assertTrue(any(n.startswith("ارزون") for n in names) and "گرون" in names, names)
         self.assertFalse(self.admin("routes_save", {"routes": [{"key": "direct>main", "price": "abc"}]})[1]["ok"])
+        self.admin("routes_save", {"routes": [{"key": chain[1], "name": "واسط ۲"}]})  # the automatic name: not pinned
+        self.assertEqual(xc.load_config()["routes_cfg"][chain[1]]["name"], "")
         # a custom two-hop route: Deco1 -> Deco2 -> this server
         out = self.admin("route_add", {"entry": "deco:" + chain[0][5:-5], "via": "deco:" + chain[1][5:-5], "exit": "main", "name": "دو پله"})[1]
         self.assertTrue(out["ok"], out)
@@ -1565,6 +1588,13 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(json.load(open(path, encoding="utf-8"))["schema"], xc.CONFIG_SCHEMA)
             xc.save_config(dict(xc.load_config(), label_deco="Deco"))  # chosen again after the migration: kept
             self.assertEqual(xc.load_config()["label_deco"], "Deco")
+            # names saved under the old label become automatic again
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"admin_path": "x", "schema": 6, "label_deco": "Deco", "routes_cfg": {"a": {"name": "Deco6"}, "b": {"name": "Deco2 · 🇩🇪 DE"}, "c": {"name": "Mine"}},
+                           "sub_templates": [{"id": "t", "items": [{"key": "a", "name": "Deco3"}]}], "user_subs": {"u": {"template": "custom", "items": [{"key": "a", "name": "Deco1"}]}}}, f)
+            cfg = xc.load_config()
+            self.assertEqual((cfg["label_deco"], [v["name"] for v in cfg["routes_cfg"].values()]), ("واسط", ["", "", "Mine"]))
+            self.assertEqual((cfg["sub_templates"][0]["items"][0]["name"], cfg["user_subs"]["u"]["items"][0]["name"]), ("", ""))
         finally:
             if keep is None:
                 os.unlink(path)
