@@ -412,6 +412,54 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(xc.user_sub_public(cfg, "u2")["custom"]["items"][0]["name"], "فقط مستقیم")
         self.assertEqual(xc.user_sub_public(cfg, "u3"), {"tpl": "default"})
 
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_folded_subscription(self):
+        own, ups = self.own[:1], self.ups[:3]
+        for n in ups[:2]:  # friend-a and friend-b come from one subscription link
+            n["src"] = "https://friend.example/sub/x"
+        gid = xc.sub_gid("https://friend.example/sub/x")
+        groups = xc.deco_groups(dict(xc.DEFAULTS), ups)
+        self.assertEqual([(g["id"], g["count"], g["name"], g["title"]) for g in groups], [(gid, 2, "واسط ۱ تا ۲", "friend.example")])
+        self.assertEqual(xc.deco_groups(self.cfg, ups)[0]["name"], "Deco1-2")
+        rts = xc.routes(self.cfg, ups)
+        self.assertEqual({r["key"][:6] for r in rts if r.get("group") == gid}, {"deco:v", "deco:t"})
+        self.assertIsNone(next(r for r in rts if r["kind"] == "deco" and r["idx"] == 3).get("group"))
+        cfg = dict(self.cfg, collapse={gid: {"name": ""}}, routes_cfg={"deco:%s>self" % xc.node_key(ups[1]): {"show": True}})
+        folded = xc.view_routes(cfg, xc.routes(cfg, ups), None, ups)
+        self.assertEqual({r["fold"] for r in folded if r.get("fold")}, {"Deco1-2"})
+        prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg, folded)[0])
+        groups = {g["name"]: g for g in prof["proxy-groups"]}
+        self.assertEqual(groups[xc.G_MAIN]["proxies"], ["⚡ Auto", "Main", "Deco1-2", "Deco3"])  # one entry for the subscription
+        self.assertEqual(groups["Deco1-2"]["type"], "url-test")
+        self.assertEqual(groups["Deco1-2"]["proxies"], ["Deco1", "Deco2", "friend-b"])
+        self.assertEqual(groups["⚡ Auto"]["proxies"], ["Main", "Deco1", "Deco2", "Deco3"])  # Auto still sees each config
+        confs = json.loads(xc.build_xray(own, ups, cfg, "t", folded)[0])
+        self.assertEqual([c["remarks"] for c in confs], ["⚡ Auto", "Main", "Deco1-2", "Deco3"])
+        fold = confs[2]
+        self.assertEqual(fold["routing"]["balancers"][0]["strategy"]["type"], "leastPing")
+        self.assertEqual(fold["routing"]["rules"][-1]["balancerTag"], "fold")
+        tags = [o["tag"] for o in fold["outbounds"]]
+        self.assertEqual([t for t in tags if t.startswith("f-")], ["f-via-1-1", "f-via-2-1", "f-own-2-1"])
+        for o in fold["outbounds"]:
+            dp = o.get("streamSettings", {}).get("sockopt", {}).get("dialerProxy")
+            self.assertTrue(dp is None or dp in tags)
+        # a template folds with its own name; a user's own choice too
+        cfg2 = dict(self.cfg, sub_templates=[{"id": "t1", "name": "x", "items": [{"key": "direct>main"}, {"key": "deco:%s>main" % xc.node_key(ups[0])}],
+                                              "collapse": {gid: {"name": "دوستان"}}}], user_subs={"u": {"template": "t1"}})
+        rts2 = xc.view_routes(cfg2, xc.routes(cfg2, ups), "u", ups)
+        prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg2, rts2)[0])
+        self.assertEqual(next(g for g in prof["proxy-groups"] if g["name"] == xc.G_MAIN)["proxies"], ["⚡ Auto", "Main", "دوستان"])
+        self.assertEqual(xc.view_routes(cfg2, xc.routes(cfg2, ups), "other", ups)[0].get("fold"), None)  # default: not folded
+        self.assertEqual(xc.clean_collapse({gid: {"name": " a "}, "nope": {}, 5: 1}, {gid}), {gid: {"name": "a"}})
+        self.assertEqual(xc.clean_collapse("bad", {gid}), {})
+        self.assertEqual(xc.profile_title("base64:" + base64.b64encode("فروشگاه VPN".encode()).decode().rstrip("=")), "فروشگاه VPN")
+        self.assertEqual((xc.profile_title(" My  Shop "), xc.profile_title("base64:!!"), xc.profile_title(None)), ("My Shop", "", ""))
+        xc.UPSTREAMS.titles["https://friend.example/sub/x"] = "Friend VPN"
+        try:
+            self.assertEqual(xc.deco_groups(self.cfg, ups)[0]["title"], "Friend VPN")
+        finally:
+            xc.UPSTREAMS.titles.clear()
+
     def test_format_detection(self):
         self.assertEqual(xc.pick_format("", "FlClash/v0.8 clash-verge"), "clash")
         self.assertEqual(xc.pick_format("", "v2rayNG/1.9.30"), "xray")
@@ -463,7 +511,7 @@ class EndToEnd(unittest.TestCase):
         con.commit()
         con.close()
         cls.db = db
-        xc.save_config(dict(xc.DEFAULTS, admin_path="adm1n", port=0, listen="127.0.0.1"))
+        xc.save_config(dict(xc.DEFAULTS, admin_path="adm1n", port=0, listen="127.0.0.1", info_config=False))
         xc.save_upstreams_text("\n".join(UPS[1:3]))
         cls.app = xc.App(db_path=db)
         cls.srv = start(ThreadingHTTPServer(("127.0.0.1", 0), xc.make_handler(cls.app)))
@@ -665,6 +713,61 @@ class EndToEnd(unittest.TestCase):
         cfg["order_mode"] = "manual"
         xc.save_config(cfg)
         self.app.reload()
+
+    def test_fold_actions(self):
+        self.login()
+        xc.save_upstreams_text("\n".join([self.friend, UPS[3]]))
+        try:
+            st = self.admin("state")[1]["state"]
+            self.assertEqual(len(st["groups"]), 1)
+            g = st["groups"][0]
+            self.assertEqual((g["count"], g["name"]), (2, "واسط ۱ تا ۲"))
+            self.assertEqual(st["decos"][0]["gid"], g["id"])
+            self.assertEqual({r["group"] for r in st["routes"] if r["kind"] == "deco" and r["idx"] <= 2}, {g["id"]})
+            out = self.admin("template_save", {"id": "default", "collapse": {g["id"]: {"name": "دوستان"}, "x": {}},
+                                               "items": [{"key": r["key"], "show": r["show"], "auto": r["auto"]} for r in st["routes"]]})[1]
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["state"]["templates"][0]["collapse"], {g["id"]: {"name": "دوستان"}})
+            status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
+            names = [c["remarks"] for c in json.loads(body)]
+            self.assertIn("دوستان", names)
+            self.assertFalse(any(n.startswith("واسط ۱") or n.startswith("واسط ۲") for n in names), names)
+            out = self.admin("user_sub", {"sub": "abc", "template": "custom", "collapse": {}, "items": [
+                {"key": r["key"], "show": r["show"], "auto": r["auto"]} for r in st["routes"]]})[1]
+            self.assertTrue(out["ok"], out)
+            status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
+            self.assertNotIn("دوستان", [c["remarks"] for c in json.loads(body)])  # this user sees each config
+        finally:
+            self.admin("user_sub", {"sub": "abc", "template": "default"})
+            cfg = xc.load_config()
+            cfg["collapse"] = {}
+            cfg.pop("routes_cfg", None)
+            xc.save_config(cfg)
+            xc.save_upstreams_text("\n".join(UPS[1:3]))
+            self.app.reload()
+
+    @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_info_entry(self):
+        self.login()
+        out = self.admin("settings", {"info_config": True})[1]
+        self.assertTrue(out["ok"] and out["state"]["settings"]["info_config"], out)
+        try:
+            status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
+            confs = json.loads(body)
+            self.assertEqual(confs[0]["remarks"], "👤 ali | 📊 0 GB | ⏳ نامحدود")  # volume from the header, days from the panel
+            self.assertEqual(confs[0]["outbounds"], confs[1]["outbounds"])  # a working copy of the first entry
+            self.assertEqual(confs[1]["remarks"], "⚡ Auto")
+            status, h, body = self.get("/chain/abc", ua="clash.meta")
+            prof = yaml.safe_load(body)
+            groups = {g["name"]: g for g in prof["proxy-groups"]}
+            info = "👤 ali | 📊 0 GB | ⏳ نامحدود"
+            self.assertEqual(groups[xc.G_MAIN]["proxies"][:2], [info, "⚡ Auto"])  # chosen by default, uses Auto
+            self.assertEqual(groups[info], {"name": info, "type": "select", "proxies": ["⚡ Auto"]})
+            self.admin("settings", {"info_format": "{name} - {used} از {total}"})
+            status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
+            self.assertEqual(json.loads(body)[0]["remarks"], "ali - 0 GB از 0 GB")
+        finally:
+            self.admin("settings", {"info_config": False, "info_format": ""})
 
     def test_route_ping(self):
         d = tempfile.mkdtemp()
@@ -1487,6 +1590,18 @@ class UsageTests(unittest.TestCase):
         store.record({"s": 90}, now=t0 + 100 * day)      # old days are pruned
         hist, _ = store.history("s", 120, now=t0 + 100 * day)
         self.assertEqual(sum(b for _, b in hist), 10)
+
+    def test_info_line(self):
+        own = xc.parse_nodes(OWN[:1])
+        now = 1_800_000_000
+        hdr = lambda total, used, exp: {"subscription-userinfo": "upload=0; download=%d; total=%d; expire=%d" % (used, total, exp)}
+        rt = dict(xc.DEFAULTS)
+        self.assertEqual(xc.info_line(rt, "s", own, hdr(50 * 1024 ** 3, 12.5 * 1024 ** 3, now + 18 * 86400 - 60), now=now),
+                         "👤 user1-reality | 📊 37.5 GB | ⏳ 18 روز")
+        self.assertEqual(xc.info_line(rt, "s", own, hdr(0, 5, 0), now=now), "👤 user1-reality | 📊 نامحدود | ⏳ نامحدود")
+        self.assertEqual(xc.info_line(rt, "s", own, hdr(300 * 1024 ** 3, 0, now + 3600), now=now), "👤 user1-reality | 📊 300 GB | ⏳ کمتر از ۱ روز")
+        self.assertEqual(xc.info_line(rt, "s", own, {}, now=now), "👤 user1-reality | 📊 نامحدود | ⏳ نامحدود")
+        self.assertEqual(xc.info_line(dict(rt, info_format="  "), "s", own, {}, now=now).split(" | ")[0], "👤 user1-reality")
 
     def test_jalali_and_billing_period(self):
         self.assertEqual(xc.g2j(2026, 10, 29), (1405, 8, 7))
