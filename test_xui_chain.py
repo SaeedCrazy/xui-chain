@@ -751,6 +751,27 @@ class EndToEnd(unittest.TestCase):
         xc.save_config(cfg)
         self.app.reload()
 
+    def test_deco_mode_and_refresh(self):
+        self.login()
+        st = self.admin("state")[1]["state"]
+        key = next(n["key"] for d in st["decos"] for n in d["nodes"])
+        def mode():
+            rts = {r["key"]: r for r in self.admin("state")[1]["state"]["routes"]}
+            m, o = rts.get("deco:%s>main" % key), rts.get("deco:%s>self" % key)
+            mm, oo = m and (m["show"] or m["auto"]), o and (o["show"] or o["auto"])
+            return "both" if mm and oo else "own" if oo else "relay" if mm else "off"
+        self.assertEqual(mode(), "relay")  # a newly added deco defaults to relay
+        self.assertTrue(self.admin("deco_mode", {"keys": [key], "mode": "own"})[1]["ok"])
+        self.assertEqual(mode(), "own")
+        self.assertTrue(self.admin("deco_mode", {"keys": [key], "mode": "both"})[1]["ok"])
+        self.assertEqual(mode(), "both")
+        self.assertTrue(self.admin("deco_mode", {"keys": [key], "mode": "off"})[1]["ok"])
+        self.assertEqual(mode(), "off")
+        self.assertFalse(self.admin("deco_mode", {"keys": [key], "mode": "bogus"})[1]["ok"])
+        self.admin("deco_mode", {"keys": ["gone|x|1|y"], "mode": "own"})  # unknown key ignored, no error
+        self.assertTrue(self.admin("decos_refresh")[1]["ok"])
+        self.admin("deco_mode", {"keys": [key], "mode": "relay"})
+
     def test_fold_actions(self):
         self.login()
         xc.save_upstreams_text("\n".join([self.friend, UPS[3]]))

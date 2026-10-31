@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.4.0"
+VERSION = "5.5.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -1722,6 +1722,11 @@ class Upstreams:
             if title:
                 self.titles[url] = title
         return links
+
+    def refresh(self):
+        with self.lock:
+            self.cache.clear()
+        return self.nodes()
 
     def lines(self, text=None):
         text = load_upstreams_text() if text is None else text
@@ -4658,6 +4663,33 @@ def do_action(app, action, body, host):
             sub = str(body.get("sub", ""))
             return 200, {"ok": True, "map": sub_map(app, sub)}
 
+        if action == "deco_mode":
+            mode = body.get("mode")
+            if mode not in ("relay", "own", "both", "off"):
+                return fail("حالت نامعتبر")
+            on, off = {"show": True, "auto": True}, {"show": False, "auto": False}
+            mainv, selfv = {"relay": (on, off), "own": (off, on), "both": (on, on), "off": (off, off)}[mode]
+            cfg = load_config()
+            valid = {node_key(n) for n in UPSTREAMS.nodes()}
+            store = dict(routes_store(cfg))
+            for key in body.get("keys") or []:
+                key = str(key)
+                if key not in valid:
+                    continue
+                store["deco:%s>main" % key] = dict(store.get("deco:%s>main" % key) or {}, **mainv)
+                store["deco:%s>self" % key] = dict(store.get("deco:%s>self" % key) or {}, **selfv)
+            cfg["routes_cfg"] = store
+            cfg.pop("entries_cfg", None)
+            cfg.pop("deco_opts", None)
+            save_config(cfg)
+            app.reload()
+            return done({"relay": "شد: فقط واسط", "own": "شد: خود کانفیگ", "both": "شد: هردو", "off": "خاموش شد"}[mode])
+
+        if action == "decos_refresh":
+            before = len(UPSTREAMS.nodes())
+            after = len(UPSTREAMS.refresh())
+            return done("کانفیگ‌های واسط به‌روز شد (%d کانفیگ)" % after)
+
         if action == "route_add":
             cfg = load_config()
             ups = {node_key(n) for n in UPSTREAMS.nodes()}
@@ -5285,7 +5317,7 @@ VIEWS.home=()=>{
   <div class="bar-btns"><button class="btn sm" data-act="add-user">${ic("plus")} کاربر جدید</button><button class="btn sm ghost" data-act="ping">${ic("wifi")} پینگ مسیرها</button></div></div>
   ${!st.panel.configured?`<div class="card"><h2>پنل 3x-ui وصل نیست</h2><p class="mut small">${st.settings.panel_auto&&st.settings.auto_note?esc(st.settings.auto_note):"برای ساخت و مدیریت کاربر از همین‌جا، پنل رو در تنظیمات وصل کن."}</p><button class="btn sm ghost" data-act="goto-panel">تنظیمات پنل</button></div>`:""}
   ${jobsBox()}
-  <div class="sec"><h3>ساب پیش‌فرض</h3><button class="lnk" data-act="seg" data-seg="templates">تمپلیت‌ها</button></div>
+  <div class="sec"><h3>ساب پیش‌فرض</h3><button class="lnk" data-act="seg" data-seg="templates">ساب‌ها</button></div>
   <div class="list">${blocks(rts,r=>r).slice(0,8).map((b,i)=>b.gid?groupRow(b,i,tplById("default")):routeRow(b.items[0],i)).join("")||`<div class="note">مسیری نیست. در «مسیرها» یه سرور ایران یا واسط اضافه کن.</div>`}</div>
   ${attention.length?`<div class="sec"><h3>نیاز به تمدید</h3><button class="lnk" data-act="tab" data-tab="users">همه</button></div><div class="list">${attention.map(u=>{const s=ustat(u);return `<div class="row btn-row" data-act="edit" data-sub="${esc(u.sub)}"><div class="t"><b class="ltr" style="text-align:right">${esc(u.name)}</b><small>${usage(u)}</small></div><div class="r"><span class="${STAT_CLS[s[0]]}">${s[0]==="soon"?daysText(u):s[1]}</span></div></div>`}).join("")}</div>`:""}
   <div class="sec"><h3>این سرور</h3><span class="mut xs">${sv.uptime?"روشن از "+uptime(sv.uptime):""}</span></div>
@@ -5297,7 +5329,7 @@ VIEWS.home=()=>{
 };
 
 /* routes tab */
-const SEGS=[["routes","مسیرها"],["templates","تمپلیت‌ها"],["entries","ورودی‌ها"],["exits","خروجی‌ها"]];
+const SEGS=[["routes","مسیرها"],["templates","ساب‌ها"],["entries","ورودی‌ها"],["exits","خروجی‌ها"]];
 const SEGV={};
 VIEWS.routes=()=>`<div class="seg">${SEGS.map(([k,l])=>`<button data-act="seg" data-seg="${k}" class="${S.seg===k?"on":""}">${l}</button>`).join("")}</div>${jobsBox()}${(SEGV[S.seg]||SEGV.routes)()}`;
 function jobsBox(){const jobs=S.state.net.jobs||[];return jobs.map(j=>`<div class="job"><span class="spin"></span><div><b>${esc(j.title)}</b><div class="mut xs ltr" style="text-align:right;unicode-bidi:plaintext">${esc((j.log||[]).slice(-1)[0]||"…")}</div></div></div>`).join("")}
@@ -5305,10 +5337,10 @@ SEGV.routes=()=>{
   const st=S.state,rts=st.routes||[];
   const ping=Object.values(st.pings||{}).sort((a,b)=>b.at-a.at)[0];
   return `<div class="toolbar"><button class="btn" data-act="route-add">${ic("plus")} مسیر</button><button class="btn ghost" data-act="ping">${ic("wifi")} پینگ</button></div>
-  <div class="note">همه‌ی مسیرهایی که ساختی${ping?`، آخرین پینگ ${ago(ping.at)}`:""}. اینکه کدوم‌ها با چه اسم و ترتیبی توی ساب کاربرها باشن: <button class="lnk" data-act="seg" data-seg="templates">تمپلیت‌ها</button></div>
+  <div class="note">همه‌ی مسیرهایی که ساختی${ping?`، آخرین پینگ ${ago(ping.at)}`:""}. اینکه کدوم‌ها با چه اسم و ترتیبی توی ساب کاربرها باشن: <button class="lnk" data-act="seg" data-seg="templates">ساب‌ها</button></div>
   ${(()=>{const bl=blocks(rts,r=>r),solo=bl.filter(b=>!b.gid),def=tplById("default");
     const withUnused=(list,id)=>{const used=list.filter(r=>routeUse(r.key).length),un=list.filter(r=>!routeUse(r.key).length),open=isOpen(id);
-      return used.map(r=>routeRow(r,null,true)).join("")+(un.length?`<div data-gbox><div class="row btn-row ghead" data-gtoggle="${esc(id)}">${chev(open)}<div class="t"><b class="mut">${fa(un.length)} مسیر استفاده‌نشده</b><small>توی هیچ تمپلیتی نیستن</small></div></div><div class="gbody" ${open?"":"hidden"}>${un.map(r=>routeRow(r,null,true)).join("")}</div></div>`:"")};
+      return used.map(r=>routeRow(r,null,true)).join("")+(un.length?`<div data-gbox><div class="row btn-row ghead" data-gtoggle="${esc(id)}">${chev(open)}<div class="t"><b class="mut">${fa(un.length)} مسیر استفاده‌نشده</b><small>توی هیچ سابی نیستن</small></div></div><div class="gbody" ${open?"":"hidden"}>${un.map(r=>routeRow(r,null,true)).join("")}</div></div>`:"")};
     return `<div class="list">${withUnused(solo.map(b=>b.items[0]),"unused")||`<div class="empty">${ic("route")}<p>هنوز مسیری نیست.</p></div>`}</div>`+
     bl.filter(b=>b.gid).map(b=>{const g=grpById(b.gid),open=isOpen(b.gid);
       return `<div class="list" data-gbox><div class="row btn-row ghead" data-gtoggle="${esc(b.gid)}">${chev(open)}<div class="t"><b>${esc(g.title)}</b><small>${groupSummary(b.gid,b.items)}</small></div><div class="r">${foldOf(def,b.gid)?`<span class="tag acc">یکی توی اپ</span>`:""}</div></div>
@@ -5342,8 +5374,8 @@ function routeUse(key){
 }
 SEGV.templates=()=>{
   const ts=S.state.templates||[],s=S.state.settings;
-  return `<div class="toolbar"><button class="btn" data-act="tpl-new">${ic("plus")} تمپلیت</button><button class="btn ghost" data-act="auto-cfg">${ic("zap")} خودکار</button></div>
-  <div class="note">تمپلیت یعنی اینکه توی ساب کاربر چه کانفیگ‌هایی باشه، با چه اسم و ترتیبی. همه «پیش‌فرض» رو می‌گیرن؛ برای هر کاربر می‌تونی تمپلیت دیگه یا انتخاب سفارشی بذاری (کاربرها ← ⋯ ← محتوای ساب).</div>
+  return `<div class="toolbar"><button class="btn" data-act="tpl-new">${ic("plus")} ساب</button><button class="btn ghost" data-act="auto-cfg">${ic("zap")} خودکار</button></div>
+  <div class="note">ساب یعنی اینکه توی ساب کاربر چه کانفیگ‌هایی باشه، با چه اسم و ترتیبی. همه «پیش‌فرض» رو می‌گیرن؛ برای هر کاربر می‌تونی ساب دیگه یا انتخاب سفارشی بذاری (کاربرها ← ⋯ ← محتوای ساب).</div>
   <div class="list">${ts.map(t=>{const shown=viewOrdered(t).filter(x=>x.show);
     const names=blocks(shown,x=>x.r).map(b=>{if(!b.gid)return viewName(t,b.items[0]);const g=grpById(b.gid),f=foldOf(t,b.gid);return f?(f.name||g.name):g.name+" ("+fa(b.items.length)+")"});
     return `<div class="row btn-row" data-act="tpl" data-id="${esc(t.id)}">${mono(t.id==="default"?"★":[...t.name].slice(0,2).join("")||"T",t.id==="default"?"on":"")}<div class="t"><b>${esc(tplLabel(t))}</b><small>${names.map(esc).join("، ")||"هیچ کانفیگی"}</small></div>
@@ -5414,7 +5446,7 @@ function bindEditor(el,o){
 }
 function tplEditor(o){
   sheet(`<h3>${ic("text")} ${esc(o.title)}</h3>
-  ${o.nameField?field("tname","اسم تمپلیت",o.name||"",'maxlength="30" autocomplete="off" placeholder="مثلاً اقتصادی"'):`<div class="mut small">همه‌ی کاربرهایی که تمپلیت دیگه‌ای ندارن این رو می‌گیرن. مسیرهای جدید خودکار به این اضافه می‌شن.</div>`}
+  ${o.nameField?field("tname","اسم ساب",o.name||"",'maxlength="30" autocomplete="off" placeholder="مثلاً اقتصادی"'):`<div class="mut small">همه‌ی کاربرهایی که ساب دیگه‌ای ندارن این رو می‌گیرن. مسیرهای جدید خودکار به این اضافه می‌شن.</div>`}
   <div data-ed>${editorHTML(o)}</div>
   <div class="bar-btns"><button type="button" class="btn" data-save>${ic("check")} ذخیره</button>${o.del?`<button type="button" class="btn danger icon" data-del aria-label="حذف">${ic("trash")}</button>`:""}</div>`,el=>{
     const get=bindEditor($("[data-ed]",el),o);
@@ -5424,13 +5456,13 @@ function tplEditor(o){
 }
 function tplSheet(t){
   const isDef=t.id==="default";
-  tplEditor({title:isDef?"تمپلیت پیش‌فرض":"تمپلیت "+t.name,nameField:!isDef,name:t.name,order_mode:t.order_mode,include_new:t.include_new,showNew:!isDef,isDefault:isDef,view:t,
+  tplEditor({title:isDef?"ساب پیش‌فرض":"ساب "+t.name,nameField:!isDef,name:t.name,order_mode:t.order_mode,include_new:t.include_new,showNew:!isDef,isDefault:isDef,view:t,
     save:async(body,btn)=>{body.id=t.id;const j=await act(btn,"template_save",body);if(j.ok)closeSheet()},
-    del:isDef?null:async()=>{if(await confirmSheet("حذف تمپلیت",esc(t.name)+" حذف بشه؟"+(t.users?" "+fa(t.users)+" کاربرش برمی‌گردن روی پیش‌فرض.":""),"حذف کن",true))act(null,"template_delete",{id:t.id})}});
+    del:isDef?null:async()=>{if(await confirmSheet("حذف ساب",esc(t.name)+" حذف بشه؟"+(t.users?" "+fa(t.users)+" کاربرش برمی‌گردن روی پیش‌فرض.":""),"حذف کن",true))act(null,"template_delete",{id:t.id})}});
 }
 function tplNew(){
   const d=tplById("default");
-  tplEditor({title:"تمپلیت جدید",nameField:true,name:"",order_mode:d.order_mode,include_new:false,showNew:true,isDefault:false,
+  tplEditor({title:"ساب جدید",nameField:true,name:"",order_mode:d.order_mode,include_new:false,showNew:true,isDefault:false,
     view:{items:d.items.map(it=>({key:it.key,name:"",show:it.show,auto:it.auto})),include_new:false,collapse:d.collapse||{}},
     save:async(body,btn)=>{const j=await act(btn,"template_save",body);if(j.ok)closeSheet()}});
 }
@@ -5464,8 +5496,8 @@ function userSubSheet(u){
       if(mode==="custom"){const base=tplById(u.tpl)||tplById("default");
         const view=u.custom||{items:(base.items||[]).map(it=>({key:it.key,name:base.id==="default"?"":it.name,show:it.show,auto:it.auto})),include_new:base.include_new,collapse:base.collapse||{}};
         const o={order_mode:(u.custom||base).order_mode,include_new:!!view.include_new,showNew:true,isDefault:false,view};
-        box.innerHTML=`<div class="hint" style="margin:4px 0 6px">فقط برای همین کاربر؛ از روی ${u.custom?"انتخاب قبلیش":"تمپلیت فعلیش"} شروع شده.</div>`+editorHTML(o);get=bindEditor(box,o)}
-      else{box.innerHTML=viewPreview(tplById(mode)||tplById("default"),u)+`<div class="hint">خود تمپلیت رو از مسیرها ← تمپلیت‌ها عوض کن.</div>`;get=null}};
+        box.innerHTML=`<div class="hint" style="margin:4px 0 6px">فقط برای همین کاربر؛ از روی ${u.custom?"انتخاب قبلیش":"ساب فعلیش"} شروع شده.</div>`+editorHTML(o);get=bindEditor(box,o)}
+      else{box.innerHTML=viewPreview(tplById(mode)||tplById("default"),u)+`<div class="hint">خود ساب رو از مسیرها ← ساب‌ها عوض کن.</div>`;get=null}};
     draw();
     $$("[data-tp]",el).forEach(b=>b.onclick=()=>{mode=b.dataset.tp;draw()});
     $("[data-save]",el).onclick=async ev=>{const body={sub:u.sub,template:mode};if(get)Object.assign(body,get());const j=await act(ev.currentTarget,"user_sub",body);if(j.ok)closeSheet()};
@@ -5486,7 +5518,7 @@ function routeSheet(r){
   ${chainChips(r)}
   ${r.note?`<div class="err">${esc(r.note)}</div>`:""}
   <form id="rf">
-  <div class="kv"><span>توی تمپلیت‌ها</span><span>${use.length?use.map(esc).join("، "):'<span class="mut">هیچ‌کدوم</span>'} <button type="button" class="lnk" data-act="seg" data-seg="templates">ویرایش</button></span></div>
+  <div class="kv"><span>توی ساب‌ها</span><span>${use.length?use.map(esc).join("، "):'<span class="mut">هیچ‌کدوم</span>'} <button type="button" class="lnk" data-act="seg" data-seg="templates">ویرایش</button></span></div>
   <div class="kv"><span>پینگ از این سرور</span><span>${ping?(ping.ok?`<span class="ok">${ms_(ping.ms)}</span>`:`<span class="bad">${esc(ping.error||"قطع")}</span>`)+` <span class="mut xs">${ago(ping.at)}</span>`:"—"}</span></div>
   <div class="kv"><span>از ایران</span><span>${ir?(ir.ok?`پینگ ${ms_(ir.tcp_ms)}، پاسخ ${ms_(ir.ttfb_ms)}، ${mb(ir.mbps)}`:`<span class="bad">قطع</span>`):"—"}</span></div>
   ${r.used!=null||r.quota_gb?`<div class="meter"><div class="rw"><span>${r.quota_gb?(r.used==null?"مصرفی ثبت نشده":gb(Math.max(0,r.quota_gb*GB-r.used))+" از "+num(r.quota_gb)+" GB مانده"):gb(r.used)+" GB مصرف"}</span><span class="mut">${fa(esc(r.period||""))}</span></div>${r.quota_gb?`<div class="bar"><i class="${barCls(pct(r.used||0,r.quota_gb*GB))}" style="width:${r.used==null?0:pct(r.used,r.quota_gb*GB)}%"></i></div>`:""}</div>`:""}
@@ -5525,7 +5557,7 @@ function autoSheet(){
   ${sw("skip_exhausted",s.skip_exhausted,"مسیر با حجم تموم‌شده برداشته بشه","تا شروع دوره‌ی بعدش")}
   <button class="btn block" style="margin-top:12px">${ic("check")} ذخیره</button></form>`,el=>{
     const f=$("#af",el);
-    const hints=()=>{$("#modehint",el).textContent=mode==="fastest"?"اپ هر چند دقیقه همه رو تست می‌کنه و سریع‌ترین رو برمی‌داره.":"اپ به ترتیب تمپلیت می‌ره: اولی که سالم بود."};hints();
+    const hints=()=>{$("#modehint",el).textContent=mode==="fastest"?"اپ هر چند دقیقه همه رو تست می‌کنه و سریع‌ترین رو برمی‌داره.":"اپ به ترتیب ساب می‌ره: اولی که سالم بود."};hints();
     $$("[data-mode]",el).forEach(b=>b.onclick=()=>{mode=b.dataset.mode;$$("[data-mode]",el).forEach(x=>x.classList.toggle("on",x===b));hints()});
     f.onsubmit=async e=>{e.preventDefault();const g=n=>f.elements.namedItem(n);
       const j=await act($("button.btn",f),"routes_save",{auto_mode:mode,show_auto:g("show_auto").checked,label_auto:g("label_auto").value.trim(),skip_down:g("skip_down").checked,skip_exhausted:g("skip_exhausted").checked});if(j.ok)closeSheet()};
@@ -5680,19 +5712,24 @@ SEGV.entries=()=>{
     <div class="r">${s.error?`<span class="bad">خطا</span>`:""}<span class="dot ${on?"ok":s.error?"bad":""}"></span></div></div>`}).join("")||`<div class="note">سرور ایران نداری. کاربرها به آی‌پی ایران وصل می‌شن و ترافیک از تانل به سرور خودت می‌رسه؛ سریع‌ترین و پایدارترین ورودیه. با یوزر و پس root اضافه کن.</div>`}</div>
   ${domainNote()}
   <div class="note">${ic("info")} ورودی «مستقیم» همیشه هست: کاربر مستقیم به آی‌پی سرور خودت وصل می‌شه.</div>`;
-  const cfgHtml=`<div class="sec"><h3>کانفیگ‌ها (واسط)</h3><span><button class="lnk" data-act="deco-raw">متنی</button>، <button class="lnk" data-act="test">تست</button>، <button class="lnk" data-act="deco-add">+ افزودن</button></span></div>
+  const decoMode=key=>{const m=(st.routes||[]).find(r=>r.key==="deco:"+key+">main"),o=(st.routes||[]).find(r=>r.key==="deco:"+key+">self");
+    const mm=m&&(m.show||m.auto),oo=o&&(o.show||o.auto);return mm&&oo?"both":oo?"own":mm?"relay":"off"};
+  const groupMode=keys=>{const set=[...new Set(keys.map(decoMode))];return set.length===1?set[0]:"mixed"};
+  const MODES=[["relay","واسط"],["own","خودش"],["both","هردو"],["off","خاموش"]];
+  const modeSeg=(keys,cur)=>`<div class="seg sub cfgmode" data-keys="${esc(keys.join(","))}">${MODES.map(([m,l])=>`<button type="button" data-act="deco-mode" data-m="${m}" class="${cur===m?"on":""}">${l}</button>`).join("")}</div>`;
+  const cfgHtml=`<div class="sec"><h3>کانفیگ‌ها (واسط)</h3><span><button class="lnk" data-act="deco-refresh">آپدیت</button>، <button class="lnk" data-act="deco-raw">متنی</button>، <button class="lnk" data-act="test">تست</button>، <button class="lnk" data-act="deco-add">+ افزودن</button></span></div>
   ${ds.length?ds.map((d,i)=>{const q=d.quota;let qh="";
     if(q){const left=Math.max(0,(q.total||0)-(q.upload||0)-(q.download||0));const p=q.total?pct((q.upload||0)+(q.download||0),q.total):0;const days=q.expire?Math.ceil((q.expire*1000-Date.now())/864e5):null;
       qh=`<div class="meter"><div class="rw"><span>${q.total?gb(left)+" از "+gb(q.total)+" GB مانده":gb((q.upload||0)+(q.download||0))+" GB مصرف"}</span><span class="${days!==null&&days<=2?"bad":"mut"}">${days===null?"":days>0?fa(days)+" روز":"منقضی"}</span></div>${q.total?`<div class="bar"><i class="${barCls(p)}" style="width:${p}%"></i></div>`:""}</div>`}
     const moves=`<div class="move"><button data-act="deco-move" data-i="${i}" data-d="-1" ${i===0?"disabled":""} aria-label="بالا">${ic("up")}</button><button data-act="deco-move" data-i="${i}" data-d="1" ${i===ds.length-1?"disabled":""} aria-label="پایین">${ic("down")}</button><button data-act="deco-del" data-i="${i}" aria-label="حذف">${ic("trash")}</button></div>`;
     const stat=s=>!s?`<span class="mut">تست‌نشده</span>`:s.ok===null?`<span class="mut">UDP</span>`:s.ok?`<span class="ok">${ms_(s.ms)}</span>`:`<span class="bad">قطع</span>`;
     const node=(nd,extra="")=>`<div class="row">${mono(decoMono(nd.n))}<div class="t"><b class="ltr" style="text-align:right">${esc(nd.name)}</b><small class="ltr" style="text-align:right">${esc(nd.proto)} · ${esc(nd.server)}:${nd.port}${nd.status&&!nd.status.ok&&nd.status.error?"، "+esc(nd.status.error):""}</small></div><div class="r">${stat(nd.status)}</div>${extra}</div>`;
-    if(d.kind==="link"&&d.nodes.length===1)return `<div class="list">${node(d.nodes[0],moves)}${d.error?`<div class="err">${esc(d.error)}</div>`:""}</div>`;
+    if(d.kind==="link"&&d.nodes.length===1)return `<div class="list">${node(d.nodes[0],moves)}<div style="padding:4px 0 2px">${modeSeg([d.nodes[0].key],decoMode(d.nodes[0].key))}</div>${d.error?`<div class="err">${esc(d.error)}</div>`:""}</div>`;
     const gid=d.gid||"l"+i,open=isOpen(gid),okN=d.nodes.filter(x=>x.status&&x.status.ok).length,badN=d.nodes.filter(x=>x.status&&x.status.ok===false).length;
     const left=q&&q.total?Math.max(0,q.total-(q.upload||0)-(q.download||0)):null;
     return `<div class="list" data-gbox><div class="row btn-row ghead" data-gtoggle="${esc(gid)}">${chev(open)}<div class="t"><b class="ltr" style="text-align:right">${esc(d.title)}</b><small>${d.kind==="sub"?"لینک ساب، ":""}${fa(d.nodes.length)} کانفیگ${okN?`، <span class="ok">${fa(okN)} سالم</span>`:""}${badN?`، <span class="bad">${fa(badN)} قطع</span>`:""}${left!=null?`، ${gb(left)} GB مانده`:""}</small></div>${moves}</div>
-     <div class="gbody" ${open?"":"hidden"}>${d.nodes.map(nd=>node(nd)).join("")}${qh?`<div style="padding:0 0 10px">${qh}</div>`:""}</div>
-     ${d.error?`<div class="err" style="padding-bottom:8px">${esc(d.error)}</div>`:""}</div>`}).join(""):`<div class="list"><div class="note">واسط = کانفیگ یا لینک ساب یکی دیگه. کاربر اول به اون وصل می‌شه و از اونجا به سرور تو می‌رسه؛ یا خود کانفیگش همون‌طور که هست توی ساب میاد. آخرین تست: ${ago(st.monitor.last_run)}</div></div>`}
+     <div class="gbody" ${open?"":"hidden"}><div class="gfold"><span class="mut small" style="flex:none">همه‌ی این ساب:</span>${modeSeg(d.nodes.map(n=>n.key),groupMode(d.nodes.map(n=>n.key)))}</div>${d.nodes.map(nd=>node(nd)).join("")}${qh?`<div style="padding:0 0 10px">${qh}</div>`:""}</div>
+     ${d.error?`<div class="err" style="padding-bottom:8px">${esc(d.error)}</div>`:""}</div>`}).join(""):`<div class="list"><div class="note">کانفیگ یا لینک ساب یکی دیگه رو اضافه کن. برای هر کدوم انتخاب کن: «واسط» (کاربر از راهش به سرور تو می‌رسه)، «خودش» (همون کانفیگ عیناً توی ساب میاد)، یا «هردو». آخرین تست: ${ago(st.monitor.last_run)}</div></div>`}
   ${st.monitor.note?`<div class="note">${ic("info")} ${esc(st.monitor.note)}</div>`:""}`;
   const e=S.eseg||"srv";
   return `<div class="seg sub"><button data-act="eseg" data-e="srv" class="${e==="srv"?"on":""}">${ic("server")} سرور</button><button data-act="eseg" data-e="cfg" class="${e==="cfg"?"on":""}">${ic("link")} کانفیگ</button></div>${e==="srv"?srvHtml:cfgHtml}`;
@@ -5966,7 +6003,7 @@ VIEWS.settings=()=>{
    ${field("info_format","متن کانفیگ اطلاعات",s.info_format,'placeholder="👤 {name} | 📊 {left} | ⏳ {days}" maxlength="80"',"{name} اسم، {left} حجم مانده، {days} روز مانده، {used} مصرف، {total} کل حجم")}
    ${field("probe_url","لینک تست سرعت از ایران",s.probe_url,'class="in ltr" placeholder="https://speed.cloudflare.com/__down?bytes=10000000"',"فایلی که برای اندازه‌گیری سرعت دانلود می‌شه")}
    ${field("label_deco","اسم واسط‌ها در اپ",s.label_deco,'placeholder="واسط"',"«واسط ۱»، «واسط ۲»… با اسم لاتین مثل Deco: Deco1، Deco2")}
-   <div class="hint" style="margin-top:8px">${ic("info")} چه کانفیگ‌هایی با چه اسم و ترتیبی توی ساب باشن: مسیرها ← تمپلیت‌ها.</div>
+   <div class="hint" style="margin-top:8px">${ic("info")} چه کانفیگ‌هایی با چه اسم و ترتیبی توی ساب باشن: مسیرها ← ساب‌ها.</div>
    <button class="btn block" style="margin-top:10px">${ic("check")} ذخیره</button></form>
 
   ${cfCard()}
@@ -6097,11 +6134,13 @@ const ACTS={
   "cf-auto":()=>act(null,"cf_sub_auto",{auto:!S.state.cf.auto}),
   "cf-off":async()=>{if(await confirmSheet("جدا کردن کلادفلر","توکن از پنل پاک می‌شه. ساب‌دامین‌هایی که ساخته شدن سر جاشون می‌مونن.","جدا کن",true))act(null,"cf_disconnect",{})},
   "sub-map":b=>{const u=userBy(b.dataset.sub);if(u)subMapSheet(u)},
+  "deco-mode":b=>{const seg=b.closest("[data-keys]");if(seg)act(b,"deco_mode",{keys:seg.dataset.keys.split(","),mode:b.dataset.m})},
+  "deco-refresh":b=>act(b,"decos_refresh",{}),
   "bk-send":b=>act(b,"backup_send",{}),
   "bot-chat":b=>{const f=b.closest("form"),t=f&&f.elements.namedItem("bale_token");act(b,"bot_chat",{bot:b.dataset.bot,token:t?t.value.trim():""})},
   "bk-restore":()=>{const inp=document.createElement("input");inp.type="file";inp.accept=".zip,application/zip";
     inp.onchange=()=>{const file=inp.files[0];if(!file)return;const rd=new FileReader();
-      rd.onload=async()=>{if(!await confirmSheet("بازگردانی بکاپ","تنظیمات، واسط‌ها، سرورها، تانل‌ها و تمپلیت‌ها از فایل <span class=\"ltr\">"+esc(file.name)+"</span> برمی‌گردن. آدرس و رمز همین پنل عوض نمی‌شه.","برگردون",true))return;
+      rd.onload=async()=>{if(!await confirmSheet("بازگردانی بکاپ","تنظیمات، واسط‌ها، سرورها، تانل‌ها و ساب‌ها از فایل <span class=\"ltr\">"+esc(file.name)+"</span> برمی‌گردن. آدرس و رمز همین پنل عوض نمی‌شه.","برگردون",true))return;
         act(null,"backup_restore",{data:String(rd.result).split(",")[1]||""})};rd.readAsDataURL(file)};inp.click()},
   "tun-ports":async b=>{const t=S.state.net.tunnels.find(x=>x.id===b.dataset.id);if(!t)return;const box=b.closest("details")||b.closest(".sheet");
     const inp=box&&$("[data-tports]",box);const ports=b.dataset.ports||(inp?inp.value.trim():"");if(!ports)return;
