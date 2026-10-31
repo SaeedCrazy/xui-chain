@@ -39,12 +39,14 @@ import tempfile
 import threading
 import time
 import uuid
+import zipfile
+import io
 import urllib.parse
 import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.3.0"
+VERSION = "5.4.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -107,6 +109,14 @@ DEFAULTS = {
     "tg_enable": True,          # Telegram alerts
     "tg_token": "",             # empty = the 3x-ui panel's own Telegram bot
     "tg_chat": "",              # empty = the panel bot's admin chat ids
+    "bk_hours": 24,             # backup every N hours (0 = only by hand)
+    "bk_tg": True,              # send backups to the Telegram bot chat(s)
+    "bk_bale": False,           # ... and to a Bale bot
+    "bale_token": "",
+    "bale_chat": "",
+    "bk_xui": True,             # include the 3x-ui database
+    "bk_last": 0,
+    "bk_note": "",
     "test_sub_id": "",          # user whose config is used for the real test; empty = first enabled user
     "panel_url": "auto",        # 3x-ui panel address for creating users; auto = from the panel settings
     "panel_auto": True,         # connect to the panel by itself from this server (no token or password typed)
@@ -4172,6 +4182,9 @@ def admin_state(app, host):
             "auto_mode": cfg.get("auto_mode") or "priority", "probe_url": cfg.get("probe_url", ""),
             "order_mode": cfg.get("order_mode") or "manual",
             "skip_down": cfg.get("skip_down", True), "skip_exhausted": cfg.get("skip_exhausted", True),
+            "bk_hours": int(cfg.get("bk_hours") or 0), "bk_tg": cfg.get("bk_tg", True), "bk_bale": cfg.get("bk_bale", False),
+            "bk_xui": cfg.get("bk_xui", True), "bk_last": int(cfg.get("bk_last") or 0) * 1000, "bk_note": cfg.get("bk_note", ""),
+            "bale_chat": cfg.get("bale_chat", ""), "bale_token_set": bool(cfg.get("bale_token")),
             "user_page": cfg.get("user_page", True), "support_url": cfg.get("support_url", ""),
             "info_config": cfg.get("info_config", True), "info_format": cfg.get("info_format") or DEFAULTS["info_format"],
             "announce": cfg.get("announce", ""),
@@ -4251,11 +4264,11 @@ def net_state(app):
             "iran": [s["id"] for s in net.servers() if s.get("role") == "iran"]}
 
 
-SETTING_BOOLS = ("direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
+SETTING_BOOLS = ("bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
                  "skip_exhausted", "info_config")
-SETTING_TEXTS = {"info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
+SETTING_TEXTS = {"bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
-SETTING_SECRETS = ("tg_token", "panel_token", "panel_pass")
+SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass")
 
 
 def net_action(app, action, body, host, done, fail):
@@ -4379,6 +4392,8 @@ def do_action(app, action, body, host):
             for k in SETTING_SECRETS:
                 if k in body:
                     cfg[k] = "" if body[k] is None else (str(body[k]).strip() or cfg.get(k, ""))
+            if "bk_hours" in body:
+                cfg["bk_hours"] = min(168, max(0, _int(body["bk_hours"])))
             if "monitor_minutes" in body:
                 cfg["monitor_minutes"] = min(1440, max(2, _int(body["monitor_minutes"]) or 10))
             save_config(cfg)
@@ -4603,6 +4618,41 @@ def do_action(app, action, body, host):
             fqdn = cf_set_server(cfg, srv, str(body.get("name")))
             net.save_server(srv)
             return done("%s → %s" % (fqdn, srv["domain_ip"]))
+
+        if action == "backup_send":
+            sent, errors = send_backup(app)
+            return (done("بکاپ فرستاده شد به " + "، ".join(sent) + ("؛ " + "؛ ".join(errors) if errors else ""))
+                    if sent else fail("بکاپ فرستاده نشد: " + "؛ ".join(errors)))
+
+        if action == "backup_restore":
+            try:
+                data = base64.b64decode(str(body.get("data") or ""), validate=True)
+            except ValueError:
+                return fail("فایل خونده نشد")
+            had_xui = restore_backup(app, data)
+            return done("بکاپ برگردونده شد" + ("؛ دیتابیس 3x-ui داخل فایل هست ولی دست نخورد (اونو از خود 3x-ui برگردون)" if had_xui else ""))
+
+        if action == "bot_chat":
+            which = body.get("bot")
+            cfg = load_config()
+            if which == "bale":
+                token = str(body.get("token") or "").strip() or cfg.get("bale_token", "")
+                api = BALE_API
+            else:
+                token = str(body.get("token") or "").strip() or app.rt.get("tg_token_rt", "")
+                api = TG_API
+            if not token:
+                return fail("اول توکن ربات رو بذار")
+            ids = bot_chat_ids(api, token)
+            if not ids:
+                return fail("پیامی پیدا نشد؛ اول توی خود ربات «سلام» بفرست و دوباره بزن")
+            key = "bale_chat" if which == "bale" else "tg_chat"
+            cfg[key] = ids[-1]
+            if which == "bale" and body.get("token"):
+                cfg["bale_token"] = token
+            save_config(cfg)
+            app.reload()
+            return done("Chat ID پیدا شد: %s" % ids[-1])
 
         if action == "sub_map":
             sub = str(body.get("sub", ""))
@@ -5949,6 +5999,21 @@ VIEWS.settings=()=>{
    ${field("monitor_minutes","فاصله‌ی تست خودکار (دقیقه)",s.monitor_minutes,'class="in ltr" inputmode="numeric"',"واسط‌ها، تانل‌ها و ترافیک سرورها")}
    <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="tg-test">${ic("bell")} پیام آزمایشی</button></div></form>
 
+  <form class="card" data-sec="backup" id="bk-sec"><h2>بکاپ</h2>
+   <p class="mut small">آخرین بکاپ: ${s.bk_last?ago(s.bk_last):"هنوز نه"}${s.bk_note?"، "+esc(s.bk_note):""}</p>
+   <label class="f"><span>ارسال خودکار</span><select class="in" name="bk_hours">${[[0,"خاموش (فقط دستی)"],[6,"هر ۶ ساعت"],[12,"هر ۱۲ ساعت"],[24,"هر روز"],[72,"هر ۳ روز"],[168,"هر هفته"]].map(([v,l])=>`<option value="${v}" ${s.bk_hours===v?"selected":""}>${l}</option>`).join("")}</select></label>
+   ${sw("bk_tg",s.bk_tg,"ربات تلگرام",s.tg_token_set||s.tg_source==="panel"?"همون ربات و چت هشدارها":"اول توی «هشدار تلگرام» ربات رو تنظیم کن")}
+   ${sw("bk_bale",s.bk_bale,"ربات بله",s.bale_token_set&&s.bale_chat?"وصله":"توکن و Chat ID پایین")}
+   <details ${s.bk_bale&&!(s.bale_token_set&&s.bale_chat)?"open":""}><summary>تنظیم ربات بله</summary>
+    <div class="hint">توی بله با <a href="https://ble.ir/botfather" target="_blank" rel="noopener">BotFather</a> یه ربات بساز و توکنش رو اینجا بذار؛ بعد به ربات خودت یه پیام بده و «پیدا کردن» رو بزن.</div>
+    ${field("bale_token","توکن ربات بله","",`class="in ltr" type="password" autocomplete="off" placeholder="${s.bale_token_set?"ذخیره شده":"123456789:ABC…"}"`)}
+    <div class="cols2" style="align-items:end">${field("bale_chat","Chat ID",s.bale_chat,'class="in ltr" autocomplete="off"')}<button type="button" class="btn sm ghost" style="margin:10px 0" data-act="bot-chat" data-bot="bale">${ic("search")} پیدا کردن</button></div>
+   </details>
+   ${sw("bk_xui",s.bk_xui,"دیتابیس 3x-ui هم توش باشه","کاربرها و inboundها")}
+   <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="bk-send">${ic("share")} ارسال الان</button></div>
+   <div class="bar-btns"><a class="btn ghost" href="backup.zip" download>${ic("in")} دانلود</a><button type="button" class="btn ghost" data-act="bk-restore">${ic("refresh")} بازگردانی</button></div>
+   <div class="hint">فایل بکاپ رمزها و توکن‌ها رو داره؛ فقط به ربات و چت خودت بفرست.</div></form>
+
   <form class="card" data-sec="links"><h2>لینک‌ها</h2>
    ${field("public_host","دامنه برای لینک کاربرها",s.public_host,'class="in ltr" placeholder="sub.example.com"',"خالی = همان آدرسی که پنل را با آن باز کردی. الان: <span class=\"ltr\">"+esc(S.state.base)+"</span>")}
    ${field("xui_sub_url","آدرس ساب 3x-ui",s.xui_sub_url,'class="in ltr"',"auto = خودکار: <span class=\"ltr\">"+esc(s.xui_rt)+"</span>")}
@@ -5969,7 +6034,7 @@ document.addEventListener("submit",async e=>{
   if(!f.dataset.sec)return;
   e.preventDefault();
   const body={};
-  $$("input,textarea",f).forEach(x=>{if(!x.name)return;if(x.type==="checkbox")body[x.name]=x.checked;else if(x.type==="password"){if(x.value)body[x.name]=x.value}else body[x.name]=x.value});
+  $$("input,textarea,select",f).forEach(x=>{if(!x.name)return;if(x.type==="checkbox")body[x.name]=x.checked;else if(x.type==="password"){if(x.value)body[x.name]=x.value}else body[x.name]=x.value});
   await act($("button:not([type=button])",f),"settings",body);
 });
 
@@ -6032,6 +6097,12 @@ const ACTS={
   "cf-auto":()=>act(null,"cf_sub_auto",{auto:!S.state.cf.auto}),
   "cf-off":async()=>{if(await confirmSheet("جدا کردن کلادفلر","توکن از پنل پاک می‌شه. ساب‌دامین‌هایی که ساخته شدن سر جاشون می‌مونن.","جدا کن",true))act(null,"cf_disconnect",{})},
   "sub-map":b=>{const u=userBy(b.dataset.sub);if(u)subMapSheet(u)},
+  "bk-send":b=>act(b,"backup_send",{}),
+  "bot-chat":b=>{const f=b.closest("form"),t=f&&f.elements.namedItem("bale_token");act(b,"bot_chat",{bot:b.dataset.bot,token:t?t.value.trim():""})},
+  "bk-restore":()=>{const inp=document.createElement("input");inp.type="file";inp.accept=".zip,application/zip";
+    inp.onchange=()=>{const file=inp.files[0];if(!file)return;const rd=new FileReader();
+      rd.onload=async()=>{if(!await confirmSheet("بازگردانی بکاپ","تنظیمات، واسط‌ها، سرورها، تانل‌ها و تمپلیت‌ها از فایل <span class=\"ltr\">"+esc(file.name)+"</span> برمی‌گردن. آدرس و رمز همین پنل عوض نمی‌شه.","برگردون",true))return;
+        act(null,"backup_restore",{data:String(rd.result).split(",")[1]||""})};rd.readAsDataURL(file)};inp.click()},
   "tun-ports":async b=>{const t=S.state.net.tunnels.find(x=>x.id===b.dataset.id);if(!t)return;const box=b.closest("details")||b.closest(".sheet");
     const inp=box&&$("[data-tports]",box);const ports=b.dataset.ports||(inp?inp.value.trim():"");if(!ports)return;
     if(!await confirmSheet("پورت‌های تانل","تانل «"+esc(t.name)+"» با پورت‌های <span class=\"ltr\">"+esc(ports)+"</span> روی هر دو سرور دوباره راه‌اندازی می‌شه (چند ثانیه قطعی).","انجام بده"))return;
@@ -6160,6 +6231,174 @@ class UsageStore:
                 con.close()
         out = [(tehran_day(now - i * 86400), 0) for i in range(days - 1, -1, -1)]
         return [(d, rows.get(d, 0)) for d, _ in out], (started[0] if started else 0)
+
+
+# ---------------------------------------------------------------- backup to Telegram / Bale
+
+BALE_API = os.environ.get("XUI_CHAIN_BALE_API", "https://tapi.bale.ai")
+BACKUP_FILES = ("config.json", "upstreams.txt", "usage.db", "known_hosts")
+
+
+def sqlite_copy(path):
+    """A consistent copy of a live SQLite database, as bytes."""
+    tmp = tempfile.mkstemp(suffix=".db")[1]
+    try:
+        src = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=10)
+        dst = sqlite3.connect(tmp)
+        try:
+            src.backup(dst)
+        finally:
+            src.close()
+            dst.close()
+        with open(tmp, "rb") as f:
+            return f.read()
+    finally:
+        os.unlink(tmp)
+
+
+def make_backup(app, include_xui=None):
+    """-> (file name, zip bytes): EZ-XUI's settings, upstreams, usage history, SSH key, and the 3x-ui DB."""
+    cfg = app.cfg
+    include_xui = cfg.get("bk_xui", True) if include_xui is None else include_xui
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name in BACKUP_FILES:
+            path = conf_path(name)
+            if not os.path.isfile(path):
+                continue
+            z.writestr("ez-xui/" + name, sqlite_copy(path) if name.endswith(".db") else open(path, "rb").read())
+        for path in (SSH_KEY, SSH_KEY + ".pub"):
+            if os.path.isfile(path):
+                z.writestr("ez-xui/ssh/" + os.path.basename(path), open(path, "rb").read())
+        if include_xui and os.path.isfile(app.db_path):
+            try:
+                z.writestr("x-ui/x-ui.db", sqlite_copy(app.db_path))
+            except sqlite3.Error as e:
+                z.writestr("x-ui/ERROR.txt", "x-ui.db not copied: %s\n" % e)
+        z.writestr("ez-xui/VERSION", VERSION + "\n")
+    host = re.sub(r"[^A-Za-z0-9.-]", "", app.rt.get("public_host") or socket.gethostname())[:40] or "server"
+    return "ez-xui-%s-%s.zip" % (host, time.strftime("%Y%m%d-%H%M", time.gmtime(time.time() + TEHRAN))), buf.getvalue()
+
+
+def send_document(api, token, chat, filename, data, caption=""):
+    """Bot API sendDocument (Telegram and Bale speak the same API). -> "" or an error."""
+    boundary = "ezxui" + secrets.token_hex(12)
+    parts = []
+    for k, v in (("chat_id", chat), ("caption", caption)):
+        parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, k, v)).encode())
+    parts.append(('--%s\r\nContent-Disposition: form-data; name="document"; filename="%s"\r\n'
+                  'Content-Type: application/zip\r\n\r\n' % (boundary, filename)).encode() + data + b"\r\n")
+    body = b"".join(parts) + ("--%s--\r\n" % boundary).encode()
+    req = urllib.request.Request("%s/bot%s/sendDocument" % (api, token), data=body,
+                                 headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+    try:
+        out = json.loads(urllib.request.urlopen(req, timeout=60).read().decode("utf-8") or "{}")
+        return "" if out.get("ok") else str(out.get("description") or "خطا")
+    except urllib.error.HTTPError as e:
+        try:
+            return str(json.loads(e.read().decode("utf-8")).get("description") or "HTTP %d" % e.code)
+        except ValueError:
+            return "HTTP %d" % e.code
+    except (OSError, ValueError) as e:
+        return str(getattr(e, "reason", None) or e)
+
+
+def backup_targets(app):
+    """[(label, api, token, [chats])] of the enabled destinations."""
+    cfg, rt = app.cfg, app.rt
+    out = []
+    split = lambda v: [c for c in re.split(r"[,\s]+", v or "") if c]
+    if cfg.get("bk_tg", True) and rt.get("tg_token_rt") and split(rt.get("tg_chat_rt")):
+        out.append(("تلگرام", TG_API, rt["tg_token_rt"], split(rt["tg_chat_rt"])))
+    if cfg.get("bk_bale") and cfg.get("bale_token") and split(cfg.get("bale_chat")):
+        out.append(("بله", BALE_API, cfg["bale_token"], split(cfg["bale_chat"])))
+    return out
+
+
+def send_backup(app):
+    """Make a backup and send it to every enabled bot. -> (sent labels, errors)."""
+    targets = backup_targets(app)
+    if not targets:
+        raise PanelError("مقصدی برای بکاپ نیست؛ ربات تلگرام یا بله رو تنظیم کن")
+    name, data = make_backup(app)
+    if len(data) > 49 * 1024 * 1024:
+        raise PanelError("بکاپ از ۵۰ مگابایت بزرگ‌تره؛ دیتابیس 3x-ui رو از بکاپ بردار یا دستی دانلود کن")
+    caption = "🗂 بکاپ %s · %s\n%s" % (NAME, app.rt.get("public_host") or "server", time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + TEHRAN)))
+    sent, errors = [], []
+    for label, api, token, chats in targets:
+        errs = [e for e in (send_document(api, token, c, name, data, caption) for c in chats) if e]
+        (errors.append("%s: %s" % (label, errs[0])) if errs else sent.append(label))
+    cfg = load_config()
+    cfg["bk_last"] = int(time.time())
+    cfg["bk_note"] = ("فرستاده شد به " + "، ".join(sent) if sent else "") + ("؛ " if sent and errors else "") + "؛ ".join(errors)
+    save_config(cfg)
+    app.reload()
+    return sent, errors
+
+
+def restore_backup(app, data):
+    """Put a backup's EZ-XUI files back. This panel's own address and password stay as they are."""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+        names = set(z.namelist())
+    except zipfile.BadZipFile:
+        raise PanelError("این فایل بکاپ EZ-XUI نیست")
+    if "ez-xui/config.json" not in names:
+        raise PanelError("این فایل بکاپ EZ-XUI نیست")
+    try:
+        old = json.loads(z.read("ez-xui/config.json").decode("utf-8"))
+        if not isinstance(old, dict):
+            raise ValueError
+    except ValueError:
+        raise PanelError("تنظیمات داخل بکاپ خراب است")
+    cfg = load_config()
+    for k in ("admin_path", "admin_pass", "session_key"):
+        old[k] = cfg.get(k, "")
+    save_config(dict(DEFAULTS, **old))
+    if "ez-xui/upstreams.txt" in names:
+        save_upstreams_text(z.read("ez-xui/upstreams.txt").decode("utf-8", "replace"))
+    for name in ("usage.db", "known_hosts"):
+        if "ez-xui/" + name in names:
+            with open(conf_path(name), "wb") as f:
+                f.write(z.read("ez-xui/" + name))
+    for path in (SSH_KEY, SSH_KEY + ".pub"):
+        member = "ez-xui/ssh/" + os.path.basename(path)
+        if member in names:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(z.read(member))
+            os.chmod(path, 0o600 if not path.endswith(".pub") else 0o644)
+    app.reload()
+    return "x-ui/x-ui.db" in names
+
+
+def bot_chat_ids(api, token):
+    """Chat ids of whoever messaged the bot lately (to fill in the chat id without typing it)."""
+    try:
+        out = json.loads(urllib.request.urlopen("%s/bot%s/getUpdates" % (api, token), timeout=15).read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise PanelError("ربات جواب نداد (HTTP %d)؛ توکن رو چک کن" % e.code)
+    except (OSError, ValueError) as e:
+        raise PanelError("ربات در دسترس نیست: %s" % (getattr(e, "reason", None) or e))
+    ids = []
+    for u in out.get("result") or []:
+        msg = u.get("message") or u.get("channel_post") or {}
+        cid = str((msg.get("chat") or {}).get("id") or "")
+        if cid and cid not in ids:
+            ids.append(cid)
+    return ids
+
+
+def backup_loop(app):
+    time.sleep(60)
+    while True:
+        try:
+            hours = int(app.cfg.get("bk_hours") or 0)
+            if hours > 0 and time.time() - int(app.cfg.get("bk_last") or 0) >= hours * 3600 and backup_targets(app):
+                send_backup(app)
+        except Exception as e:
+            print("backup error: %s" % e, flush=True)
+        time.sleep(600)
 
 
 def usage_loop(app, every=600):
@@ -6518,6 +6757,17 @@ def make_handler(app):
                 fmt = pick_format(_q(q, "format"), self.headers.get("User-Agent", ""))
                 status, hdrs, body = build_subscription(parts[1], fmt, app.rt, app)
                 return self.send(status, body, hdrs or None)
+            if self.is_admin(parts) and parts[1:] == ["backup.zip"]:
+                if not (Auth.stored() and self.authed()):
+                    return self.send(403, "forbidden\n")
+                name, data = make_backup(app)
+                self.send_response(200)
+                for k, v in (("Content-Type", "application/zip"), ("Cache-Control", "no-store"),
+                             ("Content-Disposition", 'attachment; filename="%s"' % name), ("Content-Length", str(len(data)))):
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.is_admin(parts) and len(parts) == 1:
                 if not u.path.endswith("/"):
                     self.send_response(302)
@@ -6534,7 +6784,8 @@ def make_handler(app):
             if self.headers.get("X-XC") != "1":
                 return self.json(403, {"ok": False, "error": "forbidden"})
             try:
-                length = min(int(self.headers.get("Content-Length") or 0), 1024 * 1024)
+                limit = 80 * 1024 * 1024 if parts[2] == "backup_restore" else 1024 * 1024
+                length = min(int(self.headers.get("Content-Length") or 0), limit)
                 body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                 if not isinstance(body, dict):
                     raise ValueError
@@ -6629,6 +6880,7 @@ def serve(app):
     print("panel subscription: %s" % rt["xui_sub_url"], flush=True)
     threading.Thread(target=app.monitor.loop, daemon=True).start()
     threading.Thread(target=usage_loop, args=(app,), daemon=True).start()
+    threading.Thread(target=backup_loop, args=(app,), daemon=True).start()
     threading.Thread(target=app.panel.overview, daemon=True).start()  # automatic panel connection
     httpd.serve_forever()
 

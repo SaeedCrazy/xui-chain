@@ -16,6 +16,8 @@ import threading
 import time
 import unittest
 import uuid
+import io
+import zipfile
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -842,6 +844,52 @@ class EndToEnd(unittest.TestCase):
             xc.GEO_API = keep
             geo.shutdown()
 
+    def test_backup(self):
+        tg = start(ThreadingHTTPServer(("127.0.0.1", 0), Telegram))
+        keep = xc.BALE_API
+        xc.BALE_API = "http://127.0.0.1:%d" % tg.server_address[1]
+        Telegram.sent.clear()
+        self.login()
+        try:
+            self.assertFalse(self.admin("backup_send")[1]["ok"])  # nowhere to send yet
+            self.assertFalse(self.admin("bot_chat", {"bot": "bale"})[1]["ok"])  # no token
+            out = self.admin("bot_chat", {"bot": "bale", "token": "123:bale"})[1]
+            self.assertTrue(out["ok"], out)
+            self.assertEqual((out["state"]["settings"]["bale_chat"], out["state"]["settings"]["bale_token_set"]), ("555", True))
+            self.assertNotIn("123:bale", json.dumps(out["state"]))
+            out = self.admin("settings", {"bk_bale": True, "bk_tg": False, "bk_hours": "500", "title": "قبل"})[1]
+            self.assertEqual(out["state"]["settings"]["bk_hours"], 168)
+            out = self.admin("backup_send")[1]
+            self.assertTrue(out["ok"], out)
+            self.assertIn("بله", out["msg"])
+            path, raw = next(x for x in Telegram.sent if x[0].endswith("/sendDocument"))
+            self.assertEqual(path, "/bot123:bale/sendDocument")
+            self.assertIn(b'name="chat_id"\r\n\r\n555', raw)
+            self.assertIn(b'filename="ez-xui-', raw)
+            self.assertTrue(out["state"]["settings"]["bk_last"] > 0)
+            # download (signed in only), then restore it after a change
+            req = urllib.request.Request(self.base + "/adm1n/backup.zip")
+            with self.opener.open(req, timeout=10) as r:
+                data = r.read()
+                self.assertEqual(r.headers["Content-Type"], "application/zip")
+            names = zipfile.ZipFile(io.BytesIO(data)).namelist()
+            self.assertIn("ez-xui/config.json", names)
+            self.assertIn("ez-xui/upstreams.txt", names)
+            self.assertIn("x-ui/x-ui.db", names)
+            self.assertEqual(self.get("/adm1n/backup.zip")[0], 403)  # without the session cookie
+            self.admin("settings", {"title": "بعد"})
+            out = self.admin("backup_restore", {"data": base64.b64encode(data).decode()})[1]
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["state"]["settings"]["title"], "قبل")
+            self.assertEqual(xc.load_config()["admin_path"], "adm1n")  # this panel's address stays
+            self.assertTrue(self.admin("state")[1]["ok"])  # still signed in
+            self.assertFalse(self.admin("backup_restore", {"data": base64.b64encode(b"not a zip").decode()})[1]["ok"])
+            self.assertFalse(self.admin("backup_restore", {"data": "%%%"})[1]["ok"])
+        finally:
+            self.admin("settings", {"bk_bale": False, "bk_tg": True, "bk_hours": 24, "title": "", "bale_token": None, "bale_chat": ""})
+            xc.BALE_API = keep
+            tg.shutdown()
+
     def test_route_ping(self):
         d = tempfile.mkdtemp()
         xray = os.path.join(d, "xray")
@@ -1052,11 +1100,19 @@ class Telegram(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        body = self.rfile.read(int(self.headers["Content-Length"])).decode()
-        Telegram.sent.append((self.path, urllib.parse.parse_qs(body)))
+        raw = self.rfile.read(int(self.headers["Content-Length"]))
+        if "multipart" in (self.headers.get("Content-Type") or ""):
+            Telegram.sent.append((self.path, raw))
+        else:
+            Telegram.sent.append((self.path, urllib.parse.parse_qs(raw.decode())))
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b'{"ok":true}')
+
+    def do_GET(self):  # getUpdates: someone wrote to the bot
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"ok":true,"result":[{"update_id":1,"message":{"chat":{"id":555},"text":"hi"}}]}')
 
 
 class MonitorTests(unittest.TestCase):
