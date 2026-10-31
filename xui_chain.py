@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.6.0"
+VERSION = "5.7.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -1070,10 +1070,26 @@ def sub_view(cfg, sub_id):
     return None
 
 
-def view_routes(cfg, rts, sub_id=None, ups=None):
+def first_enabled_sub(app):
+    for _, sub, en in list_clients(app.db_path):
+        if en and sub:
+            return sub
+    return ""
+
+
+def dedicated_sub(cfg, sub_id):
+    """A sub reachable by its own link, "d-<token>" -> its template, else None."""
+    if not (isinstance(sub_id, str) and sub_id.startswith("d-")):
+        return None
+    tok = sub_id[2:]
+    return next((t for t in cfg.get("sub_templates") or [] if t.get("token") and t["token"] == tok), None)
+
+
+def view_routes(cfg, rts, sub_id=None, ups=None, view=None):
     """Routes as one user gets them: their template or own choice, and the Deco subscriptions
     folded into one entry ("fold" = its name in the apps)."""
-    view = sub_view(cfg, sub_id) if sub_id is not None else None
+    if view is None and sub_id is not None:
+        view = sub_view(cfg, sub_id)
     rts = apply_view(rts, view)
     collapse = (view.get("collapse") if view else cfg.get("collapse")) or {}
     if not collapse:
@@ -1151,7 +1167,7 @@ def templates_public(cfg, rts, users=None):
     for t in cfg.get("sub_templates") or []:
         out.append({"id": t["id"], "name": t.get("name") or "", "order_mode": t.get("order_mode") or "manual",
                     "include_new": bool(t.get("include_new")), "items": t.get("items") or [], "users": count(t["id"]),
-                    "collapse": t.get("collapse") or {}})
+                    "collapse": t.get("collapse") or {}, "token": t.get("token") or "", "base": t.get("base") or ""})
     return out
 
 
@@ -1832,7 +1848,11 @@ def info_line(rt, sub_id, own, hdrs, app=None, now=None):
 
 def build_subscription(sub_id, fmt, rt, app=None):
     """-> (status, headers, body)."""
-    url = rt["xui_sub_url"] + urllib.parse.quote(sub_id)
+    ded = dedicated_sub(rt, sub_id)
+    base = (ded.get("base") or (first_enabled_sub(app) if app else "")) if ded else sub_id
+    if ded and not base:
+        return 404, {}, "no base user for this sub\n"
+    url = rt["xui_sub_url"] + urllib.parse.quote(base)
     try:
         status, hdrs, body = http_get(url, connect=rt.get("xui_connect", ""))
     except Exception as e:
@@ -1843,9 +1863,9 @@ def build_subscription(sub_id, fmt, rt, app=None):
     if not own:
         return 404, {}, "no configs for this subscription\n"
     ups = UPSTREAMS.nodes()
-    title = rt.get("title") or NAME
-    rts = view_routes(rt, live_routes(app, rt, ups) if app else routes(rt, ups), sub_id, ups)
-    info = info_line(rt, sub_id, own, hdrs, app) if rt.get("info_config", True) else None
+    title = (ded.get("name") if ded else rt.get("title")) or NAME
+    rts = view_routes(rt, live_routes(app, rt, ups) if app else routes(rt, ups), None if ded else sub_id, ups, view=ded)
+    info = info_line(rt, base, own, hdrs, app) if rt.get("info_config", True) else None
     try:
         if fmt == "xray":
             text, _ = build_xray(own, ups, rt, title, rts, info)
@@ -1914,6 +1934,8 @@ def tcp_check(server, port, timeout=3):
 # ---------------------------------------------------------------- Deco tests and alerts
 
 TG_API = os.environ.get("XUI_CHAIN_TG_API", "https://api.telegram.org")
+APP_FILE = os.environ.get("XUI_CHAIN_FILE") or os.path.abspath(__file__)
+RESTART_CMD = os.environ.get("XUI_CHAIN_RESTART", "systemctl restart xui-chain")
 XRAY_PROTOCOLS = ("vless", "vmess", "trojan", "ss")
 
 
@@ -4362,6 +4384,48 @@ def net_action(app, action, body, host, done, fail):
     return fail("not found", 404)
 
 
+def schedule_restart(delay=1.0):
+    """Restart the service a moment after the current response has been sent."""
+    def run():
+        time.sleep(delay)
+        try:
+            subprocess.Popen(RESTART_CMD, shell=True)
+        except Exception as e:  # pragma: no cover - depends on the host
+            print("self-update restart failed: %s" % e, flush=True)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def self_update(app):
+    """Download the newest xui_chain.py, check it parses, replace this file and restart."""
+    url = RAW_BASE.rstrip("/") + "/xui_chain.py"
+    try:
+        status, _, text = http_get(url, timeout=30)
+    except Exception as e:
+        return 200, {"ok": False, "error": "دانلود نسخه‌ی جدید نشد: %s" % e}
+    if status != 200 or not text:
+        return 200, {"ok": False, "error": "نسخه‌ی جدید پیدا نشد (HTTP %s)" % status}
+    m = re.search(r'^VERSION\s*=\s*"([^"]+)"', text, re.M)
+    new = m.group(1) if m else ""
+    if not new:
+        return 200, {"ok": False, "error": "فایل دانلودشده درست نیست"}
+    try:
+        compile(text, APP_FILE, "exec")
+    except SyntaxError as e:
+        return 200, {"ok": False, "error": "فایل دانلودشده سالم نیست: %s" % e}
+    if new == VERSION:
+        return 200, {"ok": True, "msg": "همین الان آخرین نسخه‌ای (%s)" % VERSION, "version": VERSION, "updated": False}
+    try:
+        tmp = APP_FILE + ".new"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, APP_FILE)
+    except OSError as e:
+        return 200, {"ok": False, "error": "فایل جایگزین نشد: %s" % e}
+    schedule_restart()
+    return 200, {"ok": True, "updated": True, "restart": True, "version": new,
+                 "msg": "به‌روزرسانی به نسخه‌ی %s انجام شد؛ پنل چند ثانیه‌ی دیگه بالا میاد" % new}
+
+
 def do_action(app, action, body, host):
     """Admin API actions -> (http_status, response dict). Mutations answer with the new state."""
     def done(msg="", **extra):
@@ -4527,6 +4591,34 @@ def do_action(app, action, body, host):
             save_config(cfg)
             app.reload()
             return done("تمپلیت %s حذف شد%s" % (t.get("name", ""), "؛ %d کاربر برگشتن روی پیش‌فرض" % len(moved) if moved else ""))
+
+        if action == "sub_dedicated":
+            cfg = load_config()
+            t = template_by_id(cfg, str(body.get("id") or ""))
+            if not t:
+                return fail("این ساب پیدا نشد")
+            if body.get("on"):
+                if not t.get("token"):
+                    t["token"] = secrets.token_urlsafe(9).replace("-", "x").replace("_", "y")
+                base = str(body.get("base") or "").strip()
+                if base:
+                    t["base"] = base
+                elif not t.get("base"):
+                    t["base"] = first_enabled_sub(app)
+                if not t.get("base"):
+                    return fail("هیچ کاربری با کانفیگ پیدا نشد؛ اول یک کاربر بساز")
+                msg = "لینک اختصاصی آماده شد"
+            else:
+                t.pop("token", None)
+                t.pop("base", None)
+                msg = "لینک اختصاصی خاموش شد"
+            save_config(cfg)
+            app.reload()
+            link = (link_base(app.rt, host) + "d-" + t["token"]) if t.get("token") else ""
+            return done(msg, link=link, base=t.get("base") or "")
+
+        if action == "self_update":
+            return self_update(app)
 
         if action == "user_sub":
             u = find_user(str(body.get("sub", "")))
@@ -5457,15 +5549,44 @@ function tplEditor(o){
   sheet(`<h3>${ic("text")} ${esc(o.title)}</h3>
   ${o.nameField?field("tname","اسم ساب",o.name||"",'maxlength="30" autocomplete="off" placeholder="مثلاً اقتصادی"'):`<div class="mut small">همه‌ی کاربرهایی که ساب دیگه‌ای ندارن این رو می‌گیرن. مسیرهای جدید خودکار به این اضافه می‌شن.</div>`}
   <div data-ed>${editorHTML(o)}</div>
+  ${o.extra?`<div data-extra>${o.extra}</div>`:""}
   <div class="bar-btns"><button type="button" class="btn" data-save>${ic("check")} ذخیره</button>${o.del?`<button type="button" class="btn danger icon" data-del aria-label="حذف">${ic("trash")}</button>`:""}</div>`,el=>{
     const get=bindEditor($("[data-ed]",el),o);
     $("[data-save]",el).onclick=async ev=>{const body=get();const nm=$("[name=tname]",el);if(nm)body.name=nm.value.trim();await o.save(body,ev.currentTarget)};
     if(o.del)$("[data-del]",el).onclick=()=>o.del();
+    if(o.bindExtra)o.bindExtra(el);
   });
+}
+function dedBlock(t){
+  if(!t||t.id==="default")return "";
+  if(!t.token)return `<div class="sec"><h3>لینک اختصاصی</h3></div>
+   <div class="hint" style="margin:0 2px 8px">یه لینک ساب جدا با همین چیدمان که به هیچ کاربری وصل نیست؛ برای فروش، تست یا اشتراک‌گذاری. کانفیگ‌هاش از یه کاربر پایه خونده می‌شه.</div>
+   <button type="button" class="btn ghost block" data-ded-on>${ic("link")} ساخت لینک اختصاصی</button>`;
+  const link=S.state.base+"d-"+t.token,users=S.state.users||[];
+  return `<div class="sec"><h3>لینک اختصاصی</h3><span class="tag ok">روشن</span></div>
+   <label class="f"><span>کاربر پایه (کانفیگ‌ها از این کاربر خونده می‌شن)</span>
+    <select class="in" data-ded-base>${users.map(u=>`<option value="${esc(u.sub)}" ${u.sub===t.base?"selected":""}>${esc(u.name)}</option>`).join("")||`<option value="">کاربری نیست</option>`}</select></label>
+   <div class="linkbox">${esc(link)}</div>
+   <div class="bar-btns"><button type="button" class="btn sm" data-ded-copy data-text="${esc(link)}">${ic("copy")} کپی لینک</button><a class="btn ghost sm" href="${esc(link)}?page=1" target="_blank" rel="noopener">${ic("users")} صفحه</a><button type="button" class="btn ghost sm" data-ded-qr>${ic("qr")} QR</button></div>
+   <div id="dedqr"></div>
+   <div style="text-align:center;margin-top:8px"><button type="button" data-ded-off style="border:0;background:none;color:var(--bad);font:inherit;font-size:12.5px;cursor:pointer;padding:4px">خاموش کردن لینک اختصاصی</button></div>`;
+}
+function bindDed(el,t){
+  const box=$("[data-extra]",el);if(!box)return;
+  const redraw=()=>{box.innerHTML=dedBlock(tplById(t.id)||t);wire()};
+  const wire=()=>{
+    const on=$("[data-ded-on]",box);if(on)on.onclick=async ev=>{const j=await act(ev.currentTarget,"sub_dedicated",{id:t.id,on:true});if(j.ok)redraw()};
+    const off=$("[data-ded-off]",box);if(off)off.onclick=async ev=>{if(await confirmSheet("خاموش کردن لینک","لینک اختصاصی این ساب از کار می‌افته.","خاموش کن",true)){const j=await act(ev.currentTarget,"sub_dedicated",{id:t.id,on:false});if(j.ok)redraw()}};
+    const base=$("[data-ded-base]",box);if(base)base.onchange=async()=>{const j=await act(null,"sub_dedicated",{id:t.id,on:true,base:base.value});if(j.ok)redraw()};
+    const cp=$("[data-ded-copy]",box);if(cp)cp.onclick=()=>copy(cp.dataset.text);
+    const qb=$("[data-ded-qr]",box);if(qb)qb.onclick=()=>{const q=$("#dedqr",box);if(q.innerHTML){q.innerHTML="";return}q.innerHTML='<div class="qr" id="dedqrc"></div>';const link=S.state.base+"d-"+(tplById(t.id)||t).token;if(window.QRCode)new QRCode($("#dedqrc",box),{text:link,width:200,height:200,correctLevel:QRCode.CorrectLevel.M});else $("#dedqrc",box).textContent="QR بارگذاری نشد"};
+  };
+  wire();
 }
 function tplSheet(t){
   const isDef=t.id==="default";
   tplEditor({title:isDef?"ساب پیش‌فرض":"ساب "+t.name,nameField:!isDef,name:t.name,order_mode:t.order_mode,include_new:t.include_new,showNew:!isDef,isDefault:isDef,view:t,
+    extra:dedBlock(t),bindExtra:el=>bindDed(el,t),
     save:async(body,btn)=>{body.id=t.id;const j=await act(btn,"template_save",body);if(j.ok)closeSheet()},
     del:isDef?null:async()=>{if(await confirmSheet("حذف ساب",esc(t.name)+" حذف بشه؟"+(t.users?" "+fa(t.users)+" کاربرش برمی‌گردن روی پیش‌فرض.":""),"حذف کن",true))act(null,"template_delete",{id:t.id})}});
 }
@@ -6071,8 +6192,9 @@ VIEWS.settings=()=>{
 
   <div class="card"><h2>درباره</h2>
    <div class="kv"><span>نسخه</span><span class="ltr">${esc(S.state.version)}</span></div>
-   <div class="kv"><span>به‌روزرسانی</span><span class="cmd">ez-xui update</span></div>
-   <div class="kv"><span>رمز یادت رفت؟</span><span class="cmd">ez-xui password</span></div></div>`;
+   <div class="kv"><span>آپدیت پنل</span><button type="button" class="btn ghost sm" data-act="self-update">${ic("refresh")} بررسی و نصب</button></div>
+   <div class="hint" style="margin:2px 2px 0">آخرین نسخه رو از گیت‌هاب نصب می‌کنه؛ دیگه لازم نیست توی سرور <span class="cmd">ez-xui update</span> بزنی.</div>
+   <div class="kv" style="margin-top:8px"><span>رمز یادت رفت؟</span><span class="cmd">ez-xui password</span></div></div>`;
 };
 document.addEventListener("submit",async e=>{
   const f=e.target;
@@ -6146,6 +6268,15 @@ const ACTS={
   "deco-mode":b=>{const seg=b.closest("[data-keys]");if(seg)act(b,"deco_mode",{keys:seg.dataset.keys.split(","),mode:b.dataset.m})},
   "deco-refresh":b=>act(b,"decos_refresh",{}),
   "bk-send":b=>act(b,"backup_send",{}),
+  "self-update":async b=>{
+    if(!await confirmSheet("آپدیت پنل","آخرین نسخه از گیت‌هاب نصب می‌شه و پنل چند ثانیه ری‌استارت می‌شه.","آپدیت کن"))return;
+    b.classList.add("busy");
+    try{const j=await api("self_update",{});
+      if(!j.ok){toast(j.error||"آپدیت نشد","bad");return}
+      toast(j.msg);
+      if(j.restart)setTimeout(()=>location.reload(),7000);
+    }catch(e){toast("آپدیت نشد؛ اتصال اینترنت سرور رو چک کن","bad")}
+    finally{b.classList.remove("busy")}},
   "bot-chat":b=>{const f=b.closest("form"),t=f&&f.elements.namedItem("bale_token");act(b,"bot_chat",{bot:b.dataset.bot,token:t?t.value.trim():""})},
   "bk-restore":()=>{const inp=document.createElement("input");inp.type="file";inp.accept=".zip,application/zip";
     inp.onchange=()=>{const file=inp.files[0];if(!file)return;const rd=new FileReader();
@@ -6475,8 +6606,10 @@ def wants_page(headers):
 def user_info(app, sub):
     """Everything the user page shows. None when the subscription does not exist."""
     rt = app.rt
+    ded = dedicated_sub(rt, sub)
+    base = (ded.get("base") or first_enabled_sub(app)) if ded else sub
     try:
-        status, hdrs, body = http_get(rt["xui_sub_url"] + urllib.parse.quote(sub), connect=rt.get("xui_connect", ""))
+        status, hdrs, body = http_get(rt["xui_sub_url"] + urllib.parse.quote(base), connect=rt.get("xui_connect", ""))
     except Exception:
         return None
     if status != 200:
@@ -6499,8 +6632,9 @@ def user_info(app, sub):
             locations.append(name)
     hist, started = app.usage.history(sub, 30)
     cfg = app.cfg
+    view = ded if ded else sub_view(rt, sub)
     return {
-        "name": u.get("name") or clean_remark(own[0]["name"]),
+        "name": (ded.get("name") if ded else "") or u.get("name") or clean_remark(own[0]["name"]),
         "title": cfg.get("title") or NAME,
         "enable": u.get("enable", True),
         "upload": info.get("upload", 0), "download": info.get("download", 0),
@@ -6510,7 +6644,7 @@ def user_info(app, sub):
         "devices": u.get("devices", 0),
         "online": online,
         "locations": locations,
-        "decos": max(0, len(active_routes(apply_view(routes(rt, UPSTREAMS.nodes()), sub_view(rt, sub)))) - 1),
+        "decos": max(0, len(active_routes(apply_view(routes(rt, UPSTREAMS.nodes()), view))) - 1),
         "history": [{"day": d, "bytes": b} for d, b in hist],
         "history_since": int(started * 1000),
         "support": cfg.get("support_url", ""),

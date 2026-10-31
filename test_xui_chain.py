@@ -916,6 +916,106 @@ class EndToEnd(unittest.TestCase):
             xc.BALE_API = keep
             tg.shutdown()
 
+    def test_dedicated_sub(self):
+        self.login()
+        st = self.admin("state")[1]["state"]
+        keys = [r["key"] for r in st["routes"]]
+        own_b = [k for k in keys if k.endswith(">self")][1]
+        tid = self.admin("template_save", {"name": "فروش", "items": [
+            {"key": own_b, "name": "B", "show": True, "auto": True},
+            {"key": "direct>main", "show": False, "auto": True}]})[1]["id"]
+        try:
+            # turn the dedicated link on; base defaults to the first enabled user (abc)
+            out = self.admin("sub_dedicated", {"id": tid, "on": True})[1]
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["base"], "abc")
+            self.assertIn("d-", out["link"])
+            token = out["link"].rsplit("d-", 1)[1]
+            self.assertTrue(token)
+            t = next(t for t in out["state"]["templates"] if t["id"] == tid)
+            self.assertEqual((t["token"], t["base"]), (token, "abc"))  # shown on the admin page
+            # the dedicated link serves the template's configs, read from the base user
+            status, h, body = self.get("/chain/d-%s" % token, ua="v2rayNG/1.9")
+            self.assertEqual(status, 200)
+            self.assertEqual([c["remarks"] for c in json.loads(body)], ["⚡ Auto", "B"])
+            self.assertEqual(h["Profile-Title"], "base64:" + base64.b64encode("فروش".encode()).decode())
+            # a browser opening it gets the user page
+            self.assertIn("<title>اشتراک من</title>", self.get("/chain/d-%s?page=1" % token, ua="x")[2])
+            # the base can be set explicitly
+            out = self.admin("sub_dedicated", {"id": tid, "on": True, "base": "abc"})[1]
+            self.assertTrue(out["ok"] and out["base"] == "abc", out)
+            self.assertEqual(out["link"].rsplit("d-", 1)[1], token)  # same token kept
+            # turning it off removes the link; the token no longer resolves
+            out = self.admin("sub_dedicated", {"id": tid, "on": False})[1]
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["link"], "")
+            self.assertEqual(self.get("/chain/d-%s" % token, ua="v2rayNG/1.9")[0], 404)
+            self.assertFalse(self.admin("sub_dedicated", {"id": "zzz", "on": True})[1]["ok"])
+        finally:
+            self.admin("template_delete", {"id": tid})
+            cfg = xc.load_config()
+            cfg.pop("routes_cfg", None)
+            cfg["order_mode"] = "manual"
+            xc.save_config(cfg)
+            self.app.reload()
+
+    def test_self_update(self):
+        class Raw(BaseHTTPRequestHandler):
+            body = b""
+            status = 200
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(Raw.status)
+                self.end_headers()
+                self.wfile.write(Raw.body)
+        raw = start(ThreadingHTTPServer(("127.0.0.1", 0), Raw))
+        appfile = os.path.join(TMP, "app_copy.py")
+
+        def read(p):
+            with open(p, encoding="utf-8") as f:
+                return f.read()
+        with open(appfile, "w") as f:
+            f.write('VERSION = "%s"\nprint("hi")\n' % xc.VERSION)
+        keep = (xc.RAW_BASE, xc.APP_FILE, xc.schedule_restart)
+        restarts = []
+        xc.RAW_BASE = "http://127.0.0.1:%d" % raw.server_address[1]
+        xc.APP_FILE = appfile
+        xc.schedule_restart = lambda *a, **k: restarts.append(1)
+        self.login()
+        try:
+            # already on the latest: nothing is written, no restart
+            Raw.body = ('VERSION = "%s"\n# same\n' % xc.VERSION).encode()
+            out = self.admin("self_update")[1]
+            self.assertTrue(out["ok"] and not out["updated"], out)
+            self.assertEqual(restarts, [])
+            self.assertEqual(read(appfile), 'VERSION = "%s"\nprint("hi")\n' % xc.VERSION)
+            # a newer version: the file is replaced and a restart is scheduled
+            Raw.body = b'VERSION = "99.9.9"\nprint("new")\n'
+            out = self.admin("self_update")[1]
+            self.assertTrue(out["ok"] and out["updated"] and out["restart"], out)
+            self.assertEqual(out["version"], "99.9.9")
+            self.assertEqual(read(appfile), 'VERSION = "99.9.9"\nprint("new")\n')
+            self.assertEqual(len(restarts), 1)
+            # a broken download is rejected, the file is left untouched
+            Raw.body = b'VERSION = "100.0.0"\ndef (oops\n'
+            out = self.admin("self_update")[1]
+            self.assertFalse(out["ok"], out)
+            self.assertIn("سالم نیست", out["error"])
+            self.assertEqual(read(appfile), 'VERSION = "99.9.9"\nprint("new")\n')
+            self.assertEqual(len(restarts), 1)  # no extra restart
+            # a download without a version string is rejected
+            Raw.body = b'print("no version here")\n'
+            self.assertFalse(self.admin("self_update")[1]["ok"])
+            # an HTTP error is reported
+            Raw.status, Raw.body = 404, b"nope"
+            self.assertFalse(self.admin("self_update")[1]["ok"])
+        finally:
+            xc.RAW_BASE, xc.APP_FILE, xc.schedule_restart = keep
+            raw.shutdown()
+
     def test_route_ping(self):
         d = tempfile.mkdtemp()
         xray = os.path.join(d, "xray")
