@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.7.0"
+VERSION = "5.7.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -4397,7 +4397,7 @@ def schedule_restart(delay=1.0):
 
 def self_update(app):
     """Download the newest xui_chain.py, check it parses, replace this file and restart."""
-    url = RAW_BASE.rstrip("/") + "/xui_chain.py"
+    url = RAW_BASE.rstrip("/") + "/xui_chain.py?_=%d" % int(time.time())  # skip the raw CDN cache
     try:
         status, _, text = http_get(url, timeout=30)
     except Exception as e:
