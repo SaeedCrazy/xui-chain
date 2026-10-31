@@ -205,7 +205,7 @@ class ProfileTests(unittest.TestCase):
             "deco:%s>main" % kb: {"name": "Via B"},
             "deco:%s>self" % kb: {"show": True, "auto": False}})
         confs = json.loads(xc.build_xray(own, ups, cfg, "t")[0])
-        self.assertEqual([c["remarks"] for c in confs], ["⚡ Best", "Friend A", "Via B", "friend-b"])  # Deco order
+        self.assertEqual([c["remarks"] for c in confs], ["⚡ Best", "Friend A", "friend-b", "Via B"])  # Deco order
         own_a = confs[1]["outbounds"][0]
         self.assertEqual((own_a["protocol"], own_a["settings"]["vnext"][0]["address"]), ("vmess", "198.51.100.5"))
         self.assertNotIn("sockopt", own_a["streamSettings"])
@@ -214,7 +214,7 @@ class ProfileTests(unittest.TestCase):
         self.assertIn("up-2", auto_tags)
         prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])
         groups = {g["name"]: g for g in prof["proxy-groups"]}
-        self.assertEqual(groups[xc.G_MAIN]["proxies"], ["⚡ Best", "Friend A", "Via B", "friend-b"])
+        self.assertEqual(groups[xc.G_MAIN]["proxies"], ["⚡ Best", "Friend A", "friend-b", "Via B"])
         self.assertEqual(groups["⚡ Best"]["proxies"], ["Main", "Via B"])  # hidden Main still backs Auto
         self.assertEqual(groups["⚡ Best"]["type"], "fallback")
         cfg_fast = dict(cfg, auto_mode="fastest", routes_cfg=dict(cfg["routes_cfg"], **{"deco:%s>self" % ka: {"show": True, "auto": True, "name": "Friend A"}}))
@@ -246,7 +246,7 @@ class ProfileTests(unittest.TestCase):
         st = xc.routes_store(cfg)
         self.assertEqual(st["deco:%s>self" % ka], {"show": True, "auto": False, "name": "Friend A"})
         self.assertEqual((st["deco:%s>main" % kb]["name"], st["tun:t1"], st["direct>main"]), ("Via B", {"price": 5}, {"name": "Home"}))
-        self.assertEqual([c["remarks"] for c in json.loads(xc.build_xray(own, ups, cfg, "t")[0])], ["⚡ Auto", "Home", "Friend A", "Via B", "friend-b"])
+        self.assertEqual([c["remarks"] for c in json.loads(xc.build_xray(own, ups, cfg, "t")[0])], ["⚡ Auto", "Home", "Friend A", "friend-b", "Via B"])
         self.assertEqual(xc.routes_store(dict(cfg, routes_cfg={})), {})  # once saved, the old keys are ignored
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
@@ -260,7 +260,7 @@ class ProfileTests(unittest.TestCase):
                    {"id": "t3", "name": "x", "entry": "ir2", "exit": "main", "engine": "gost", "ports": "443", "status": "failed"}]
         cfg = dict(self.cfg, servers=servers, tunnels=tunnels)
         rts = xc.routes(cfg, ups)
-        self.assertEqual([r["key"] for r in rts], ["direct>main", "tun:t1", "tun:t2", "deco:%s>main" % ka, "deco:%s>self" % ka])
+        self.assertEqual([r["key"] for r in rts], ["direct>main", "tun:t1", "tun:t2", "deco:%s>self" % ka, "deco:%s>main" % ka])
         self.assertTrue(rts[2]["down"] and rts[2]["skip"])
         self.assertEqual((rts[1]["entry"]["type"], rts[1]["entry"]["ip"], rts[1]["exit"]["id"]), ("server", "5.6.7.8", "main"))
         prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])
@@ -368,7 +368,7 @@ class ProfileTests(unittest.TestCase):
         self.assertFalse(next(r for r in rts if r["key"] == "tun:t1")["skip"])
         # manual order with explicit positions; the rest keep their default place
         cfg2 = dict(cfg, order_mode="manual", routes_cfg={"direct>main": {"order": 5}, "tun:t1": {"order": 0}})
-        self.assertEqual([r["key"] for r in xc.routes(cfg2, ups)][:3], ["tun:t1", "direct>main", "deco:%s>main" % ka])
+        self.assertEqual([r["key"] for r in xc.routes(cfg2, ups)][:3], ["tun:t1", "direct>main", "deco:%s>self" % ka])
         pub = xc.routes_public(xc.routes(cfg, ups, usage={"srv:ir1": 980 * xc.GB_BYTES}), {"tun:t1": {"ok": True, "ms": 80}})
         self.assertEqual((pub[4]["entry"], pub[4]["exit"], pub[4]["tunnel"]["engine"], pub[4]["ping"]["ms"]),
                          ({"type": "server", "id": "ir1", "name": "ایران", "ip": "5.6.7.8", "host": "5.6.7.8"}, {"id": "main", "name": "سرور اصلی"}, "backhaul", 80))
@@ -466,7 +466,7 @@ class ProfileTests(unittest.TestCase):
         groups = {g["name"]: g for g in prof["proxy-groups"]}
         self.assertEqual(groups[xc.G_MAIN]["proxies"], ["⚡ Auto", "Main", "Deco1-2", "Deco3"])  # one entry for the subscription
         self.assertEqual(groups["Deco1-2"]["type"], "url-test")
-        self.assertEqual(groups["Deco1-2"]["proxies"], ["Deco1", "Deco2", "friend-b"])
+        self.assertEqual(groups["Deco1-2"]["proxies"], ["Deco1", "friend-b", "Deco2"])
         self.assertEqual(groups["⚡ Auto"]["proxies"], ["Main", "Deco1", "Deco2", "Deco3"])  # Auto still sees each config
         confs = json.loads(xc.build_xray(own, ups, cfg, "t", folded)[0])
         self.assertEqual([c["remarks"] for c in confs], ["⚡ Auto", "Main", "Deco1-2", "Deco3"])
@@ -474,7 +474,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(fold["routing"]["balancers"][0]["strategy"]["type"], "leastPing")
         self.assertEqual(fold["routing"]["rules"][-1]["balancerTag"], "fold")
         tags = [o["tag"] for o in fold["outbounds"]]
-        self.assertEqual([t for t in tags if t.startswith("f-")], ["f-via-1-1", "f-via-2-1", "f-own-2-1"])
+        self.assertEqual([t for t in tags if t.startswith("f-")], ["f-via-1-1", "f-own-2-1", "f-via-2-1"])
         for o in fold["outbounds"]:
             dp = o.get("streamSettings", {}).get("sockopt", {}).get("dialerProxy")
             self.assertTrue(dp is None or dp in tags)
@@ -646,7 +646,7 @@ class EndToEnd(unittest.TestCase):
         st = self.admin("state")[1]["state"]
         keys = [r["key"] for r in st["routes"]]
         self.assertEqual(keys[0], "direct>main")
-        self.assertEqual([r["name"] for r in st["routes"]][:3], ["Main", "واسط ۱", "friend-b"])
+        self.assertEqual([r["name"] for r in st["routes"]][:3], ["Main", "friend-b", "واسط ۱"])
         chain = [k for k in keys if k.startswith("deco:") and k.endswith(">main")]
         owns = [k for k in keys if k.endswith(">self")]
         self.assertEqual([e["id"] for e in st["exits"]], ["main"])
@@ -720,8 +720,9 @@ class EndToEnd(unittest.TestCase):
         status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
         self.assertEqual([c["remarks"] for c in json.loads(body)], ["⚡ Auto", "B"])
         # ... or a choice of its own
+        relay = next(k for k in keys if k.startswith("deco:") and k.endswith(">main"))
         out = self.admin("user_sub", {"sub": "abc", "template": "custom", "order_mode": "manual", "items": [
-            {"key": keys[1], "name": "فقط این", "show": True, "auto": False}]})[1]
+            {"key": relay, "name": "فقط این", "show": True, "auto": False}]})[1]
         self.assertTrue(out["ok"], out)
         self.assertEqual((out["state"]["users"][0]["tpl"], out["state"]["users"][0]["custom"]["items"][0]["name"]), ("custom", "فقط این"))
         status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
@@ -763,8 +764,12 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(mode(), "relay")  # a newly added deco defaults to relay
         self.assertTrue(self.admin("deco_mode", {"keys": [key], "mode": "own"})[1]["ok"])
         self.assertEqual(mode(), "own")
-        self.assertTrue(self.admin("deco_mode", {"keys": [key], "mode": "both"})[1]["ok"])
+        out = self.admin("deco_mode", {"keys": [key], "mode": "both"})[1]
+        self.assertTrue(out["ok"], out)
         self.assertEqual(mode(), "both")
+        rts = {r["key"]: r for r in out["state"]["routes"]}
+        self.assertTrue(rts["deco:%s>main" % key]["name"].endswith(" V"))  # relay named after the config + V
+        self.assertEqual(rts["deco:%s>self" % key]["name"], rts["deco:%s>self" % key]["auto_name"])  # own keeps the config name
         self.assertTrue(self.admin("deco_mode", {"keys": [key], "mode": "off"})[1]["ok"])
         self.assertEqual(mode(), "off")
         self.assertFalse(self.admin("deco_mode", {"keys": [key], "mode": "bogus"})[1]["ok"])

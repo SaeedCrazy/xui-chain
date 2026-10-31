@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.5.0"
+VERSION = "5.6.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -931,13 +931,13 @@ def routes(cfg, ups, usage=None, statuses=None, deco_down=None, nodes=None):
         entry = {"type": "deco", "key": key, "name": n["name"], "idx": i, "ip": n["server"]}
         group = sub_gid(n["src"]) if n.get("src") else None
         info = UPSTREAMS.info.get(n.get("src", "")) if n.get("src") else None
-        for j, e in enumerate(exits):
-            r = add("deco:%s>%s" % (key, e["id"]), "deco", deco_label(cfg, i) + ("" if e["id"] == "main" else name_sep(cfg) + e["name"]),
-                    1000 + i * 10 + j, entry, None, e, node=n, idx=i, exit_id=e["id"], group=group)
-            r["down"] = bool(deco_down.get(key))
-        r = add("deco:%s>self" % key, "own", n["name"], 1000 + i * 10 + 9, entry, None,
+        r = add("deco:%s>self" % key, "own", n["name"], 1000 + i * 10 + 0, entry, None,
                 {"id": "self", "name": n["name"]}, node=n, idx=i, exit_id="self", show=False, auto=False, group=group)
         r["down"] = bool(deco_down.get(key))
+        for j, e in enumerate(exits):
+            r = add("deco:%s>%s" % (key, e["id"]), "deco", deco_label(cfg, i) + ("" if e["id"] == "main" else name_sep(cfg) + e["name"]),
+                    1000 + i * 10 + 1 + j, entry, None, e, node=n, idx=i, exit_id=e["id"], group=group)
+            r["down"] = bool(deco_down.get(key))
         if info:
             for r in out:
                 if r.get("node") is n:
@@ -4670,14 +4670,20 @@ def do_action(app, action, body, host):
             on, off = {"show": True, "auto": True}, {"show": False, "auto": False}
             mainv, selfv = {"relay": (on, off), "own": (off, on), "both": (on, on), "off": (off, off)}[mode]
             cfg = load_config()
-            valid = {node_key(n) for n in UPSTREAMS.nodes()}
+            names = {node_key(n): n["name"] for n in UPSTREAMS.nodes()}
             store = dict(routes_store(cfg))
             for key in body.get("keys") or []:
                 key = str(key)
-                if key not in valid:
+                if key not in names:
                     continue
-                store["deco:%s>main" % key] = dict(store.get("deco:%s>main" % key) or {}, **mainv)
-                store["deco:%s>self" % key] = dict(store.get("deco:%s>self" % key) or {}, **selfv)
+                mv = dict(mainv)
+                if mode in ("relay", "both"):  # relay named after the config, + V, so both can show together
+                    mv["name"] = names[key] + " V"
+                sv = dict(selfv)
+                if mode in ("own", "both"):
+                    sv["name"] = ""  # the config's own name
+                store["deco:%s>main" % key] = dict(store.get("deco:%s>main" % key) or {}, **mv)
+                store["deco:%s>self" % key] = dict(store.get("deco:%s>self" % key) or {}, **sv)
             cfg["routes_cfg"] = store
             cfg.pop("entries_cfg", None)
             cfg.pop("deco_opts", None)
@@ -4894,11 +4900,11 @@ ADMIN_HTML = r"""<!doctype html>
 <title>EZ-XUI</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css">
 <style>
-:root{--bg:#0b0c0f;--bg2:#101217;--card:#121419;--line:#22252d;--line2:#2c3039;--fg:#e9eaef;--mut:#8a8f9b;--acc:#8ab4ff;--ok:#3ecf8e;--warn:#f2b63c;--bad:#ff6b6b;--okbg:rgba(62,207,142,.12);--warnbg:rgba(242,182,60,.12);--badbg:rgba(255,107,107,.12);--accbg:rgba(138,180,255,.13);--r:12px;color-scheme:dark}
-:root[data-theme=light]{--bg:#f6f6f7;--bg2:#fff;--card:#fff;--line:#e3e5e9;--line2:#d3d6dc;--fg:#15171c;--mut:#6b7079;--acc:#2f6fed;--okbg:rgba(62,207,142,.14);--accbg:rgba(47,111,237,.1);color-scheme:light}
+:root{--bg:#000;--bg2:#1c1c1e;--card:#1c1c1e;--card2:#2c2c2e;--line:#38383a;--line2:#48484a;--fg:#fff;--mut:#98989f;--acc:#0a84ff;--ok:#30d158;--warn:#ffd60a;--bad:#ff453a;--okbg:rgba(48,209,88,.16);--warnbg:rgba(255,214,10,.16);--badbg:rgba(255,69,58,.16);--accbg:rgba(10,132,255,.18);--segbg:rgba(118,118,128,.24);--r:14px;color-scheme:dark}
+:root[data-theme=light]{--bg:#f2f2f7;--bg2:#fff;--card:#fff;--card2:#f2f2f7;--line:#e5e5ea;--line2:#d1d1d6;--fg:#000;--mut:#8a8a8e;--acc:#007aff;--ok:#34c759;--warn:#ff9f0a;--bad:#ff3b30;--okbg:rgba(52,199,89,.14);--warnbg:rgba(255,159,10,.14);--badbg:rgba(255,59,48,.12);--accbg:rgba(0,122,255,.1);--segbg:rgba(118,118,128,.12);color-scheme:light}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;background:var(--bg);color:var(--fg)}
-body{font:14.5px/1.6 Vazirmatn,Tahoma,system-ui,sans-serif;min-height:100vh}
+body{font:15px/1.55 Vazirmatn,-apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;min-height:100vh;-webkit-font-smoothing:antialiased;letter-spacing:-.01em}
 button,input,textarea,select{font:inherit;color:inherit}
 input,textarea,select{font-size:16px}
 button{touch-action:manipulation}
@@ -4925,7 +4931,7 @@ a{color:var(--acc)}
 .nav{position:fixed;bottom:0;left:0;right:0;z-index:20;padding:6px 10px max(8px,env(safe-area-inset-bottom));background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-top:1px solid var(--line)}
 .nav .inner{max-width:480px;margin:0 auto;display:grid;grid-template-columns:repeat(4,1fr)}
 .nav button{border:0;background:none;color:var(--mut);display:flex;flex-direction:column;align-items:center;gap:3px;padding:6px 0 4px;cursor:pointer;font-size:11px}
-.nav button.on{color:var(--fg)}.nav .i{width:21px;height:21px}
+.nav button.on{color:var(--acc)}.nav .i{width:21px;height:21px}
 /* sections */
 .sec{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:22px 2px 8px}
 .sec h3{font-size:13px;margin:0;color:var(--mut);font-weight:600;letter-spacing:.2px}
@@ -4953,22 +4959,22 @@ a{color:var(--acc)}
 .err{color:var(--bad);font-size:12.5px;margin-top:6px}
 .note{font-size:12.5px;color:var(--mut);padding:8px 2px}
 /* buttons */
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid var(--fg);border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:600;background:var(--fg);color:var(--bg);transition:opacity .15s,transform .1s;text-decoration:none;font-size:14px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:0;border-radius:12px;padding:11px 15px;cursor:pointer;font-weight:600;background:var(--acc);color:#fff;transition:opacity .15s,transform .1s;text-decoration:none;font-size:15px}
 .btn:active{transform:scale(.98)}.btn[disabled]{opacity:.5}
-.btn.ghost{background:none;color:var(--fg);border-color:var(--line2)}
-.btn.danger{background:none;color:var(--bad);border-color:color-mix(in srgb,var(--bad) 50%,var(--line2))}
+.btn.ghost{background:var(--segbg);color:var(--acc);border:0}
+.btn.danger{background:var(--badbg);color:var(--bad);border:0}
 .btn.sm{padding:7px 11px;font-size:13px;border-radius:9px}
 .btn.block{width:100%}
 .btn.busy{pointer-events:none;opacity:.7}.btn.busy::after{content:"";width:14px;height:14px;border-radius:50%;border:2px solid currentColor;border-left-color:transparent;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .bar-btns{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 2px}.bar-btns .btn{flex:1;white-space:nowrap}.bar-btns .btn.icon{flex:0 0 auto;padding:10px 12px}
 .toolbar{display:flex;gap:8px;align-items:center;margin:10px 0 2px}
-.seg{display:flex;background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:3px;gap:2px;width:100%;margin:6px 0 10px}
-.seg button{flex:1;border:0;background:none;padding:6px 10px;border-radius:8px;cursor:pointer;font-size:13px;color:var(--mut)}
-.seg button.on{background:var(--card);color:var(--fg);box-shadow:0 0 0 1px var(--line2)}
+.seg{display:flex;background:var(--segbg);border-radius:9px;padding:2px;gap:2px;width:100%;margin:6px 0 10px}
+.seg button{flex:1;border:0;background:none;padding:7px 10px;border-radius:7px;cursor:pointer;font-size:13px;color:var(--fg);font-weight:500;transition:background .15s}
+.seg button.on{background:var(--card);color:var(--fg);box-shadow:0 1px 3px rgba(0,0,0,.2),0 0 0 .5px rgba(0,0,0,.04);font-weight:600}
 .chips{display:flex;gap:7px;overflow-x:auto;padding:4px 0 8px;scrollbar-width:none;flex-wrap:wrap}.chips.nowrap{flex-wrap:nowrap}.chips::-webkit-scrollbar{display:none}
 .chip{border:1px solid var(--line2);background:none;border-radius:99px;padding:5px 11px;white-space:nowrap;cursor:pointer;font-size:12.5px;color:var(--fg)}
-.chip.on{background:var(--fg);border-color:var(--fg);color:var(--bg)}
+.chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
 .chip b{font-weight:700;opacity:.7;margin-inline-start:4px}
 /* forms */
 label.f{display:block;margin:10px 0}
@@ -5024,11 +5030,14 @@ select.in{appearance:none;-webkit-appearance:none;background-image:linear-gradie
 .tag.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 50%,var(--line2))}
 .warnbox{border:1px solid color-mix(in srgb,var(--warn) 45%,var(--line2));background:var(--warnbg);border-radius:10px;padding:10px 12px;margin:10px 0;font-size:13px}
 .warnbox .btn{margin-top:8px}
+.crow{border-bottom:1px solid var(--line);padding-bottom:8px}.crow:last-child{border-bottom:0;padding-bottom:0}.crow .row{border-bottom:0}
+.crow .cfgmode{margin:2px 0 6px}.seg.sub.cfgmode button{font-size:12.5px;padding:6px 8px;gap:4px}
+.gall{display:flex;align-items:center;gap:8px;padding:2px 0 8px;border-bottom:1px solid var(--line);margin-bottom:4px}.gall .seg{margin:0;flex:1}
 .lnk{border:0;background:none;color:var(--acc);font-size:12.5px;cursor:pointer;padding:0;font-family:inherit}
 .trow{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--line)}.trow:last-child{border-bottom:0}
 .trow .t{flex:1;min-width:0}.trow .t small{display:block;color:var(--mut);font-size:11.5px;margin-top:3px;line-height:1.45}
 .trow .tn{padding:6px 10px;font-weight:600}.trow.off .t{opacity:.45}
-.tk{display:grid;place-items:center;cursor:pointer;padding:4px}.tk input{width:20px;height:20px;accent-color:var(--fg);margin:0}
+.tk{display:grid;place-items:center;cursor:pointer;padding:4px}.tk input{width:22px;height:22px;accent-color:var(--acc);margin:0}
 .zap{width:34px;height:34px;border-radius:9px;border:1px solid var(--line2);background:none;display:grid;place-items:center;cursor:pointer;color:var(--line2);flex:none}
 .zap.on{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 55%,var(--line2))}.zap .i{width:16px;height:16px}
 .vmove{display:flex;flex-direction:column;gap:3px;flex:none}.vmove button{width:30px;height:24px;border-radius:7px;border:1px solid var(--line2);background:none;display:grid;place-items:center;cursor:pointer;color:var(--fg);padding:0}
@@ -5723,12 +5732,12 @@ SEGV.entries=()=>{
       qh=`<div class="meter"><div class="rw"><span>${q.total?gb(left)+" از "+gb(q.total)+" GB مانده":gb((q.upload||0)+(q.download||0))+" GB مصرف"}</span><span class="${days!==null&&days<=2?"bad":"mut"}">${days===null?"":days>0?fa(days)+" روز":"منقضی"}</span></div>${q.total?`<div class="bar"><i class="${barCls(p)}" style="width:${p}%"></i></div>`:""}</div>`}
     const moves=`<div class="move"><button data-act="deco-move" data-i="${i}" data-d="-1" ${i===0?"disabled":""} aria-label="بالا">${ic("up")}</button><button data-act="deco-move" data-i="${i}" data-d="1" ${i===ds.length-1?"disabled":""} aria-label="پایین">${ic("down")}</button><button data-act="deco-del" data-i="${i}" aria-label="حذف">${ic("trash")}</button></div>`;
     const stat=s=>!s?`<span class="mut">تست‌نشده</span>`:s.ok===null?`<span class="mut">UDP</span>`:s.ok?`<span class="ok">${ms_(s.ms)}</span>`:`<span class="bad">قطع</span>`;
-    const node=(nd,extra="")=>`<div class="row">${mono(decoMono(nd.n))}<div class="t"><b class="ltr" style="text-align:right">${esc(nd.name)}</b><small class="ltr" style="text-align:right">${esc(nd.proto)} · ${esc(nd.server)}:${nd.port}${nd.status&&!nd.status.ok&&nd.status.error?"، "+esc(nd.status.error):""}</small></div><div class="r">${stat(nd.status)}</div>${extra}</div>`;
-    if(d.kind==="link"&&d.nodes.length===1)return `<div class="list">${node(d.nodes[0],moves)}<div style="padding:4px 0 2px">${modeSeg([d.nodes[0].key],decoMode(d.nodes[0].key))}</div>${d.error?`<div class="err">${esc(d.error)}</div>`:""}</div>`;
+    const node=(nd,extra="")=>`<div class="crow"><div class="row">${mono(decoMono(nd.n))}<div class="t"><b class="ltr" style="text-align:right">${esc(nd.name)}</b><small class="ltr" style="text-align:right">${esc(nd.proto)} · ${esc(nd.server)}:${nd.port}${nd.status&&!nd.status.ok&&nd.status.error?"، "+esc(nd.status.error):""}</small></div><div class="r">${stat(nd.status)}</div>${extra}</div>${modeSeg([nd.key],decoMode(nd.key))}</div>`;
+    if(d.kind==="link"&&d.nodes.length===1)return `<div class="list">${node(d.nodes[0],moves)}${d.error?`<div class="err">${esc(d.error)}</div>`:""}</div>`;
     const gid=d.gid||"l"+i,open=isOpen(gid),okN=d.nodes.filter(x=>x.status&&x.status.ok).length,badN=d.nodes.filter(x=>x.status&&x.status.ok===false).length;
     const left=q&&q.total?Math.max(0,q.total-(q.upload||0)-(q.download||0)):null;
     return `<div class="list" data-gbox><div class="row btn-row ghead" data-gtoggle="${esc(gid)}">${chev(open)}<div class="t"><b class="ltr" style="text-align:right">${esc(d.title)}</b><small>${d.kind==="sub"?"لینک ساب، ":""}${fa(d.nodes.length)} کانفیگ${okN?`، <span class="ok">${fa(okN)} سالم</span>`:""}${badN?`، <span class="bad">${fa(badN)} قطع</span>`:""}${left!=null?`، ${gb(left)} GB مانده`:""}</small></div>${moves}</div>
-     <div class="gbody" ${open?"":"hidden"}><div class="gfold"><span class="mut small" style="flex:none">همه‌ی این ساب:</span>${modeSeg(d.nodes.map(n=>n.key),groupMode(d.nodes.map(n=>n.key)))}</div>${d.nodes.map(nd=>node(nd)).join("")}${qh?`<div style="padding:0 0 10px">${qh}</div>`:""}</div>
+     <div class="gbody" ${open?"":"hidden"}><div class="gall"><span class="mut small">همه:</span>${modeSeg(d.nodes.map(n=>n.key),groupMode(d.nodes.map(n=>n.key)))}</div>${d.nodes.map(nd=>node(nd)).join("")}${qh?`<div style="padding:0 0 10px">${qh}</div>`:""}</div>
      ${d.error?`<div class="err" style="padding-bottom:8px">${esc(d.error)}</div>`:""}</div>`}).join(""):`<div class="list"><div class="note">کانفیگ یا لینک ساب یکی دیگه رو اضافه کن. برای هر کدوم انتخاب کن: «واسط» (کاربر از راهش به سرور تو می‌رسه)، «خودش» (همون کانفیگ عیناً توی ساب میاد)، یا «هردو». آخرین تست: ${ago(st.monitor.last_run)}</div></div>`}
   ${st.monitor.note?`<div class="note">${ic("info")} ${esc(st.monitor.note)}</div>`:""}`;
   const e=S.eseg||"srv";
