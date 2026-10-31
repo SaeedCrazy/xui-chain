@@ -1024,7 +1024,7 @@ def routes_public(rts, pings=None):
     """Routes for the admin page (no node or tunnel objects)."""
     keep = ("key", "kind", "idx", "name", "show", "auto", "price", "unit", "quota_gb", "bill_day", "count", "order",
             "used", "remaining", "down", "exhausted", "skip", "cost", "quota_from_sub", "server_id", "exit_id", "note", "group",
-            "auto_name")
+            "auto_name", "default_order")
     out = []
     for r in rts:
         d = {k: r.get(k) for k in keep}
@@ -5025,9 +5025,12 @@ a{color:var(--acc)}
 .nav button{border:0;background:none;color:var(--mut);display:flex;flex-direction:column;align-items:center;gap:3px;padding:6px 0 4px;cursor:pointer;font-size:11px}
 .nav button.on{color:var(--acc)}.nav .i{width:21px;height:21px}
 /* sections */
-.sec{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:22px 2px 8px}
+.sec{display:flex;align-items:center;justify-content:space-between;gap:8px 10px;margin:22px 2px 8px;flex-wrap:wrap}
 .sec h3{font-size:13px;margin:0;color:var(--mut);font-weight:600;letter-spacing:.2px}
 .sec .lnk{border:0;background:none;color:var(--acc);font-size:12.5px;cursor:pointer;padding:0}
+.sec .acts{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.abtn{border:1px solid var(--line2);background:var(--card);color:var(--acc);border-radius:8px;padding:5px 10px;font-size:12.5px;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:4px;white-space:nowrap;transition:transform .1s}
+.abtn:active{transform:scale(.95)}.abtn .i{width:14px;height:14px;stroke-width:2}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;margin:10px 0}
 .card h2{font-size:15px;margin:0 0 6px;display:flex;align-items:center;gap:8px}
 .card p{margin:4px 0 10px}
@@ -5509,7 +5512,7 @@ function tplGroup(b,fold,o){
 }
 function editorHTML(o){
   return `<div class="seg"><button type="button" data-om="manual" class="${o.order_mode!=="price"?"on":""}">ترتیب دستی</button><button type="button" data-om="price" class="${o.order_mode==="price"?"on":""}">ارزون‌ترین اول</button></div>
-  <div class="hint" data-omhint></div>
+  <div class="sec" style="margin:4px 2px 2px"><div class="hint" data-omhint style="margin:0;flex:1"></div><div class="acts"><button type="button" class="abtn" data-sort-natural>${ic("route")} مرتب کردن</button></div></div>
   <div class="tblocks">${blocks(viewRows(o.view),x=>x.r).map(b=>b.gid?tplGroup(b,(o.view.collapse||{})[b.gid],o):`<div class="tblk">${tplRow(b.items[0],o.isDefault)}</div>`).join("")}</div>
   ${o.showNew?sw("include_new",o.include_new,"مسیرهای جدید هم خودکار اضافه بشن","هر مسیری که بعداً بسازی، با همون تنظیم پیش‌فرضش"):""}`;
 }
@@ -5532,6 +5535,14 @@ function bindEditor(el,o){
     $("[data-omhint]",el).textContent=om==="price"?"توی ساب از ارزون‌ترین (تومان به ازای هر GB) چیده می‌شه؛ قیمت هر مسیر رو در «مسیرها» بذار.":"☑ = توی ساب، ⚡ = توی خودکار، فلش‌ها = ترتیب. اسم خالی = اسم خود مسیر."};
   sync();
   $$("[data-om]",el).forEach(b=>b.onclick=()=>{om=b.dataset.om;$$("[data-om]",el).forEach(x=>x.classList.toggle("on",x===b));sync()});
+  const natOrder=key=>{const r=(S.state.routes||[]).find(x=>x.key===key);return r?r.default_order:1e9};
+  const sb=$("[data-sort-natural]",el);
+  if(sb)sb.onclick=()=>{
+    if(om==="price"){om="manual";$$("[data-om]",el).forEach(x=>x.classList.toggle("on",x.dataset.om==="manual"))}
+    $$(".tblk.grp",list).forEach(blk=>{const body=$(".gbody",blk);rowsOf(body).sort((a,b)=>natOrder(a.dataset.key)-natOrder(b.dataset.key)).forEach(r=>body.appendChild(r))});
+    const ord=blk=>{const rs=blk.classList.contains("grp")?rowsOf($(".gbody",blk)):[$(":scope > .trow[data-key]",blk)];return Math.min(...rs.filter(Boolean).map(r=>natOrder(r.dataset.key)))};
+    $$(":scope > .tblk",list).sort((a,b)=>ord(a)-ord(b)).forEach(b=>list.appendChild(b));
+    sync();toast("مرتب شد؛ برای ذخیره «ذخیره» رو بزن")};
   list.addEventListener("click",ev=>{
     const gz=ev.target.closest("[data-gzap]");if(gz){const on=!gz.classList.contains("on");rowsOf($(".gbody",gz.closest(".tblk"))).forEach(c=>$(".zap",c).classList.toggle("on",on));sync();return}
     const z=ev.target.closest(".zap");if(z){z.classList.toggle("on");z.setAttribute("aria-pressed",z.classList.contains("on"));sync();return}
@@ -5796,7 +5807,7 @@ function cfCard(){
   return `<div class="card" id="cf-sec"><h2>🌐 دامنه (کلادفلر) <span class="tag ok">وصل</span></h2>
   ${c.zones.length>1||!c.zone?`<label class="f"><span>دامنه</span><select class="in" data-cfzone>${!c.zone?'<option value="">انتخاب کن…</option>':""}${c.zones.map(z=>`<option value="${esc(z.id)}" ${z.id===c.zone_id?"selected":""}>${esc(z.name)}</option>`).join("")}</select></label>`:`<div class="kv"><span>دامنه</span><span class="ltr">${esc(c.zone)}</span></div>`}
   ${c.zone?`<div class="kv"><span>دسترسی‌ها</span><span><span class="tag ${c.perms.dns?"ok":"bad"}">DNS</span> <span class="tag ${c.perms.workers?"ok":"bad"}">Workers</span></span></div>
-  <div class="sec" style="margin:14px 2px 4px"><h3>ساب‌دامین سرورهای ایران</h3><button class="lnk" data-act="cf-all">+ ساخت برای همه</button></div>
+  <div class="sec" style="margin:14px 2px 4px"><h3>ساب‌دامین سرورهای ایران</h3><div class="acts"><button type="button" class="abtn" data-act="cf-all">${ic("plus")} ساخت برای همه</button></div></div>
   <div class="list">${irans.map(s=>`<div class="row btn-row" data-act="cf-sub" data-id="${s.id}">${mono("IR",s.domain?"ok":"")}<div class="t"><b>${esc(s.name)}</b><small>${s.domain?`<span class="ltr">${esc(s.domain)} → ${esc(s.domain_ip||"")}</span>`:"ساب‌دامین نداره؛ توی ساب آی‌پی میاد"}</small></div><div class="r">${ic("edit")}</div></div>`).join("")||`<div class="note">هنوز سرور ایران نداری.</div>`}</div>
   <label class="sw" data-act="cf-auto"><div><div>ساب‌دامین خودکار برای سرور ایران جدید</div><div class="hint">ir1، ir2…</div></div><input type="checkbox" ${c.auto?"checked":""} disabled><span class="t"></span></label>`:""}
   <div class="bar-btns"><button class="btn sm ghost" data-act="cf-connect">${ic("refresh")} توکن تازه</button><button class="btn sm danger" data-act="cf-off">جدا کردن</button></div></div>`;
@@ -5836,7 +5847,7 @@ function subMapSheet(u){
 SEGV.entries=()=>{
   const st=S.state,n=st.net,irans=n.servers.filter(s=>s.role==="iran"),ds=st.decos;
   const usedBy=id=>(st.routes||[]).find(r=>r.kind==="tunnel"&&r.server_id===id);
-  const srvHtml=`<div class="sec"><h3>سرورهای ایران</h3><button class="lnk" data-act="srv-add" data-role="iran">+ افزودن</button></div>
+  const srvHtml=`<div class="sec"><h3>سرورهای ایران</h3><div class="acts"><button type="button" class="abtn" data-act="srv-add" data-role="iran">${ic("plus")} افزودن</button></div></div>
   <div class="list">${irans.map(s=>{const f=s.facts||{},on=!s.error&&f.ip,r=usedBy(s.id);
     return `<div class="row btn-row" data-act="srv-more" data-id="${s.id}">${mono("IR",on?"ok":s.error?"bad":"")}<div class="t"><b>${esc(s.name)}</b><small>${s.domain?`<span class="ltr">${esc(s.domain)}</span>، `:""}<span class="ltr">${esc(f.ip||s.host||"")}</span>${f.os?"، "+esc(f.os):""}${f.cc==="bbr"?"، BBR":""}${r?"، "+(r.remaining!=null?gb(r.remaining)+" GB مانده":r.used!=null?gb(r.used)+" GB":"تانل دارد"):"، بدون تانل"}</small></div>
     <div class="r">${s.error?`<span class="bad">خطا</span>`:""}<span class="dot ${on?"ok":s.error?"bad":""}"></span></div></div>`}).join("")||`<div class="note">سرور ایران نداری. کاربرها به آی‌پی ایران وصل می‌شن و ترافیک از تانل به سرور خودت می‌رسه؛ سریع‌ترین و پایدارترین ورودیه. با یوزر و پس root اضافه کن.</div>`}</div>
@@ -5847,7 +5858,7 @@ SEGV.entries=()=>{
   const groupMode=keys=>{const set=[...new Set(keys.map(decoMode))];return set.length===1?set[0]:"mixed"};
   const MODES=[["relay","واسط"],["own","خودش"],["both","هردو"],["off","خاموش"]];
   const modeSeg=(keys,cur)=>`<div class="seg sub cfgmode" data-keys="${esc(keys.join(","))}">${MODES.map(([m,l])=>`<button type="button" data-act="deco-mode" data-m="${m}" class="${cur===m?"on":""}">${l}</button>`).join("")}</div>`;
-  const cfgHtml=`<div class="sec"><h3>کانفیگ‌ها (واسط)</h3><span><button class="lnk" data-act="deco-refresh">آپدیت</button>، <button class="lnk" data-act="deco-raw">متنی</button>، <button class="lnk" data-act="test">تست</button>، <button class="lnk" data-act="deco-add">+ افزودن</button></span></div>
+  const cfgHtml=`<div class="sec"><h3>کانفیگ‌ها (واسط)</h3><div class="acts"><button type="button" class="abtn" data-act="deco-refresh">${ic("refresh")} آپدیت</button><button type="button" class="abtn" data-act="deco-raw">${ic("text")} متنی</button><button type="button" class="abtn" data-act="test">${ic("wifi")} تست</button><button type="button" class="abtn" data-act="deco-add">${ic("plus")} افزودن</button></div></div>
   ${ds.length?ds.map((d,i)=>{const q=d.quota;let qh="";
     if(q){const left=Math.max(0,(q.total||0)-(q.upload||0)-(q.download||0));const p=q.total?pct((q.upload||0)+(q.download||0),q.total):0;const days=q.expire?Math.ceil((q.expire*1000-Date.now())/864e5):null;
       qh=`<div class="meter"><div class="rw"><span>${q.total?gb(left)+" از "+gb(q.total)+" GB مانده":gb((q.upload||0)+(q.download||0))+" GB مصرف"}</span><span class="${days!==null&&days<=2?"bad":"mut"}">${days===null?"":days>0?fa(days)+" روز":"منقضی"}</span></div>${q.total?`<div class="bar"><i class="${barCls(p)}" style="width:${p}%"></i></div>`:""}</div>`}
@@ -5868,12 +5879,12 @@ SEGV.entries=()=>{
 SEGV.exits=()=>{
   const st=S.state,p=st.panel,n=st.net;
   const notExit=n.servers.filter(s=>!s.local&&s.role!=="iran"&&!st.exits.some(e=>e.node_id===s.node_id&&s.node_id||e.address===s.host||e.address===(s.facts||{}).ip));
-  return `<div class="sec"><h3>خروجی‌ها (سرورهای خودت)</h3><span>${p.ok&&p.version===3?`<button class="lnk" data-act="loc-add">+ خروجی جدید</button>`:""}</span></div>
+  return `<div class="sec"><h3>خروجی‌ها (سرورهای خودت)</h3><div class="acts">${p.ok&&p.version===3?`<button type="button" class="abtn" data-act="loc-add">${ic("plus")} خروجی جدید</button>`:""}</div></div>
   <div class="list">${st.locations.map(l=>{const on=l.status==="online";const ibs=st.inbounds.filter(ib=>l.inbounds.includes(ib.id));
     return `<div class="row btn-row" data-act="exit-more" data-id="${l.id}">${mono(l.main?"⌂":(l.name.match(/\p{Regional_Indicator}{2}/u)||["EX"])[0],l.main||on?"on":l.status==="offline"?"bad":"")}<div class="t"><b>${esc(l.name)}</b><small>${l.main?"این پنل":esc(l.address||"")}، ${fa(usersOn(l))} کاربر، ${ibs.length?ibs.map(ib=>esc(ib.remark||ib.protocol)+" :"+ib.port).join("، "):"بدون inbound"}${l.latency!=null&&!l.main?"، "+ms_(l.latency):""}</small></div>
     <div class="r">${l.error?`<span class="bad">خطا</span>`:""}<span class="dot ${l.main||on?"ok":l.status==="offline"?"bad":""}"></span></div></div>`}).join("")}</div>
   ${!p.ok?`<div class="note">${p.configured?esc(p.error||"پنل در دسترس نیست"):"برای خروجی‌های بیشتر (لوکیشن) اول پنل 3x-ui رو در تنظیمات وصل کن."}</div>`:p.version!==3?`<div class="note">خروجی‌های بیشتر به 3x-ui نسخه‌ی ۳ نیاز دارند: <span class="cmd">x-ui update</span></div>`:""}
-  <div class="sec"><h3>سرورهای خارج</h3><button class="lnk" data-act="srv-add" data-role="foreign">+ افزودن</button></div>
+  <div class="sec"><h3>سرورهای خارج</h3><div class="acts"><button type="button" class="abtn" data-act="srv-add" data-role="foreign">${ic("plus")} افزودن</button></div></div>
   <div class="list">${n.servers.filter(s=>s.role!=="iran").map(s=>{const f=s.facts||{},on=!s.error&&f.ip,isExit=s.local||!notExit.includes(s);
     return `<div class="row btn-row" data-act="srv-more" data-id="${s.id}">${mono(s.local?"⌂":"EX",on?"ok":s.error?"bad":"")}<div class="t"><b>${esc(s.name)}</b><small><span class="ltr">${esc(f.ip||s.host||"")}</span>${f.os?"، "+esc(f.os):""}${f.cc==="bbr"?"، BBR":""}${f.xui?"، 3x-ui":""}${isExit?"":"، هنوز خروجی نیست"}</small></div>
     <div class="r">${!isExit&&p.ok&&p.version===3?`<button class="btn sm ghost" data-act="srv-node" data-id="${s.id}">تبدیل به خروجی</button>`:""}<span class="dot ${on?"ok":s.error?"bad":""}"></span></div></div>`}).join("")}</div>
