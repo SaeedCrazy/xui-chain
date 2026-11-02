@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.10.0"
+VERSION = "5.11.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -116,6 +116,16 @@ DEFAULTS = {
     "bot_days": "3,1",          # customer reminders this many days before expiry
     "bot_pcts": "80,95",        # ... and at these percents of the volume
     "bot_quiet": "0-8",         # no customer reminders in these Tehran hours
+    "shop_enable": False,       # sales through the bot (shop.json holds plans, codes, wallets, orders)
+    "shop_cards": "",           # card-to-card: one per line, "number | holder | bank"
+    "shop_trial": "",           # free trial "GB,days"; empty = none
+    "shop_channel": "",         # @channel customers must join first (the bot must be its admin)
+    "shop_ref": "",             # percent of an invited customer's first purchase, paid to the inviter's wallet
+    "shop_topups": "100000,200000,500000",  # wallet top-up amounts (Toman)
+    "shop_inbounds": "",        # inbound ids new services get; empty = every customer protocol
+    "shop_welcome": "",
+    "shop_help": "",
+    "shop_prefix": "tg",        # client names: <prefix><telegram id>
     "tg_enable": True,          # Telegram alerts
     "tg_token": "",             # empty = the 3x-ui panel's own Telegram bot
     "tg_chat": "",              # empty = the panel bot's admin chat ids
@@ -4699,6 +4709,9 @@ def admin_state(app, host):
         "decos": decos,
         "entries": entries_public(cfg, rts, decos),
         "bot": app.bot.public(),
+        "shop": app.bot.shop.public(),
+        "shop_cfg": {k[5:]: cfg.get(k, "") for k in ("shop_cards", "shop_trial", "shop_ref", "shop_topups", "shop_channel",
+                                                     "shop_inbounds", "shop_prefix", "shop_welcome", "shop_help")},
         "routes": rts,
         "cf": cf_public(cfg),
         "groups": deco_groups(cfg, ups),
@@ -4763,8 +4776,9 @@ def net_state(app):
 
 
 SETTING_BOOLS = ("bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
-                 "skip_exhausted", "info_config", "bot_enable", "bot_bale")
-SETTING_TEXTS = {"bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
+                 "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable")
+SETTING_TEXTS = {"shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
+                 "shop_welcome": 1000, "shop_help": 2000, "shop_prefix": 10, "bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
 
@@ -5257,6 +5271,9 @@ def do_action(app, action, body, host):
                 return fail("فایل خونده نشد")
             had_xui = restore_backup(app, data)
             return done("بکاپ برگردونده شد" + ("؛ دیتابیس 3x-ui داخل فایل هست ولی دست نخورد (اونو از خود 3x-ui برگردون)" if had_xui else ""))
+
+        if action.startswith("shop_"):
+            return shop_action(app, action[5:], body, done, fail)
 
         if action == "bot_pair":
             if not app.bot.nets():
@@ -5780,6 +5797,10 @@ select.in{appearance:none;-webkit-appearance:none;background-image:linear-gradie
 .gtools{display:flex;gap:6px;flex-wrap:wrap;padding:2px 0 8px}
 .savebar{position:sticky;bottom:calc(70px + env(safe-area-inset-bottom));z-index:3;background:var(--card);border:1px solid var(--line2);border-radius:16px;padding:10px 12px;margin-top:12px;box-shadow:0 10px 30px rgba(0,0,0,.25);display:flex;align-items:center;gap:10px}
 .savebar .check{flex:1;font-size:13px}
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0}
+.tile2{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:12px 14px}.tile2 .k{color:var(--mut);font-size:12px}.tile2 .v{font-size:19px;font-weight:700;margin-top:2px}.tile2.acc{background:linear-gradient(135deg,color-mix(in srgb,var(--acc) 22%,var(--card)),var(--card))}
+.ord .amt{font-weight:700;white-space:nowrap}.ord .st{font-size:11px}
+.rcpt{max-width:100%;border-radius:12px;display:block;margin:8px auto}
 .move{display:flex;gap:4px}.move button{width:34px;height:34px;border-radius:9px;border:1px solid var(--line2);background:none;display:grid;place-items:center;cursor:pointer;color:var(--fg)}.move button[disabled]{opacity:.3}.move .i{width:16px;height:16px}
 /* sheet */
 .ov{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.5);display:flex;align-items:flex-end;justify-content:center;animation:fade .15s}
@@ -5810,7 +5831,7 @@ details summary{padding:6px 0;font-size:13.5px;cursor:pointer;color:var(--mut)}d
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
 <script>
 "use strict";
-const I={
+const I={cart:"M3 4h2l2.4 11.2a2 2 0 0 0 2 1.6h7.7a2 2 0 0 0 2-1.5L21 8H6.2M10 21h.01M17 21h.01",
 home:"M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z",
 users:"M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75",
 route:"M4 19h4a4 4 0 0 0 4-4V9a4 4 0 0 1 4-4h4M4 19l3-3M4 19l3 3M20 5l-3-3M20 5l-3 3",
@@ -5950,7 +5971,7 @@ function bindAuth(){
 }
 
 /* layout */
-const TABS=[["home","home","خانه"],["routes","route","مسیرها"],["users","users","کاربرها"],["settings","sliders","تنظیمات"]];
+const TABS=[["home","home","خانه"],["routes","route","مسیرها"],["users","users","کاربرها"],["shop","cart","فروش"],["settings","sliders","تنظیمات"]];
 const VIEWS={};
 function render(){
   const app=$("#app");
@@ -6906,6 +6927,110 @@ VIEWS.settings=()=>{
    <div class="hint" style="margin:2px 2px 0">آخرین نسخه رو از گیت‌هاب نصب می‌کنه؛ دیگه لازم نیست توی سرور <span class="cmd">ez-xui update</span> بزنی.</div>
    <div class="kv" style="margin-top:8px"><span>رمز یادت رفت؟</span><span class="cmd">ez-xui password</span></div></div>`;
 };
+/* shop tab: sales through the bot */
+const SSEGS=[["sum","خلاصه"],["plans","پلن‌ها"],["codes","کدها"],["cust","مشتری‌ها"],["set","تنظیمات"]];
+const OST={new:["","در انتظار پرداخت"],receipt:["warn","منتظر رسید"],review:["acc","در حال بررسی"],approving:["acc","در حال انجام"],done:["ok","انجام شد"],rejected:["bad","رد شد"],cancelled:["","لغو"],failed:["bad","ناموفق"],refunded:["warn","برگشت به کیف پول"]};
+const OKIND={buy:"خرید",renew:"تمدید",traffic:"حجم اضافه",topup:"شارژ کیف پول"};
+const tmn=v=>toman(v)+" ت";
+function ordRow(o,acts){const st=OST[o.status]||["",o.status];
+  return `<div class="row btn-row ord" data-act="shop-ord" data-id="${o.id}"><div class="t"><b>${esc(o.name||o.uid)} ${o.username?`<span class="mut xs ltr">@${esc(o.username)}</span>`:""}</b><small>#${fa(o.id)} · ${OKIND[o.kind]||""}${o.plan_name?" · "+esc(o.plan_name):""} · ${ago(o.at*1000)}</small></div>
+   <div class="r" style="flex-direction:column;align-items:flex-end;gap:3px"><span class="amt">${tmn(o.total)}</span><span class="tag st ${st[0]}">${st[1]}</span></div></div>
+   ${acts&&o.status==="review"?`<div class="bar-btns" style="margin:0 0 10px">${o.method!=="wallet"?`<button class="btn sm ghost" data-act="shop-rcpt" data-id="${o.id}">🖼 رسید</button>`:""}<button class="btn sm" data-act="shop-ok" data-id="${o.id}">✅ تأیید</button><button class="btn sm danger" data-act="shop-no" data-id="${o.id}">❌ رد</button></div>`:""}`}
+function planLine(p){return `${p.kind==="traffic"?"حجم اضافه · ":""}${p.gb?fa(p.gb)+" گیگ":"نامحدود"}${p.kind!=="traffic"?" · "+(p.days?fa(p.days)+" روز":"بدون محدودیت زمان"):""}${p.devices?" · "+fa(p.devices)+" دستگاه":""}`}
+VIEWS.shop=()=>{
+  const sh=S.state.shop||{},b=S.state.bot||{},seg=S.sseg||"sum";
+  const segs=`<div class="seg">${SSEGS.map(([k,l])=>`<button data-act="sseg" data-s="${k}" class="${seg===k?"on":""}">${l}</button>`).join("")}</div>`;
+  let warn="";
+  if(!b.enable||!(b.nets&&(b.nets.tg||{}).on))warn=`<div class="note">${ic("info")} اول ربات رو از تنظیمات ← 🤖 ربات روشن کن.</div>`;
+  else if(!sh.enable)warn=`<div class="note">${ic("info")} فروشگاه خاموشه. از «تنظیمات» همین‌جا روشنش کن.</div>`;
+  else if(!(b.admins||[]).some(a=>(a.events==="all"||(a.events||[]).includes("shop"))&&!a.paused))warn=`<div class="note">${ic("info")} هیچ چت مدیری هشدار «فروش» رو نمی‌گیره؛ رسیدها فقط اینجا دیده می‌شن.</div>`;
+  return `<div class="hero"><h1>🛍 فروشگاه</h1><div class="mut">${sh.enable?`ربات <span class="ltr">@${esc(((b.nets||{}).tg||{}).username||"")}</span> در حال فروشه`:"خاموش"}</div></div>${segs}${warn}${(SHOPV[seg]||SHOPV.sum)(sh)}`;
+};
+const SHOPV={};
+SHOPV.sum=sh=>{const st=sh.stats||{},rev=(sh.orders||[]).filter(o=>o.status==="review");
+  return `<div class="tiles"><div class="tile2 acc"><div class="k">فروش امروز</div><div class="v">${tmn(st.today)}</div><div class="k">${fa(st.orders_today||0)} سفارش</div></div>
+   <div class="tile2"><div class="k">۳۰ روز اخیر</div><div class="v">${tmn(st.month)}</div></div>
+   <div class="tile2"><div class="k">مشتری‌ها</div><div class="v">${fa(st.customers||0)}</div><div class="k">${fa(st.buyers||0)} خریدار</div></div>
+   <div class="tile2"><div class="k">توی کیف پول‌ها</div><div class="v">${tmn(st.wallets)}</div></div></div>
+  <div class="sec"><h3>رسیدهای منتظر ${rev.length?`<span class="tag acc">${fa(rev.length)}</span>`:""}</h3></div>
+  <div class="list">${rev.map(o=>ordRow(o,true)).join("")||`<div class="note">رسیدی منتظر نیست ✨</div>`}</div>
+  <div class="sec"><h3>آخرین سفارش‌ها</h3></div>
+  <div class="list">${(sh.orders||[]).filter(o=>o.status!=="review"&&o.status!=="new").slice(0,25).map(o=>ordRow(o)).join("")||`<div class="note">هنوز سفارشی نیست.</div>`}</div>`};
+SHOPV.plans=sh=>{const ps=(sh.plans||[]).slice().sort((a,b)=>(a.kind==="traffic")-(b.kind==="traffic")||(a.order||0)-(b.order||0));
+  return `<div class="toolbar"><button class="btn" data-act="shop-plan">${ic("plus")} پلن</button><button class="btn ghost" data-act="shop-plan" data-kind="traffic">${ic("plus")} حجم اضافه</button></div>
+  <div class="list">${ps.map(p=>`<div class="row btn-row" data-act="shop-plan" data-id="${p.id}">${mono(p.kind==="traffic"?"+GB":"📦",p.active!==false?"ok":"")}<div class="t"><b>${esc(p.name)}</b><small>${planLine(p)}${p.desc?" · "+esc(p.desc):""}</small></div><div class="r" style="flex-direction:column;align-items:flex-end;gap:3px"><span class="amt">${tmn(p.price)}</span>${p.active===false?'<span class="tag">مخفی</span>':""}</div></div>`).join("")||`<div class="empty">${ic("cart")}<p>هنوز پلنی نساختی.<br>مثلاً «۳۰ گیگ یک‌ماهه».</p></div>`}</div>`};
+SHOPV.codes=sh=>`<div class="toolbar"><button class="btn" data-act="shop-code">${ic("plus")} کد تخفیف</button><button class="btn ghost" data-act="shop-code" data-kind="gift">${ic("plus")} کد هدیه</button></div>
+  <div class="list">${(sh.codes||[]).map(c=>`<div class="row btn-row" data-act="shop-code" data-code="${esc(c.code)}">${mono(c.kind==="gift"?"🎁":"%")}<div class="t"><b class="ltr" style="text-align:right">${esc(c.code)}</b><small>${c.kind==="gift"?"هدیه "+tmn(c.amount):c.pct?fa(c.pct)+"٪ تخفیف":tmn(c.amount)+" تخفیف"} · ${fa(c.used)}${c.max?" از "+fa(c.max):""} بار${c.exp?` · ${c.exp*1000<Date.now()?'<span class="bad">منقضی</span>':"تا "+new Intl.DateTimeFormat("fa-IR-u-ca-persian",{month:"long",day:"numeric"}).format(new Date(c.exp*1000))}`:""}</small></div></div>`).join("")||`<div class="note">کد تخفیف روی فاکتور اعمال می‌شه؛ کد هدیه کیف پول رو شارژ می‌کنه.</div>`}</div>`;
+SHOPV.cust=sh=>{const q=(S.cq||"").toLowerCase(),cs=(sh.customers||[]).filter(c=>!q||(c.name+" "+c.username+" "+c.id).toLowerCase().includes(q));
+  return `<input class="in" id="cq" placeholder="جستجو: اسم، یوزرنیم یا آیدی" value="${esc(S.cq||"")}" style="margin:6px 0 10px">
+  <div class="list">${cs.slice(0,100).map(c=>`<div class="row btn-row" data-act="shop-cust" data-id="${esc(c.id)}"><div class="t"><b>${esc(c.name||c.id)} ${c.username?`<span class="mut xs ltr">@${esc(c.username)}</span>`:""}</b><small>${fa(c.subs)} سرویس · خرید ${tmn(c.spent)}</small></div><div class="r"><span class="amt">${tmn(c.wallet)}</span></div></div>`).join("")||`<div class="note">هنوز مشتری‌ای نیست.</div>`}</div>`};
+SHOPV.set=sh=>{const s=S.state.settings,c=S.state.shop_cfg||{};
+  return `<form class="card" data-sec="shop"><h2>تنظیمات فروشگاه</h2>
+   ${sw("shop_enable",sh.enable,"فروشگاه روشن باشد","مشتری‌ها با /start منوی خرید رو می‌بینن")}
+   <label class="f"><span>کارت‌ها (کارت به کارت)</span><textarea class="in ltr" name="shop_cards" style="min-height:70px" placeholder="6037-xxxx-xxxx-xxxx | نام صاحب کارت | بانک">${esc(c.cards||"")}</textarea><div class="hint">هر کارت یه خط: شماره | اسم | بانک</div></label>
+   <div class="cols2">${field("shop_trial","تست رایگان (گیگ,روز)",c.trial,'class="in ltr" placeholder="1,1"',"خالی = خاموش")}${field("shop_ref","پاداش دعوت (٪)",c.ref,'class="in ltr" inputmode="numeric" placeholder="10"',"از اولین خرید دوست")}</div>
+   ${field("shop_topups","مبالغ شارژ کیف پول (تومان)",c.topups,'class="in ltr" placeholder="100000,200000,500000"')}
+   ${field("shop_channel","عضویت اجباری کانال",c.channel,'class="in ltr" placeholder="@mychannel"',"ربات باید ادمین کانال باشه. خالی = خاموش")}
+   <div class="cols2">${field("shop_inbounds","inboundهای سرویس جدید",c.inbounds,'class="in ltr" placeholder="1,11"',"خالی = همه")}${field("shop_prefix","پیشوند اسم کاربر",c.prefix,'class="in ltr" placeholder="tg"')}</div>
+   <label class="f"><span>پیام خوش‌آمد</span><textarea class="in" name="shop_welcome" style="min-height:60px;font-family:inherit" placeholder="به فروشگاه ما خوش اومدی 🌟">${esc(c.welcome||"")}</textarea></label>
+   <label class="f"><span>راهنمای اتصال</span><textarea class="in" name="shop_help" style="min-height:60px;font-family:inherit" placeholder="خالی = راهنمای پیش‌فرض (Happ و v2rayNG)">${esc(c.help||"")}</textarea></label>
+   <button class="btn block">${ic("check")} ذخیره</button></form>`};
+function planSheet(p,kind){p=p||{kind:kind||"service",active:true};const tr=p.kind==="traffic";
+  sheet(`<h3>${p.id?"ویرایش":"پلن جدید"}${tr?" (حجم اضافه)":""}</h3><form id="spf">
+   ${field("name","اسم",p.name||"",'maxlength="40" placeholder="'+(tr?"۱۰ گیگ اضافه":"۳۰ گیگ یک‌ماهه")+'" required')}
+   <div class="cols2">${field("gb","حجم (گیگ)",p.gb??"",'class="in ltr" inputmode="decimal" placeholder="'+(tr?"10":"30")+'"',tr?"":"خالی = نامحدود")}${tr?"":field("days","مدت (روز)",p.days??"",'class="in ltr" inputmode="numeric" placeholder="30"')}</div>
+   <div class="cols2">${field("price","قیمت (تومان)",p.price??"",'class="in ltr" inputmode="numeric" placeholder="150000" required')}${tr?"":field("devices","تعداد دستگاه",p.devices||"",'class="in ltr" inputmode="numeric" placeholder="نامحدود"')}</div>
+   ${field("desc","توضیح کوتاه",p.desc||"",'maxlength="120" placeholder="مثلاً: مناسب گوشی"')}
+   ${sw("active",p.active!==false,"توی ربات فروخته بشه")}
+   <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button>${p.id?`<button type="button" class="btn danger" data-del>${ic("trash")} حذف</button>`:""}</div></form>`,el=>{
+    const f=$("#spf",el);
+    f.onsubmit=async e=>{e.preventDefault();const g=n=>f.elements[n]?f.elements[n].value.trim():"";
+      const j=await act($("button.btn",f),"shop_plan_save",{plan:{id:p.id||"",kind:p.kind,name:g("name"),gb:g("gb"),days:g("days"),price:g("price").replace(/[^\d]/g,""),devices:g("devices"),desc:g("desc"),active:f.active.checked}});if(j.ok)closeSheet()};
+    const d=$("[data-del]",el);if(d)d.onclick=async()=>{if(await confirmSheet("حذف پلن",`«${esc(p.name)}» حذف بشه؟ سفارش‌های قبلی می‌مونن.`,"حذف کن",true)){const j=await act(null,"shop_plan_delete",{id:p.id});if(j.ok)closeSheet()}};
+  });
+}
+function codeSheet(c,kind){c=c||{kind:kind||"discount"};const gift=c.kind==="gift";
+  sheet(`<h3>${gift?"🎁 کد هدیه":"🏷 کد تخفیف"}</h3><form id="scf">
+   ${field("code","کد",c.code||"",'class="in ltr" maxlength="24" placeholder="'+(gift?"GIFT50":"NOWRUZ")+'" required'+(c.code?" readonly":""))}
+   ${gift?field("amount","مبلغ هدیه (تومان)",c.amount||"",'class="in ltr" inputmode="numeric" placeholder="50000" required'):`<div class="cols2">${field("pct","درصد تخفیف",c.pct||"",'class="in ltr" inputmode="numeric" placeholder="20"')}${field("amount","یا مبلغ ثابت",c.pct?"":c.amount||"",'class="in ltr" inputmode="numeric" placeholder="30000"')}</div>`}
+   <div class="cols2">${field("max","چند بار (کل)",c.max||"",'class="in ltr" inputmode="numeric" placeholder="نامحدود"')}${field("days","اعتبار (روز)",c.exp?Math.max(1,Math.ceil((c.exp*1000-Date.now())/864e5)):"",'class="in ltr" inputmode="numeric" placeholder="همیشه"')}</div>
+   <div class="hint">هر مشتری هر کد رو فقط یه بار می‌تونه استفاده کنه.</div>
+   <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button>${c.code?`<button type="button" class="btn danger" data-del>${ic("trash")} حذف</button>`:""}</div></form>`,el=>{
+    const f=$("#scf",el);
+    f.onsubmit=async e=>{e.preventDefault();const g=n=>f.elements[n]?f.elements[n].value.trim():"";
+      const j=await act($("button.btn",f),"shop_code_save",{code:{code:g("code"),kind:c.kind,pct:g("pct"),amount:g("amount").replace(/[^\d]/g,""),max:g("max"),days:g("days")}});if(j.ok)closeSheet()};
+    const d=$("[data-del]",el);if(d)d.onclick=async()=>{const j=await act(null,"shop_code_delete",{code:c.code});if(j.ok)closeSheet()};
+  });
+}
+function custSheet(c){
+  sheet(`<h3>${esc(c.name||c.id)}</h3>${c.username?`<p class="mut small ltr" style="text-align:right">@${esc(c.username)}</p>`:""}
+   <div class="tiles"><div class="tile2"><div class="k">کیف پول</div><div class="v">${tmn(c.wallet)}</div></div><div class="tile2"><div class="k">کل خرید</div><div class="v">${tmn(c.spent)}</div></div></div>
+   <form id="swf"><label class="f"><span>تغییر کیف پول (تومان)</span><input class="in ltr" name="delta" inputmode="numeric" placeholder="50000 یا -20000" required></label>
+   <div class="bar-btns"><button class="btn">${ic("check")} اعمال</button></div><div class="hint">به مشتری هم توی ربات خبر داده می‌شه.</div></form>
+   <div class="sec" style="margin-top:12px"><h3>سفارش‌ها</h3></div><div class="list">${(S.state.shop.orders||[]).filter(o=>o.uid===c.id).slice(0,15).map(o=>ordRow(o)).join("")||'<div class="note">سفارشی نیست.</div>'}</div>`,el=>{
+    const f=$("#swf",el);f.onsubmit=async e=>{e.preventDefault();const v=f.delta.value.replace(/[^\d-]/g,"");const j=await act($("button.btn",f),"shop_wallet",{id:c.id,delta:v});if(j.ok)closeSheet()}});
+}
+function ordSheet(o){const st=OST[o.status]||["",o.status];
+  sheet(`<h3>سفارش #${fa(o.id)} <span class="tag ${st[0]}">${st[1]}</span></h3>
+   <div class="kv"><span>مشتری</span><span>${esc(o.name||o.uid)}${o.username?` <span class="ltr">@${esc(o.username)}</span>`:""}</span></div>
+   <div class="kv"><span>نوع</span><span>${OKIND[o.kind]||""}${o.plan_name?" · "+esc(o.plan_name):""}</span></div>
+   <div class="kv"><span>مبلغ</span><span>${tmn(o.total)}${o.discount?` <span class="mut xs">(تخفیف ${tmn(o.discount)} با ${esc(o.code)})</span>`:""}</span></div>
+   <div class="kv"><span>پرداخت</span><span>${o.method==="wallet"?"کیف پول":o.method==="card"?"کارت به کارت":"—"}</span></div>
+   <div class="kv"><span>زمان</span><span>${ago(o.at*1000)}</span></div>
+   ${o.reviewed_by?`<div class="kv"><span>بررسی</span><span>${esc(o.reviewed_by)}</span></div>`:""}${o.error?`<div class="err">${esc(o.error)}</div>`:""}
+   <div id="orc"></div>
+   <div class="bar-btns">${o.receipt_kind?`<button class="btn ghost" data-r>🖼 رسید</button>`:""}${o.status==="review"?`<button class="btn" data-ok>✅ تأیید</button><button class="btn danger" data-no>❌ رد</button>`:""}${["done","rejected"].includes(o.status)&&o.kind!=="topup"?`<button class="btn ghost" data-ref>💰 برگشت به کیف پول</button>`:""}${o.status==="failed"?`<button class="btn" data-retry>${ic("refresh")} دوباره</button>`:""}</div>`,el=>{
+    const on=(sel,fn)=>{const b=$(sel,el);if(b)b.onclick=()=>fn(b)};
+    on("[data-r]",b=>showReceipt(o.id,$("#orc",el),b));
+    on("[data-ok]",async b=>{const j=await act(b,"shop_order",{id:o.id,act:"approve"});if(j.ok)closeSheet()});
+    on("[data-no]",async b=>{const j=await act(b,"shop_order",{id:o.id,act:"reject"});if(j.ok)closeSheet()});
+    on("[data-ref]",async b=>{if(await confirmSheet("برگشت پول",`${tmn(o.total)} به کیف پول مشتری برگرده؟`,"برگردون")){const j=await act(null,"shop_order",{id:o.id,act:"refund"});if(j.ok)closeSheet()}});
+    on("[data-retry]",async b=>{const j=await act(b,"shop_order",{id:o.id,act:"retry"});if(j.ok)closeSheet()});
+  });
+}
+async function showReceipt(id,box,btn){if(btn)btn.classList.add("busy");try{const j=await api("shop_receipt",{id});if(j.ok&&box)box.innerHTML=`<img class="rcpt" src="data:image/jpeg;base64,${j.img}" alt="رسید">`}finally{if(btn)btn.classList.remove("busy")}}
+document.addEventListener("input",e=>{if(e.target.id==="cq"){S.cq=e.target.value;const pos=e.target.selectionStart;render();const x=$("#cq");if(x){x.focus();x.setSelectionRange(pos,pos)}}});
+
 /* the bot: settings, admin chats, customers */
 function botCard(){
   const b=S.state.bot||{},n=b.nets||{},tg=n.tg||{},bl=n.bale||{};
@@ -6983,6 +7108,14 @@ const ACTS={
   seg:b=>{S.seg=b.dataset.seg;S.tab="routes";try{localStorage.setItem("xc_seg",S.seg);localStorage.setItem("xc_tab","routes")}catch(e){}closeSheet();render()},
   theme:()=>{const dark=document.documentElement.dataset.theme==="dark";S.theme=dark?"light":"dark";try{localStorage.setItem("xc_theme",S.theme)}catch(e){}applyTheme();render()},
   refresh:b=>act(b,"state",{}),
+  sseg:b=>{S.sseg=b.dataset.s;render()},
+  "shop-plan":b=>planSheet((S.state.shop.plans||[]).find(p=>p.id===b.dataset.id),b.dataset.kind),
+  "shop-code":b=>codeSheet((S.state.shop.codes||[]).find(c=>c.code===b.dataset.code),b.dataset.kind),
+  "shop-cust":b=>{const c=(S.state.shop.customers||[]).find(x=>x.id===b.dataset.id);if(c)custSheet(c)},
+  "shop-ord":b=>{const o=(S.state.shop.orders||[]).find(x=>x.id===+b.dataset.id);if(o)ordSheet(o)},
+  "shop-ok":b=>act(b,"shop_order",{id:+b.dataset.id,act:"approve"}),
+  "shop-no":async b=>{if(await confirmSheet("رد رسید","این رسید رد بشه؟ به مشتری خبر داده می‌شه.","رد کن",true))act(null,"shop_order",{id:+b.dataset.id,act:"reject"})},
+  "shop-rcpt":b=>{const o=(S.state.shop.orders||[]).find(x=>x.id===+b.dataset.id);if(o)ordSheet(o);setTimeout(()=>{const r=document.querySelector("#ov [data-r]");r&&r.click()},120)},
   "bot-pair":async b=>{b.classList.add("busy");try{const j=await api("bot_pair",{});if(j.ok)botPairSheet(j);else toast(j.msg||"نشد","bad")}finally{b.classList.remove("busy")}},
   "bot-admin":b=>{const a=(S.state.bot.admins||[]).find(x=>x.id===b.dataset.id);if(a)botAdminSheet(a)},
   "bot-test":b=>act(b,"bot_test",{}),
@@ -7215,7 +7348,7 @@ class UsageStore:
 # ---------------------------------------------------------------- backup to Telegram / Bale
 
 BALE_API = os.environ.get("XUI_CHAIN_BALE_API", "https://tapi.bale.ai")
-BACKUP_FILES = ("config.json", "upstreams.txt", "usage.db", "known_hosts")
+BACKUP_FILES = ("config.json", "upstreams.txt", "usage.db", "known_hosts", "shop.json", "bot.json")
 
 
 def sqlite_copy(path):
@@ -7336,10 +7469,14 @@ def restore_backup(app, data):
     save_config(dict(DEFAULTS, **old))
     if "ez-xui/upstreams.txt" in names:
         save_upstreams_text(z.read("ez-xui/upstreams.txt").decode("utf-8", "replace"))
-    for name in ("usage.db", "known_hosts"):
+    for name in ("usage.db", "known_hosts", "shop.json", "bot.json"):
         if "ez-xui/" + name in names:
             with open(conf_path(name), "wb") as f:
                 f.write(z.read("ez-xui/" + name))
+            os.chmod(conf_path(name), 0o600)
+    if getattr(app, "bot", None):  # wallets, orders and chats from the backup
+        app.bot.st = app.bot._load()
+        app.bot.shop.d = app.bot.shop._load()
     for path in (SSH_KEY, SSH_KEY + ".pub"):
         member = "ez-xui/ssh/" + os.path.basename(path)
         if member in names:
@@ -7374,7 +7511,7 @@ def bot_chat_ids(api, token):
 # /status and /user. Customers link their chat by sending their subscription link (or one tap from
 # their page) and get reminders before their time or volume runs out, and their usage on demand.
 
-BOT_EVENTS = (("deco", "قطع و وصل واسط‌ها و تانل‌ها"), ("quota", "حجم و زمان واسط‌ها"),
+BOT_EVENTS = (("shop", "فروش: رسیدها و سفارش‌ها"), ("deco", "قطع و وصل واسط‌ها و تانل‌ها"), ("quota", "حجم و زمان واسط‌ها"),
               ("users", "خلاصه‌ی روزانه‌ی کاربرهای رو به پایان"), ("backup", "خطای بکاپ"))
 BOT_NETS = {"tg": "تلگرام", "bale": "بله"}
 SUB_RE = re.compile(r"(?:/[A-Za-z0-9_.-]+/|^s_?|^)([A-Za-z0-9_-]{8,64})/?$")
@@ -7396,6 +7533,7 @@ class Bot:
         self.me = {}        # net -> {"username", "error"}
         self.threads = {}
         self.st = self._load()
+        self.shop = Shop(self)
 
     # state ------------------------------------------------------------------
     def _load(self):
@@ -7569,7 +7707,7 @@ class Bot:
     def handle(self, net, msg):
         chat = (msg.get("chat") or {}).get("id")
         text = (msg.get("text") or "").strip()
-        if chat is None or not text:
+        if chat is None or not (text or msg.get("photo") or msg.get("document")):
             return
         cid = "%s:%s" % (net, chat)
         who = msg.get("from") or {}
@@ -7590,6 +7728,10 @@ class Bot:
                          {"remove_keyboard": True})
         if admin and cmd in ("/status", "/user"):
             return reply(self.admin_status() if cmd == "/status" else self.admin_user(arg))
+        if self.shop.on() and self.shop.on_message(net, msg):
+            return
+        if not text:
+            return
         if cmd == "/stop":
             with self.lock:
                 had = self.st["customers"].pop(cid, None) or self.st["admins"].pop(cid, None)
@@ -7614,10 +7756,17 @@ class Bot:
             with self.lock:
                 self.st["customers"][cid] = {"sub": u["sub"], "name": name, "at": int(time.time())}
             self.save()
+            with self.shop.lock:
+                su = self.shop.user("%s:%s" % (net, who.get("id", chat)), who)
+                if self.shop.on() and u["sub"] not in su.setdefault("subs", []):
+                    su["subs"].append(u["sub"])
+            self.shop.save()
             return reply("✅ وصل شد. قبل از تموم شدن حجم یا زمانت همین‌جا خبرت می‌کنم.\n\n" + self.user_text(u),
                          self.customer_keyboard())
         if admin:
             return reply("دستورها:\n/status خلاصه\n/user اسم — وضعیت یه کاربر")
+        if self.shop.on() and (msg.get("chat") or {}).get("type", "private") == "private":
+            return self.shop.on_start(net, chat, who, "")
         if cust:
             return reply("از دکمه‌های پایین استفاده کن.", self.customer_keyboard())
         return reply("سلام 👋\nلینک اشتراکت رو اینجا بفرست تا قبل از تموم شدن حجم یا زمانت خبرت کنم و هر وقت خواستی مصرفت رو ببینی.")
@@ -7652,7 +7801,7 @@ class Bot:
         """One long-poll round for one bot."""
         try:
             ups = self.call(net, "getUpdates", {"offset": self.st["offset"].get(net, 0), "timeout": 25,
-                                                "allowed_updates": ["message"]}, timeout=35)
+                                                "allowed_updates": ["message", "callback_query"]}, timeout=35)
             self.me.setdefault(net, {})["error"] = ""
         except (ValueError, OSError) as e:
             self.me.setdefault(net, {})["error"] = str(e)[:160]
@@ -7663,6 +7812,8 @@ class Bot:
             try:
                 if up.get("message"):
                     self.handle(net, up["message"])
+                elif up.get("callback_query"):
+                    self.shop.on_callback(net, up["callback_query"])
             except Exception as e:  # one bad update must not stop the bot
                 print("bot %s: %s" % (net, e), flush=True)
         if ups:
@@ -7677,6 +7828,11 @@ class Bot:
         try:
             me = self.call(net, "getMe", timeout=10)
             self.me[net] = {"username": me.get("username", ""), "error": ""}
+            try:
+                self.call(net, "setMyCommands", {"commands": [{"command": "start", "description": "منوی اصلی"},
+                                                              {"command": "stop", "description": "قطع اعلان‌ها"}]}, timeout=10)
+            except (ValueError, OSError):
+                pass
         except (ValueError, OSError) as e:
             self.me[net] = {"username": "", "error": str(e)[:160]}
 
@@ -7817,6 +7973,817 @@ class Bot:
                 "queue": len(self.st["queue"]), "log": self.st["log"][-30:][::-1],
                 "events": [{"key": k, "label": l} for k, l in BOT_EVENTS],
                 "days": cfg.get("bot_days") or "3,1", "pcts": cfg.get("bot_pcts") or "80,95", "quiet": cfg.get("bot_quiet") or ""}
+
+
+# ---------------------------------------------------------------- the shop (sales through the bot)
+#
+# Customers buy, renew and top up with inline buttons: plans the admin defines, card-to-card
+# receipts the admins approve with one tap (or the wallet), discount and gift codes, a free trial,
+# referral rewards and a channel to join first. Fulfilment goes through the panel's own API.
+
+def toman(n):
+    return ("{:,}".format(int(round(n or 0))).replace(",", "٬") + " تومان").translate(FA_DIGITS)
+
+
+def fa_num(n):
+    return str(n).translate(FA_DIGITS)
+
+
+def bar(p, n=10):
+    p = max(0.0, min(1.0, p))
+    k = int(round(p * n))
+    return "▰" * k + "▱" * (n - k)
+
+
+def shop_path():
+    return conf_path("shop.json")
+
+
+class Shop:
+    STATUS = {"new": "در انتظار پرداخت", "receipt": "منتظر رسید", "review": "در حال بررسی", "done": "انجام شد",
+              "rejected": "رد شد", "cancelled": "لغو شد", "failed": "ناموفق (برگشت به کیف پول)", "refunded": "برگشت به کیف پول"}
+    KINDS = {"buy": "خرید", "renew": "تمدید", "traffic": "حجم اضافه", "topup": "شارژ کیف پول"}
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.app = bot.app
+        self.lock = threading.RLock()
+        self.wait = {}  # chat id -> {"what": "receipt"|"code"|"gift"|"amount", "order": id}
+        self.d = self._load()
+
+    # data -----------------------------------------------------------------------
+    def _load(self):
+        try:
+            with open(shop_path(), encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            d = {}
+        for k, v in (("plans", []), ("codes", []), ("users", {}), ("orders", []), ("seq", 0)):
+            d.setdefault(k, v)
+        return d
+
+    def save(self):
+        with self.lock:
+            os.makedirs(CONF_DIR, exist_ok=True)
+            tmp = shop_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.d, f, ensure_ascii=False)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, shop_path())
+
+    def on(self):
+        return bool(self.app.cfg.get("shop_enable"))
+
+    def user(self, uid, who=None):
+        with self.lock:
+            u = self.d["users"].setdefault(uid, {"wallet": 0, "subs": [], "trial": False, "joined": int(time.time()), "ref": ""})
+            if who:
+                u["name"] = " ".join(x for x in (who.get("first_name"), who.get("last_name")) if x) or u.get("name", "")
+                u["username"] = who.get("username") or u.get("username", "")
+            return u
+
+    def plan(self, pid):
+        return next((p for p in self.d["plans"] if p.get("id") == pid), None)
+
+    def plans(self, kind="service"):
+        return sorted([p for p in self.d["plans"] if p.get("active", True) and (p.get("kind") or "service") == kind],
+                      key=lambda p: (p.get("order", 0), p.get("price", 0)))
+
+    def order(self, oid):
+        return next((o for o in self.d["orders"] if o["id"] == oid), None)
+
+    def new_order(self, uid, net, chat, kind, price, plan=None, sub=""):
+        with self.lock:
+            self.d["seq"] += 1
+            o = {"id": self.d["seq"], "uid": uid, "net": net, "chat": str(chat), "kind": kind, "plan": (plan or {}).get("id", ""),
+                 "plan_name": (plan or {}).get("name", ""), "gb": (plan or {}).get("gb", 0), "days": (plan or {}).get("days", 0),
+                 "devices": (plan or {}).get("devices", 0), "sub": sub, "price": int(price), "discount": 0, "code": "",
+                 "status": "new", "at": int(time.time()), "admin_msgs": []}
+            self.d["orders"].append(o)
+            self.d["orders"] = self.d["orders"][-3000:]
+        self.save()
+        return o
+
+    def total(self, o):
+        return max(0, o["price"] - o.get("discount", 0))
+
+    # Telegram helpers -------------------------------------------------------------
+    def kb(self, rows):
+        return {"inline_keyboard": [[{"text": t, "callback_data": d} if not d.startswith("http") else {"text": t, "url": d}
+                                     for t, d in row] for row in rows if row]}
+
+    def show(self, net, chat, text, rows=None, msg=None):
+        """Edit the message in place when there is one (smooth menus), else send a new one."""
+        payload = {"chat_id": chat, "text": text[:4000], "disable_web_page_preview": True, "parse_mode": "HTML"}
+        if rows is not None:
+            payload["reply_markup"] = self.kb(rows)
+        if msg:
+            try:
+                return self.bot.call(net, "editMessageText", dict(payload, message_id=msg))
+            except (ValueError, OSError) as e:
+                if "not modified" in str(e):
+                    return None
+        try:
+            return self.bot.call(net, "sendMessage", payload)
+        except (ValueError, OSError) as e:
+            self.bot.log(net, chat, "shop", str(e)[:160])
+
+    def esc(self, s):
+        return html.escape(str(s or ""), quote=False)
+
+    def back(self, to="m"):
+        return [("⬅️ بازگشت", to)]
+
+    # menus ----------------------------------------------------------------------
+    def main_menu(self, net, chat, uid, msg=None):
+        cfg = self.app.cfg
+        u = self.user(uid)
+        hello = cfg.get("shop_welcome") or "به فروشگاه %s خوش اومدی 🌟\nسریع، پایدار و بدون قطعی." % self.esc(cfg.get("title") or NAME)
+        text = "%s\n\n💰 کیف پول: <b>%s</b>" % (hello, toman(u.get("wallet", 0)))
+        if u.get("subs"):
+            text += "\n📦 سرویس‌های فعال: <b>%s</b>" % fa_num(len(u["subs"]))
+        rows = [[("🛒 خرید سرویس", "buy"), ("🔄 تمدید", "renew")],
+                [("📦 سرویس‌های من", "svc"), ("💰 کیف پول", "wallet")]]
+        extra = []
+        if self.trial_cfg() and not u.get("trial"):
+            extra.append(("🆓 تست رایگان", "trial"))
+        extra.append(("🎁 کد هدیه", "gift"))
+        rows.append(extra)
+        row = []
+        if _int(cfg.get("shop_ref")):
+            row.append(("👥 دعوت دوستان", "ref"))
+        if cfg.get("support_url"):
+            row.append(("💬 پشتیبانی", cfg["support_url"] if cfg["support_url"].startswith("http") else "help"))
+        rows.append(row)
+        rows.append([("📚 راهنمای اتصال", "guide")])
+        self.show(net, chat, text, rows, msg)
+
+    def trial_cfg(self):
+        parts = [x for x in str(self.app.cfg.get("shop_trial") or "").replace(" ", "").split(",") if x]
+        if len(parts) != 2:
+            return None
+        try:
+            gb, days = float(parts[0]), int(parts[1])
+        except ValueError:
+            return None
+        return (gb, days) if gb > 0 and days > 0 else None
+
+    def plan_line(self, p):
+        gb = "نامحدود" if not p.get("gb") else "%s گیگ" % fa_num(_fmt_num(p["gb"]))
+        days = "%s روزه" % fa_num(p["days"]) if p.get("days") else "بدون محدودیت زمان"
+        return "%s · %s · %s" % (gb, days, toman(p["price"]))
+
+    def buy_menu(self, net, chat, msg, sub=""):
+        ps = self.plans()
+        if not ps:
+            return self.show(net, chat, "فعلاً پلنی برای فروش نیست 🙏", [self.back()], msg)
+        title = "🔄 <b>تمدید سرویس</b>\nپلن جدید رو انتخاب کن؛ حجم از نو شروع می‌شه و روزها به باقی‌مونده اضافه می‌شن." if sub else \
+            "🛒 <b>خرید سرویس</b>\nیکی از پلن‌ها رو انتخاب کن:"
+        lines = ["\n• <b>%s</b>\n  %s%s" % (self.esc(p["name"]), self.plan_line(p),
+                                            "\n  " + self.esc(p["desc"]) if p.get("desc") else "") for p in ps]
+        rows = [[("%s · %s" % (p["name"], toman(p["price"])), ("rp:%s:%s" % (sub, p["id"])) if sub else "bp:%s" % p["id"])] for p in ps]
+        self.show(net, chat, title + "\n" + "".join(lines), rows + [self.back("svc" if sub else "m")], msg)
+
+    def services(self, uid, cid=None):
+        u = self.user(uid)
+        subs = list(u.get("subs") or [])
+        linked = (self.bot.st["customers"].get(cid) or {}).get("sub") if cid else None
+        if linked and linked not in subs:
+            subs.append(linked)
+        users = {x["sub"]: x for x in group_users(clients_of(self.app)) if x.get("sub")}
+        return [(s, users.get(s)) for s in subs]
+
+    def svc_menu(self, net, chat, uid, msg, renew=False):
+        svcs = [(s, x) for s, x in self.services(uid, "%s:%s" % (net, chat)) if x]
+        if not svcs:
+            return self.show(net, chat, "هنوز سرویسی نداری.\nاز «🛒 خرید سرویس» شروع کن، یا اگه قبلاً خریدی لینک اشتراکت رو همین‌جا بفرست.",
+                             [[("🛒 خرید سرویس", "buy")], self.back()], msg)
+        rows = [[("%s %s" % ("🟢" if self.active(x) else "🔴", x["name"]), ("rn:%s" if renew else "sv:%s") % s)] for s, x in svcs]
+        self.show(net, chat, "🔄 <b>کدوم سرویس رو تمدید کنیم؟</b>" if renew else "📦 <b>سرویس‌های من</b>", rows + [self.back()], msg)
+
+    def active(self, x):
+        ms = time.time() * 1000
+        return x["enable"] and not (x["expiry"] > 0 and x["expiry"] < ms) and not (x["total"] and x["used"] >= x["total"])
+
+    def svc_detail(self, net, chat, uid, sub, msg):
+        x = next((x for s, x in self.services(uid, "%s:%s" % (net, chat)) if s == sub and x), None)
+        if not x:
+            return self.show(net, chat, "این سرویس پیدا نشد.", [self.back("svc")], msg)
+        ms = time.time() * 1000
+        lines = ["📦 <b>%s</b>  %s" % (self.esc(x["name"]), "🟢 فعال" if self.active(x) else "🔴 غیرفعال")]
+        if x["total"]:
+            left = max(0, x["total"] - x["used"])
+            lines.append("\n📊 حجم: %s\n%s مانده از %s گیگ" % (bar(1 - x["used"] / x["total"]), fa_num(fmt_gb(left)), fa_num(fmt_gb(x["total"]))))
+        else:
+            lines.append("\n📊 حجم نامحدود · %s گیگ مصرف" % fa_num(fmt_gb(x["used"])))
+        if x["expiry"] > 0:
+            d = max(0, math.ceil((x["expiry"] - ms) / 86400000))
+            lines.append("⏳ %s" % ("منقضی شده" if d == 0 else "%s روز مانده" % fa_num(d)))
+        elif x["expiry"] < 0:
+            lines.append("⏳ %s روز، از اولین اتصال" % fa_num(round(-x["expiry"] / 86400000)))
+        lines.append("\n🔗 لینک اشتراک (کپی کن و توی اپ اضافه کن):\n<code>%s</code>" % self.esc(self.bot.sub_link(sub)))
+        rows = [[("🔄 تمدید", "rn:%s" % sub)]]
+        if self.plans("traffic"):
+            rows[0].append(("➕ حجم اضافه", "tf:%s" % sub))
+        rows.append([("📱 صفحه‌ی اشتراک و آموزش", self.bot.sub_link(sub))])
+        rows.append(self.back("svc"))
+        self.show(net, chat, "\n".join(lines), rows, msg)
+
+    def traffic_menu(self, net, chat, sub, msg):
+        ps = self.plans("traffic")
+        rows = [[("%s · %s" % (p["name"], toman(p["price"])), "tp:%s:%s" % (sub, p["id"]))] for p in ps]
+        self.show(net, chat, "➕ <b>حجم اضافه</b>\nبه حجم فعلیت اضافه می‌شه و روزها عوض نمی‌شن.", rows + [self.back("sv:%s" % sub)], msg)
+
+    def wallet_menu(self, net, chat, uid, msg):
+        u = self.user(uid)
+        amounts = [_int(a) for a in str(self.app.cfg.get("shop_topups") or "100000,200000,500000").split(",") if _int(a) > 0][:6]
+        rows = [[(toman(a), "tu:%d" % a) for a in amounts[i:i + 2]] for i in range(0, len(amounts), 2)]
+        mine = [o for o in self.d["orders"] if o["uid"] == uid and o["status"] in ("done", "refunded", "failed")][-5:]
+        hist = "".join("\n%s %s · %s" % ("➕" if o["kind"] == "topup" or o["status"] in ("refunded", "failed") else "➖",
+                                          self.KINDS.get(o["kind"], ""), toman(self.total(o))) for o in reversed(mine))
+        self.show(net, chat, "💰 <b>کیف پول</b>\nموجودی: <b>%s</b>\n\nبا شارژ کیف پول، خرید و تمدید بعدی با یه دکمه انجام می‌شه.%s" % (
+            toman(u.get("wallet", 0)), "\n\n<b>آخرین تراکنش‌ها</b>" + hist if hist else ""), rows + [self.back()], msg)
+
+    def invoice(self, net, chat, o, msg=None):
+        u = self.user(o["uid"])
+        total = self.total(o)
+        lines = ["🧾 <b>فاکتور #%s</b>" % fa_num(o["id"]), "\n%s: <b>%s</b>" % (self.KINDS[o["kind"]], self.esc(o["plan_name"]) if o["plan_name"] else toman(o["price"]))]
+        if o["kind"] != "topup" and o["plan_name"]:
+            p = {"gb": o["gb"], "days": o["days"], "price": o["price"]}
+            lines.append(self.plan_line(p) if o["kind"] != "traffic" else "%s گیگ" % fa_num(_fmt_num(o["gb"])))
+        if o.get("discount"):
+            lines.append("🏷 تخفیف (%s): −%s" % (self.esc(o["code"]), toman(o["discount"])))
+        lines.append("\n💳 مبلغ قابل پرداخت: <b>%s</b>" % toman(total))
+        lines.append("💰 کیف پول شما: %s" % toman(u.get("wallet", 0)))
+        rows = []
+        if o["kind"] != "topup" and u.get("wallet", 0) >= total:
+            rows.append([("💰 پرداخت از کیف پول", "pw:%s" % o["id"])])
+        if self.cards():
+            rows.append([("💳 کارت به کارت", "pc:%s" % o["id"])])
+        if o["kind"] != "topup" and not o.get("code") and any(c.get("kind") == "discount" for c in self.d["codes"]):
+            rows.append([("🏷 کد تخفیف دارم", "dc:%s" % o["id"])])
+        rows.append([("✖️ انصراف", "x:%s" % o["id"])])
+        if not self.cards() and not (o["kind"] != "topup" and u.get("wallet", 0) >= total):
+            lines.append("\n⚠️ روش پرداختی تنظیم نشده؛ با پشتیبانی در تماس باش.")
+        self.show(net, chat, "\n".join(lines), rows, msg)
+
+    def cards(self):
+        out = []
+        for line in str(self.app.cfg.get("shop_cards") or "").splitlines():
+            parts = [p.strip() for p in line.split("|")]
+            if parts and re.sub(r"\D", "", parts[0]):
+                out.append(parts + [""] * (3 - len(parts)))
+        return out
+
+    def card_text(self, o):
+        cards = "\n".join("💳 <code>%s</code>\n👤 %s%s" % (self.esc(c[0]), self.esc(c[1]), " · " + self.esc(c[2]) if c[2] else "")
+                          for c in self.cards())
+        return ("💳 <b>کارت به کارت</b>\n\nمبلغ <b>%s</b> رو به این کارت واریز کن:\n\n%s\n\n📸 بعد از واریز، <b>عکس رسید</b> رو همین‌جا بفرست. "
+                "بعد از تأیید، سرویست خودکار فعال می‌شه.") % (toman(self.total(o)), cards)
+
+    # actions ----------------------------------------------------------------------
+    def joined(self, net, uid_num):
+        ch = str(self.app.cfg.get("shop_channel") or "").strip()
+        if not ch:
+            return True
+        try:
+            m = self.bot.call(net, "getChatMember", {"chat_id": ch, "user_id": uid_num}, timeout=10)
+            return (m or {}).get("status") in ("member", "administrator", "creator", "restricted")
+        except (ValueError, OSError):
+            return True  # the bot is not admin there: do not lock customers out
+
+    def join_prompt(self, net, chat, msg=None):
+        ch = str(self.app.cfg.get("shop_channel") or "").strip()
+        url = "https://t.me/" + ch.lstrip("@") if ch.startswith("@") else ch
+        self.show(net, chat, "📢 برای استفاده از ربات، اول عضو کانال ما شو و بعد «✅ عضو شدم» رو بزن.",
+                  [[("📢 عضویت در کانال", url)], [("✅ عضو شدم", "m")]], msg)
+
+    def on_start(self, net, chat, who, arg):
+        uid = "%s:%s" % (net, who.get("id", chat))
+        new = uid not in self.d["users"]
+        u = self.user(uid, who)
+        if new and arg.startswith("r_") and arg[2:] != str(who.get("id")) and ("%s:%s" % (net, arg[2:])) in self.d["users"]:
+            u["ref"] = "%s:%s" % (net, arg[2:])
+        self.save()
+        if not self.joined(net, who.get("id")):
+            return self.join_prompt(net, chat)
+        self.main_menu(net, chat, uid)
+
+    def on_message(self, net, msg):
+        """A customer's message while the shop is on. -> True when handled."""
+        chat = (msg.get("chat") or {}).get("id")
+        who = msg.get("from") or {}
+        if (msg.get("chat") or {}).get("type", "private") != "private":
+            return False
+        cid, uid = "%s:%s" % (net, chat), "%s:%s" % (net, who.get("id", chat))
+        w = self.wait.get(cid)
+        if w and w["what"] == "receipt" and (msg.get("photo") or msg.get("document")):
+            return self.got_receipt(net, chat, uid, w["order"], msg)
+        text = (msg.get("text") or "").strip()
+        if msg.get("photo") or msg.get("document"):
+            self.show(net, chat, "اول از منو سفارشت رو ثبت کن، بعد رسید رو بفرست 🙏", [[("🏠 منوی اصلی", "m")]])
+            return True
+        if w and text and not text.startswith("/"):
+            self.wait.pop(cid, None)
+            if w["what"] == "code":
+                return self.apply_code(net, chat, uid, w["order"], text)
+            if w["what"] == "gift":
+                return self.redeem(net, chat, uid, text)
+        cmd, _, arg = text.partition(" ")
+        if cmd.split("@")[0].lower() in ("/start", "/menu", "/shop"):
+            self.wait.pop(cid, None)
+            if SUB_RE.search(arg.strip()) and arg.strip().startswith("s_"):
+                return False  # one-tap link from the user page: the bot links it
+            self.on_start(net, chat, who, arg.strip())
+            return True
+        return False
+
+    def got_receipt(self, net, chat, uid, oid, msg):
+        o = self.order(oid)
+        if not o or o["status"] not in ("receipt", "new"):
+            self.wait.pop("%s:%s" % (net, chat), None)
+            return False
+        self.wait.pop("%s:%s" % (net, chat), None)
+        if msg.get("photo"):
+            media = ("sendPhoto", "photo", msg["photo"][-1]["file_id"])
+        else:
+            media = ("sendDocument", "document", msg["document"]["file_id"])
+        with self.lock:
+            o["status"], o["receipt"], o["receipt_at"] = "review", media[2], int(time.time())
+            o["receipt_kind"] = media[1]
+        u = self.user(uid)
+        cap = ("🧾 <b>رسید #%s</b>\n👤 %s%s\n🛍 %s%s\n💳 <b>%s</b>" % (
+            fa_num(o["id"]), self.esc(u.get("name") or uid), " (@%s)" % self.esc(u["username"]) if u.get("username") else "",
+            self.KINDS[o["kind"]], " · " + self.esc(o["plan_name"]) if o["plan_name"] else "", toman(self.total(o))))
+        sent = 0
+        for acid, a in list(self.bot.st["admins"].items()):
+            anet, achat = acid.split(":", 1)
+            if anet != net or a.get("paused"):
+                continue  # a Bale file id means nothing on Telegram
+            try:
+                r = self.bot.call(anet, media[0], {"chat_id": achat, media[1]: media[2], "caption": cap, "parse_mode": "HTML",
+                                                   "reply_markup": self.kb([[("✅ تأیید", "ok:%s" % o["id"]), ("❌ رد", "no:%s" % o["id"])]])})
+                o["admin_msgs"].append([anet, achat, r.get("message_id")])
+                sent += 1
+            except (ValueError, OSError) as e:
+                self.bot.log(anet, achat, "receipt", str(e)[:160])
+        self.save()
+        self.show(net, chat, "✅ رسیدت رسید و در حال بررسیه.\nمعمولاً چند دقیقه طول می‌کشه؛ بعد از تأیید همین‌جا خبرت می‌کنم 🙏",
+                  [[("🏠 منوی اصلی", "m")]])
+        if not sent:
+            self.bot.notify_admins("shop", "🧾 رسید #%s رسید ولی به هیچ چت مدیری نرسید؛ از پنل بررسی کن." % o["id"])
+        return True
+
+    def apply_code(self, net, chat, uid, oid, text):
+        o = self.order(oid)
+        if not o or o["status"] not in ("new", "receipt"):
+            return True
+        code = text.strip().upper()
+        c = next((c for c in self.d["codes"] if c.get("kind") == "discount" and c["code"].upper() == code), None)
+        err = self.code_error(c, uid)
+        if err:
+            self.show(net, chat, "❌ " + err, [[("🏷 یه کد دیگه", "dc:%s" % oid), ("⬅️ فاکتور", "iv:%s" % oid)]])
+            return True
+        disc = o["price"] * _int(c.get("pct")) // 100 if c.get("pct") else _int(c.get("amount"))
+        with self.lock:
+            o["discount"], o["code"] = min(o["price"], disc), c["code"]
+        self.save()
+        self.invoice(net, chat, o)
+        return True
+
+    def code_error(self, c, uid):
+        if not c:
+            return "این کد معتبر نیست."
+        if c.get("exp") and time.time() > c["exp"]:
+            return "این کد منقضی شده."
+        if c.get("max") and len(c.get("used_by") or []) >= c["max"]:
+            return "ظرفیت این کد تموم شده."
+        if uid in (c.get("used_by") or []):
+            return "این کد رو قبلاً استفاده کردی."
+        return ""
+
+    def redeem(self, net, chat, uid, text):
+        code = text.strip().upper()
+        c = next((c for c in self.d["codes"] if c.get("kind") == "gift" and c["code"].upper() == code), None)
+        err = self.code_error(c, uid)
+        if err:
+            self.show(net, chat, "❌ " + err, [[("🎁 یه کد دیگه", "gift")], self.back()])
+            return True
+        with self.lock:
+            c.setdefault("used_by", []).append(uid)
+            u = self.user(uid)
+            u["wallet"] = u.get("wallet", 0) + _int(c.get("amount"))
+        self.save()
+        self.show(net, chat, "🎉 <b>%s</b> به کیف پولت اضافه شد!\nموجودی: %s" % (toman(c.get("amount")), toman(u["wallet"])),
+                  [[("🛒 خرید سرویس", "buy")], self.back()])
+        return True
+
+    def pay_wallet(self, net, chat, uid, o, msg):
+        total = self.total(o)
+        with self.lock:
+            u = self.user(uid)
+            if o["status"] not in ("new", "receipt") or u.get("wallet", 0) < total:
+                return self.show(net, chat, "موجودی کیف پول کافی نیست.", [[("💰 شارژ کیف پول", "wallet")], self.back()], msg)
+            u["wallet"] -= total
+            o["status"], o["method"] = "review", "wallet"
+        self.save()
+        self.show(net, chat, "⏳ در حال آماده‌سازی…", None, msg)
+        self.fulfil(o, by="کیف پول", msg=msg)
+
+    def trial(self, net, chat, uid, who, msg):
+        t = self.trial_cfg()
+        u = self.user(uid)
+        if not t or u.get("trial"):
+            return self.show(net, chat, "تست رایگان قبلاً استفاده شده 🙏", [self.back()], msg)
+        try:
+            sub = self.app.panel.add_client(self.client_name(uid, "t"), t[0], t[1], 1, False, self.inbounds())
+        except Exception as e:
+            self.bot.notify_admins("shop", "⚠️ ساخت تست رایگان نشد: %s" % e)
+            return self.show(net, chat, "الان نشد؛ چند دقیقه‌ی دیگه دوباره امتحان کن 🙏", [self.back()], msg)
+        with self.lock:
+            u["trial"] = True
+            u.setdefault("subs", []).append(sub)
+            self.bot.st["customers"]["%s:%s" % (net, chat)] = {"sub": sub, "name": u.get("name", ""), "at": int(time.time())}
+        self.save()
+        self.bot.save()
+        self.delivered(net, chat, sub, "🎁 <b>تست رایگانت آماده‌ست!</b>\n%s گیگ · %s روز" % (fa_num(_fmt_num(t[0])), fa_num(t[1])), msg)
+
+    def delivered(self, net, chat, sub, head, msg=None):
+        link = self.bot.sub_link(sub)
+        self.show(net, chat, "%s\n\n🔗 لینک اشتراک (کپی کن و توی اپ اضافه کن):\n<code>%s</code>\n\n📱 آموزش اتصال و دکمه‌ی افزودن به اپ‌ها توی صفحه‌ی اشتراکه." % (head, self.esc(link)),
+                  [[("📱 صفحه‌ی اشتراک و آموزش", link)], [("📦 سرویس‌های من", "svc"), ("🏠 منو", "m")]], msg)
+
+    def client_name(self, uid, tag=""):
+        prefix = re.sub(r"[^A-Za-z0-9_]", "", str(self.app.cfg.get("shop_prefix") or "tg"))[:10] or "tg"
+        base = "%s%s" % (prefix, uid.split(":", 1)[1])
+        taken = {c["email"] for c in clients_of(self.app)}
+        k = 1
+        while True:
+            name = "%s%s%s" % (base, "_" + tag if tag else "", "_%d" % k if k > 1 else "")
+            if name not in taken:
+                return name
+            k += 1
+
+    def inbounds(self):
+        ids = [_int(x) for x in str(self.app.cfg.get("shop_inbounds") or "").split(",") if _int(x)]
+        if ids:
+            return ids
+        p = self.app.panel.overview()
+        return [ib["id"] for ib in p.get("inbounds") or [] if ib.get("enable", True)
+                and ib.get("protocol") in ("vless", "vmess", "trojan", "shadowsocks")]
+
+    def fulfil(self, o, by="", msg=None):
+        """Carry out a paid order. On a panel error the money goes to the wallet."""
+        uid, net, chat = o["uid"], o["net"], o["chat"]
+        u = self.user(uid)
+        try:
+            if o["kind"] == "topup":
+                with self.lock:
+                    u["wallet"] = u.get("wallet", 0) + o["price"]
+                head = "✅ کیف پولت <b>%s</b> شارژ شد.\nموجودی: %s" % (toman(o["price"]), toman(u["wallet"]))
+                o["status"] = "done"
+                self.save()
+                self.show(net, chat, head, [[("🛒 خرید سرویس", "buy"), ("🏠 منو", "m")]], msg)
+            elif o["kind"] == "buy":
+                sub = self.app.panel.add_client(self.client_name(uid), o["gb"], o["days"], o.get("devices") or 0, False, self.inbounds())
+                with self.lock:
+                    o["sub"], o["status"] = sub, "done"
+                    u.setdefault("subs", []).append(sub)
+                    self.bot.st["customers"]["%s:%s" % (net, chat)] = {"sub": sub, "name": u.get("name", ""), "at": int(time.time())}
+                self.save()
+                self.bot.save()
+                self.delivered(net, chat, sub, "🎉 <b>سرویست آماده‌ست!</b>\n%s" % self.esc(o["plan_name"]), msg)
+            else:
+                x = next((x for x in group_users(clients_of(self.app)) if x.get("sub") == o["sub"]), None)
+                if not x:
+                    raise PanelError("سرویس پیدا نشد")
+                if o["kind"] == "renew":
+                    ms = time.time() * 1000
+                    start = x["expiry"] if x["expiry"] > ms else ms
+                    self.app.panel.reset_user(o["sub"], x["emails"])
+                    ch = {"totalGB": int(float(o["gb"]) * GB_BYTES), "enable": True}
+                    if o["days"]:
+                        ch["expiryTime"] = int(start + o["days"] * 86400000)
+                    self.app.panel.update_user(o["sub"], x["emails"], ch)
+                    head = "✅ <b>سرویس %s تمدید شد</b>\n%s" % (self.esc(x["name"]), self.esc(o["plan_name"]))
+                else:
+                    self.app.panel.update_user(o["sub"], x["emails"], {"totalGB": int(x["total"] + float(o["gb"]) * GB_BYTES), "enable": True})
+                    head = "✅ <b>%s گیگ</b> به سرویس %s اضافه شد" % (fa_num(_fmt_num(o["gb"])), self.esc(x["name"]))
+                with self.lock:
+                    o["status"] = "done"
+                    for k in list(self.bot.st["sent"]):
+                        if k.startswith(o["sub"] + "|"):
+                            self.bot.st["sent"].pop(k)  # a new period: its reminders may come again
+                self.save()
+                self.show(net, chat, head, [[("📦 سرویس‌های من", "sv:%s" % o["sub"]), ("🏠 منو", "m")]], msg)
+        except Exception as e:
+            with self.lock:
+                o["status"], o["error"] = "failed", str(e)[:200]
+                u["wallet"] = u.get("wallet", 0) + self.total(o)
+            self.save()
+            self.show(net, chat, "⚠️ آماده‌سازی انجام نشد؛ مبلغ <b>%s</b> به کیف پولت برگشت.\nبه زودی پیگیری می‌کنیم 🙏" % toman(self.total(o)),
+                      [[("🏠 منو", "m")]], msg)
+            self.bot.notify_admins("shop", "⚠️ سفارش #%s انجام نشد و پولش به کیف پول برگشت: %s" % (o["id"], e))
+            return False
+        o["done_at"] = int(time.time())
+        if o.get("code"):
+            c = next((c for c in self.d["codes"] if c["code"] == o["code"]), None)
+            if c:
+                c.setdefault("used_by", []).append(uid)
+        self.reward(o)
+        self.save()
+        self.bot.notify_admins("shop", "🛍 %s #%s · %s · %s%s" % (self.KINDS[o["kind"]], o["id"], u.get("name") or uid,
+                                                               toman(self.total(o)), " · " + by if by else ""))
+        return True
+
+    def reward(self, o):
+        """The first paid order of an invited customer rewards whoever invited them."""
+        u = self.user(o["uid"])
+        pct = _int(self.app.cfg.get("shop_ref"))
+        if not (pct and u.get("ref") and not u.get("ref_paid") and o["kind"] != "topup" and self.total(o)):
+            return
+        r = self.d["users"].get(u["ref"])
+        if not r:
+            return
+        amount = self.total(o) * pct // 100
+        with self.lock:
+            r["wallet"] = r.get("wallet", 0) + amount
+            r["ref_earned"] = r.get("ref_earned", 0) + amount
+            u["ref_paid"] = True
+        net, chat = u["ref"].split(":", 1)
+        self.show(net, chat, "🎉 یکی از دوستانت خرید کرد و <b>%s</b> به کیف پولت اضافه شد!" % toman(amount), [[("💰 کیف پول", "wallet")]])
+
+    def review(self, oid, approve, who="", reason=""):
+        """An admin approved or rejected a receipt (from the bot or the panel). -> message"""
+        o = self.order(oid)
+        if not o:
+            return "سفارش پیدا نشد"
+        with self.lock:
+            if o["status"] != "review" or o.get("method") == "wallet":
+                return "این سفارش قبلاً %s" % self.STATUS.get(o["status"], o["status"])
+            o["status"], o["reviewed_by"] = ("approving" if approve else "rejected"), who
+        if approve:
+            ok = self.fulfil(o, by="کارت به کارت")
+            res = "✅ تأیید شد" if ok else "⚠️ تأیید شد ولی انجام نشد (پول به کیف پول برگشت)"
+        else:
+            o["reason"] = reason
+            self.save()
+            sup = self.app.cfg.get("support_url")
+            self.show(o["net"], o["chat"], "❌ رسید سفارش #%s تأیید نشد.%s\n\nاگه فکر می‌کنی اشتباه شده با پشتیبانی در تماس باش%s" % (
+                fa_num(o["id"]), "\nدلیل: " + self.esc(reason) if reason else "", ":\n" + self.esc(sup) if sup else "."), [[("🏠 منو", "m")]])
+            res = "❌ رد شد"
+        for anet, achat, mid in o.get("admin_msgs") or []:
+            try:
+                self.bot.call(anet, "editMessageReplyMarkup", {"chat_id": achat, "message_id": mid,
+                                                               "reply_markup": self.kb([[("%s%s" % (res, " · " + who if who else ""), "noop")]])})
+            except (ValueError, OSError):
+                pass
+        return res
+
+    # callbacks --------------------------------------------------------------------
+    def on_callback(self, net, cq):
+        data = cq.get("data") or ""
+        msg = cq.get("message") or {}
+        chat = (msg.get("chat") or {}).get("id")
+        mid = msg.get("message_id")
+        who = cq.get("from") or {}
+        uid = "%s:%s" % (net, who.get("id", chat))
+        cid = "%s:%s" % (net, chat)
+        note = ""
+        try:
+            if data in ("noop",):
+                pass
+            elif data.startswith(("ok:", "no:")):
+                if cid not in self.bot.st["admins"]:
+                    note = "فقط مدیرها"
+                else:
+                    note = self.review(_int(data[3:]), data.startswith("ok:"),
+                                       who=" ".join(x for x in (who.get("first_name"), who.get("username") and "@" + who["username"]) if x))
+            elif not self.on():
+                note = "فروشگاه فعلاً بسته‌ست"
+            elif not self.joined(net, who.get("id")):
+                self.join_prompt(net, chat, mid)
+                note = "اول عضو کانال شو"
+            else:
+                self.user(uid, who)
+                self.route(net, chat, uid, who, data, mid)
+        except Exception as e:
+            print("shop callback: %s" % e, flush=True)
+            note = "خطا؛ دوباره امتحان کن"
+        try:
+            self.bot.call(net, "answerCallbackQuery", {"callback_query_id": cq.get("id"), "text": note[:180]}, timeout=10)
+        except (ValueError, OSError):
+            pass
+
+    def route(self, net, chat, uid, who, data, mid):
+        cid = "%s:%s" % (net, chat)
+        self.wait.pop(cid, None)
+        head, _, rest = data.partition(":")
+        if head == "m":
+            return self.main_menu(net, chat, uid, mid)
+        if head == "buy":
+            return self.buy_menu(net, chat, mid)
+        if head == "renew":
+            return self.svc_menu(net, chat, uid, mid, renew=True)
+        if head == "svc":
+            return self.svc_menu(net, chat, uid, mid)
+        if head == "sv":
+            return self.svc_detail(net, chat, uid, rest, mid)
+        if head == "rn":
+            return self.buy_menu(net, chat, mid, sub=rest)
+        if head == "tf":
+            return self.traffic_menu(net, chat, rest, mid)
+        if head in ("bp", "rp", "tp"):
+            sub, _, pid = rest.rpartition(":")
+            p = self.plan(pid)
+            if not p or not p.get("active", True):
+                return self.show(net, chat, "این پلن دیگه فروخته نمی‌شه.", [self.back()], mid)
+            if sub and sub not in [s for s, _ in self.services(uid, cid)]:
+                return self.show(net, chat, "این سرویس مال تو نیست.", [self.back()], mid)
+            o = self.new_order(uid, net, chat, {"bp": "buy", "rp": "renew", "tp": "traffic"}[head], p["price"], p, sub)
+            return self.invoice(net, chat, o, mid)
+        if head == "tu":
+            amount = _int(rest)
+            ok = [_int(a) for a in str(self.app.cfg.get("shop_topups") or "100000,200000,500000").split(",")]
+            if amount not in ok:
+                return
+            o = self.new_order(uid, net, chat, "topup", amount)
+            return self.invoice(net, chat, o, mid)
+        o = self.order(_int(rest)) if rest.isdigit() else None
+        if head in ("iv", "pw", "pc", "dc", "x") and (not o or o["uid"] != uid):
+            return self.show(net, chat, "این فاکتور پیدا نشد.", [self.back()], mid)
+        if head == "iv":
+            return self.invoice(net, chat, o, mid)
+        if head == "x":
+            if o["status"] in ("new", "receipt"):
+                o["status"] = "cancelled"
+                self.save()
+            return self.main_menu(net, chat, uid, mid)
+        if head == "pw":
+            return self.pay_wallet(net, chat, uid, o, mid)
+        if head == "pc":
+            if o["status"] not in ("new", "receipt"):
+                return self.show(net, chat, "این فاکتور %s." % self.STATUS.get(o["status"]), [self.back()], mid)
+            o["status"], o["method"] = "receipt", "card"
+            self.save()
+            self.wait[cid] = {"what": "receipt", "order": o["id"]}
+            return self.show(net, chat, self.card_text(o), [[("✖️ انصراف", "x:%s" % o["id"])]], mid)
+        if head == "dc":
+            self.wait[cid] = {"what": "code", "order": o["id"]}
+            return self.show(net, chat, "🏷 کد تخفیفت رو بفرست:", [[("⬅️ فاکتور", "iv:%s" % o["id"])]], mid)
+        if head == "wallet":
+            return self.wallet_menu(net, chat, uid, mid)
+        if head == "gift":
+            self.wait[cid] = {"what": "gift"}
+            return self.show(net, chat, "🎁 کد هدیه‌ت رو بفرست:", [self.back()], mid)
+        if head == "trial":
+            return self.trial(net, chat, uid, who, mid)
+        if head == "ref":
+            me = (self.bot.me.get(net) or {}).get("username", "")
+            u = self.user(uid)
+            invited = sum(1 for x in self.d["users"].values() if x.get("ref") == uid)
+            link = "https://%s/%s?start=r_%s" % ("t.me" if net == "tg" else "ble.ir", me, uid.split(":", 1)[1])
+            return self.show(net, chat, "👥 <b>دعوت دوستان</b>\n\nدوستت با لینک زیر وارد ربات بشه، از اولین خریدش <b>%s٪</b> به کیف پولت اضافه می‌شه.\n\n<code>%s</code>\n\n👤 دعوت‌شده‌ها: %s\n💰 درآمد تا الان: %s" % (
+                fa_num(_int(self.app.cfg.get("shop_ref"))), self.esc(link), fa_num(invited), toman(u.get("ref_earned", 0))), [self.back()], mid)
+        if head == "help":
+            return self.show(net, chat, "💬 پشتیبانی: %s" % self.esc(self.app.cfg.get("support_url", "")), [self.back()], mid)
+        if head == "guide":
+            g = self.app.cfg.get("shop_help") or ("📚 <b>راهنمای اتصال</b>\n\n1️⃣ اپ <b>Happ</b> (اندروید و آیفون) یا v2rayNG رو نصب کن.\n"
+                                                  "2️⃣ از «📦 سرویس‌های من» لینک اشتراک رو کپی کن.\n3️⃣ توی اپ «+» بزن و «از کلیپ‌بورد» رو انتخاب کن.\n"
+                                                  "4️⃣ گزینه‌ی ⚡ Auto رو انتخاب کن و وصل شو.\n\nصفحه‌ی اشتراکت دکمه‌ی افزودن خودکار به اپ‌ها رو هم داره.")
+            return self.show(net, chat, g, [self.back()], mid)
+        return self.main_menu(net, chat, uid, mid)
+
+    # admin page -------------------------------------------------------------------
+    def public(self):
+        now = time.time()
+        day0 = now - (now + TEHRAN) % 86400
+        done = [o for o in self.d["orders"] if o["status"] == "done" and o["kind"] != "topup"]
+        sales = lambda since: sum(self.total(o) for o in done if o.get("done_at", o["at"]) >= since)
+        users = self.d["users"]
+        return {"enable": self.on(), "plans": self.d["plans"], "codes": [dict(c, used=len(c.get("used_by") or []), used_by=None) for c in self.d["codes"]],
+                "orders": [dict(o, admin_msgs=None, receipt=None, total=self.total(o), name=(users.get(o["uid"]) or {}).get("name", ""),
+                                username=(users.get(o["uid"]) or {}).get("username", "")) for o in self.d["orders"][-150:]][::-1],
+                "stats": {"today": sales(day0), "month": sales(now - 30 * 86400), "orders_today": sum(1 for o in done if o.get("done_at", o["at"]) >= day0),
+                          "review": sum(1 for o in self.d["orders"] if o["status"] == "review"), "customers": len(users),
+                          "buyers": len({o["uid"] for o in done}), "wallets": sum(u.get("wallet", 0) for u in users.values())},
+                "customers": sorted([{"id": k, "name": u.get("name", ""), "username": u.get("username", ""), "wallet": u.get("wallet", 0),
+                                      "subs": len(u.get("subs") or []), "joined": u.get("joined", 0),
+                                      "spent": sum(self.total(o) for o in done if o["uid"] == k)} for k, u in users.items()],
+                                    key=lambda c: -c["joined"])[:300]}
+
+    def receipt_media(self, oid):
+        o = self.order(oid)
+        if not o or not o.get("receipt"):
+            return None
+        try:
+            f = self.bot.call(o["net"], "getFile", {"file_id": o["receipt"]}, timeout=15)
+            base, token = self.bot.nets()[o["net"]]
+            with urllib.request.urlopen("%s/file/bot%s/%s" % (base, token, f["file_path"]), timeout=20) as r:
+                return r.read(5 * 1024 * 1024)
+        except (ValueError, OSError, KeyError):
+            return None
+
+
+def shop_action(app, act, body, done, fail):
+    sh = app.bot.shop
+    if act == "plan_save":
+        p = body.get("plan") or {}
+        name = str(p.get("name") or "").strip()[:40]
+        if not name:
+            return fail("یه اسم برای پلن بذار")
+        try:
+            gb, days, price = max(0.0, float(p.get("gb") or 0)), max(0, int(float(p.get("days") or 0))), max(0, int(float(str(p.get("price") or 0).replace(",", ""))))
+        except ValueError:
+            return fail("حجم، روز و قیمت باید عدد باشن")
+        kind = "traffic" if p.get("kind") == "traffic" else "service"
+        if kind == "traffic" and not gb:
+            return fail("حجم اضافه باید چند گیگ باشه")
+        with sh.lock:
+            cur = sh.plan(str(p.get("id") or ""))
+            if not cur:
+                cur = {"id": secrets.token_hex(3), "order": len(sh.d["plans"])}
+                sh.d["plans"].append(cur)
+            cur.update(name=name, kind=kind, gb=gb, days=0 if kind == "traffic" else days, price=price,
+                       devices=max(0, _int(p.get("devices"))), desc=str(p.get("desc") or "").strip()[:120], active=bool(p.get("active", True)))
+            if "order" in p:
+                cur["order"] = _int(p["order"])
+        sh.save()
+        return done("پلن ذخیره شد")
+    if act == "plan_delete":
+        with sh.lock:
+            sh.d["plans"] = [p for p in sh.d["plans"] if p.get("id") != str(body.get("id"))]
+        sh.save()
+        return done("پلن حذف شد")
+    if act == "code_save":
+        c = body.get("code") or {}
+        code = re.sub(r"[^A-Za-z0-9_-]", "", str(c.get("code") or "")).upper()[:24]
+        if len(code) < 3:
+            return fail("کد حداقل ۳ حرف انگلیسی یا عدد")
+        kind = "gift" if c.get("kind") == "gift" else "discount"
+        pct, amount = min(100, max(0, _int(c.get("pct")))), max(0, _int(str(c.get("amount") or 0).replace(",", "")))
+        if kind == "discount" and not (pct or amount) or kind == "gift" and not amount:
+            return fail("درصد یا مبلغ رو بنویس")
+        with sh.lock:
+            sh.d["codes"] = [x for x in sh.d["codes"] if x["code"] != code] + [{
+                "code": code, "kind": kind, "pct": pct if kind == "discount" else 0, "amount": 0 if kind == "discount" and pct else amount,
+                "max": max(0, _int(c.get("max"))), "exp": int(time.time() + _int(c.get("days")) * 86400) if _int(c.get("days")) else 0,
+                "used_by": next((x.get("used_by") for x in sh.d["codes"] if x["code"] == code), [])}]
+        sh.save()
+        return done("کد %s ذخیره شد" % code)
+    if act == "code_delete":
+        with sh.lock:
+            sh.d["codes"] = [x for x in sh.d["codes"] if x["code"] != str(body.get("code"))]
+        sh.save()
+        return done("کد حذف شد")
+    if act == "order":
+        oid, what = _int(body.get("id")), body.get("act")
+        o = sh.order(oid)
+        if not o:
+            return fail("سفارش پیدا نشد")
+        if what in ("approve", "reject"):
+            return done(sh.review(oid, what == "approve", who="پنل", reason=str(body.get("reason") or "")[:200]))
+        if what == "refund" and o["status"] in ("done", "rejected", "review") and o["kind"] != "topup":
+            with sh.lock:
+                u = sh.user(o["uid"])
+                u["wallet"] = u.get("wallet", 0) + sh.total(o)
+                o["status"] = "refunded"
+            sh.save()
+            sh.show(o["net"], o["chat"], "💰 مبلغ سفارش #%s (%s) به کیف پولت برگشت." % (fa_num(o["id"]), toman(sh.total(o))), [[("💰 کیف پول", "wallet")]])
+            return done("به کیف پول برگشت")
+        if what == "retry" and o["status"] == "failed":
+            with sh.lock:
+                u = sh.user(o["uid"])
+                if u.get("wallet", 0) < sh.total(o):
+                    return fail("مبلغش دیگه توی کیف پول نیست")
+                u["wallet"] -= sh.total(o)
+                o["status"] = "review"
+            return done("انجام شد" if sh.fulfil(o, by="پنل") else "باز هم نشد")
+        return fail("این کار برای این سفارش ممکن نیست")
+    if act == "wallet":
+        cid = str(body.get("id") or "")
+        if cid not in sh.d["users"]:
+            return fail("مشتری پیدا نشد")
+        delta = _int(str(body.get("delta") or 0).replace(",", ""))
+        with sh.lock:
+            u = sh.d["users"][cid]
+            u["wallet"] = max(0, u.get("wallet", 0) + delta)
+        sh.save()
+        if delta and body.get("notify", True):
+            net, chat = cid.split(":", 1)
+            sh.show(net, chat, "💰 کیف پولت %s%s شد.\nموجودی: %s" % (toman(abs(delta)), " شارژ" if delta > 0 else " کم", toman(u["wallet"])), [[("🏠 منو", "m")]])
+        return done("موجودی: %s" % toman(u["wallet"]))
+    if act == "receipt":
+        data = sh.receipt_media(_int(body.get("id")))
+        if not data:
+            return fail("عکس رسید خونده نشد")
+        return done("", img=base64.b64encode(data).decode())
+    return fail("نامعتبر")
+
+
+def _fmt_num(x):
+    x = float(x or 0)
+    return str(int(x)) if x == int(x) else ("%.1f" % x)
 
 
 def backup_loop(app):

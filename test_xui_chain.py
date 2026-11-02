@@ -1511,7 +1511,7 @@ class Telegram(BaseHTTPRequestHandler):
 
 class BotAPI(BaseHTTPRequestHandler):
     """A stand-in Bot API: records what is sent, answers getMe and getUpdates."""
-    sent, updates, blocked = [], [], set()
+    sent, updates, blocked, other, outside = [], [], set(), [], False
 
     def log_message(self, *a):
         pass
@@ -1523,12 +1523,15 @@ class BotAPI(BaseHTTPRequestHandler):
             res = {"username": "ez_test_bot"}
         elif method == "getUpdates":
             res, BotAPI.updates = list(BotAPI.updates), []
-        elif method == "sendMessage":
+        elif method in ("sendMessage", "editMessageText", "sendPhoto", "sendDocument"):
             if str(body.get("chat_id")) in BotAPI.blocked:
                 return self.answer(403, {"ok": False, "description": "Forbidden: bot was blocked by the user"})
-            BotAPI.sent.append(body)
+            BotAPI.sent.append(dict(body, method=method))
             res = {"message_id": len(BotAPI.sent)}
+        elif method == "getChatMember":
+            res = {"status": "left" if BotAPI.outside else "member"}
         else:
+            BotAPI.other.append((method, body))
             res = True
         self.answer(200, {"ok": True, "result": res})
 
@@ -1540,7 +1543,7 @@ class BotAPI(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
 
-class BotTests(unittest.TestCase):
+class BotBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.api = start(ThreadingHTTPServer(("127.0.0.1", 0), BotAPI))
@@ -1583,6 +1586,8 @@ class BotTests(unittest.TestCase):
         self.bot.handle("tg", {"chat": {"id": chat}, "from": {"first_name": name}, "text": text})
         return BotAPI.sent[-1]["text"] if BotAPI.sent else ""
 
+
+class BotTests(BotBase):
     def test_admin_pairing_and_commands(self):
         self.assertIn("/status", self.say(100, "/status") + "/status")  # a stranger gets the welcome, not the status
         self.assertNotIn("کاربر فعال", self.say(100, "/status"))
@@ -1649,6 +1654,163 @@ class BotTests(unittest.TestCase):
         self.bot.retry()
         self.assertEqual(self.bot.st["queue"], [])
         self.assertEqual(BotAPI.sent[-1]["text"], "hello")
+
+
+class FakeShopPanel:
+    """What the shop asks of the users' panel."""
+    def __init__(self):
+        self.added, self.updated, self.reset, self.fail = [], [], [], False
+
+    def add_client(self, name, gb, days, devices, first_use, inbound_ids):
+        if self.fail:
+            raise xc.PanelError("panel down")
+        self.added.append((name, gb, days, devices, inbound_ids))
+        return "newsub%04d" % len(self.added)
+
+    def update_user(self, sub, emails, changes):
+        self.updated.append((sub, emails, changes))
+
+    def reset_user(self, sub, emails):
+        self.reset.append(sub)
+
+    def configured(self):
+        return False
+
+    def nodes(self):
+        return []
+
+    def overview(self, *a, **k):
+        return {"inbounds": [{"id": 1, "protocol": "shadowsocks", "enable": True}, {"id": 5, "protocol": "mtproto", "enable": True}]}
+
+
+class ShopTests(BotBase):
+    def setUp(self):
+        super().setUp()
+        BotAPI.other, BotAPI.outside = [], False
+        cfg = xc.load_config()
+        cfg.update(shop_enable=True, shop_cards="6037-1111-2222-3333 | Ali Test | Melli", shop_trial="1,1", shop_ref="10",
+                   shop_topups="100000,200000")
+        xc.save_config(cfg)
+        try:
+            os.remove(xc.shop_path())
+        except OSError:
+            pass
+        self.app.reload()
+        self.shop = self.bot.shop = xc.Shop(self.bot)
+        self.panel = FakeShopPanel()
+        self.app.xui_panel = self.panel
+        self.shop.d["plans"] = [{"id": "p30", "name": "30GB", "kind": "service", "gb": 30, "days": 30, "price": 150000, "active": True},
+                                {"id": "t10", "name": "+10GB", "kind": "traffic", "gb": 10, "days": 0, "price": 40000, "active": True}]
+        self.bot.st["admins"]["tg:100"] = {"name": "boss", "events": "all"}
+
+    def tearDown(self):
+        super().tearDown()
+        try:
+            os.remove(xc.shop_path())
+        except OSError:
+            pass
+
+    def tap(self, user, data, chat=None):
+        BotAPI.sent = []
+        self.shop.on_callback("tg", {"id": "q", "data": data, "from": {"id": user, "first_name": "U%d" % user},
+                                     "message": {"chat": {"id": chat or user}, "message_id": 7}})
+        return BotAPI.sent[-1]["text"] if BotAPI.sent else ""
+
+    def photo(self, user):
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": user, "type": "private"}, "from": {"id": user}, "photo": [{"file_id": "F1"}]})
+
+    def test_menu_and_buy_by_card(self):
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 500, "type": "private"}, "from": {"id": 500, "first_name": "Reza"}, "text": "/start"})
+        menu = BotAPI.sent[-1]
+        self.assertIn("خوش اومدی", menu["text"])
+        datas = [b["callback_data"] for row in menu["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
+        self.assertIn("buy", datas)
+        self.assertIn("trial", datas)
+        self.assertIn("30GB", self.tap(500, "buy"))
+        inv = self.tap(500, "bp:p30")
+        self.assertIn("۱۵۰٬۰۰۰ تومان", inv)
+        oid = self.shop.d["orders"][-1]["id"]
+        self.assertIn("6037-1111-2222-3333", self.tap(500, "pc:%d" % oid))
+        self.photo(500)
+        o = self.shop.order(oid)
+        self.assertEqual(o["status"], "review")
+        to_admin = [m for m in BotAPI.sent if m["method"] == "sendPhoto"]
+        self.assertEqual(to_admin[0]["chat_id"], "100")
+        self.assertIn("ok:%d" % oid, json.dumps(to_admin[0]["reply_markup"]))
+        self.tap(600, "ok:%d" % oid, chat=600)  # not an admin chat
+        self.assertEqual(o["status"], "review")
+        self.tap(100, "ok:%d" % oid, chat=100)
+        self.assertEqual(o["status"], "done")
+        self.assertEqual(self.panel.added[0][:3], ("tg500", 30, 30))
+        self.assertEqual(self.panel.added[0][4], [1])  # every customer protocol, no mtproto
+        self.assertEqual(self.bot.st["customers"]["tg:500"]["sub"], o["sub"])
+        self.assertIn(o["sub"], [m["text"] for m in BotAPI.sent if m["chat_id"] == "500"][-1])
+        self.assertTrue(any(m[0] == "editMessageReplyMarkup" for m in BotAPI.other))
+        self.assertIn("قبلاً", self.shop.review(oid, True))  # no second fulfilment
+
+    def test_wallet_codes_trial_and_referral(self):
+        self.shop.user("tg:700")["wallet"] = 0
+        self.bot.handle("tg", {"chat": {"id": 701, "type": "private"}, "from": {"id": 701}, "text": "/start r_700"})
+        self.assertEqual(self.shop.user("tg:701")["ref"], "tg:700")
+        self.tap(701, "tu:100000")
+        top = self.shop.d["orders"][-1]
+        self.tap(701, "pc:%d" % top["id"])
+        self.photo(701)
+        self.shop.review(top["id"], True)
+        self.assertEqual(self.shop.user("tg:701")["wallet"], 100000)
+        self.shop.d["codes"] = [{"code": "OFF20", "kind": "discount", "pct": 20, "amount": 0, "max": 0, "exp": 0},
+                                {"code": "GIFT", "kind": "gift", "pct": 0, "amount": 50000, "max": 1, "exp": 0}]
+        self.tap(701, "bp:p30")
+        o = self.shop.d["orders"][-1]
+        self.tap(701, "dc:%d" % o["id"])
+        self.bot.handle("tg", {"chat": {"id": 701, "type": "private"}, "from": {"id": 701}, "text": "off20"})
+        self.assertEqual(self.shop.total(o), 120000)
+        self.assertIn("کیف پول", self.tap(701, "pw:%d" % o["id"]))  # 100k is not enough for 120k
+        self.tap(701, "gift")
+        self.bot.handle("tg", {"chat": {"id": 701, "type": "private"}, "from": {"id": 701}, "text": "GIFT"})
+        self.assertEqual(self.shop.user("tg:701")["wallet"], 150000)
+        self.tap(701, "pw:%d" % o["id"])
+        self.assertEqual(o["status"], "done")
+        self.assertEqual(self.shop.user("tg:701")["wallet"], 30000)
+        self.assertEqual(self.shop.user("tg:700")["wallet"], 12000)  # 10% of the first purchase
+        self.tap(702, "gift")
+        self.bot.handle("tg", {"chat": {"id": 702, "type": "private"}, "from": {"id": 702}, "text": "GIFT"})
+        self.assertEqual(self.shop.user("tg:702")["wallet"], 0)  # used up
+        self.tap(701, "trial")
+        self.tap(701, "trial")
+        self.assertEqual(sum(1 for a in self.panel.added if a[0].endswith("_t")), 1)
+
+    def test_renew_traffic_and_failed_panel(self):
+        u = self.shop.user("tg:800")
+        u["wallet"], u["subs"] = 500000, ["sarasub12345"]
+        self.assertIn("sara", json.dumps(self.tap(800, "svc"), ensure_ascii=False) + json.dumps(BotAPI.sent, ensure_ascii=False))
+        self.tap(800, "rp:sarasub12345:p30")
+        o = self.shop.d["orders"][-1]
+        self.tap(800, "pw:%d" % o["id"])
+        self.assertEqual(o["status"], "done")
+        sub, emails, ch = self.panel.updated[-1]
+        self.assertEqual((sub, emails, ch["totalGB"]), ("sarasub12345", ["sara"], 30 * GB))
+        self.assertGreater(ch["expiryTime"], (time.time() + 32 * 86400) * 1000)  # added to the 2.5 days left
+        self.assertEqual(self.panel.reset, ["sarasub12345"])
+        self.tap(800, "tp:sarasub12345:t10")
+        o2 = self.shop.d["orders"][-1]
+        self.tap(800, "pw:%d" % o2["id"])
+        self.assertEqual(self.panel.updated[-1][2]["totalGB"], 20 * GB)
+        self.assertEqual(self.tap(800, "rp:omidsub12345:p30").count("مال تو نیست"), 1)
+        self.panel.fail = True
+        self.tap(800, "bp:p30")
+        o3 = self.shop.d["orders"][-1]
+        self.tap(800, "pw:%d" % o3["id"])
+        self.assertEqual(o3["status"], "failed")
+        self.assertEqual(u["wallet"], 500000 - 150000 - 40000)  # the failed one came back
+        BotAPI.outside = True
+        cfg = xc.load_config()
+        cfg["shop_channel"] = "@chan"
+        xc.save_config(cfg)
+        self.app.reload()
+        self.assertIn("عضو", self.tap(800, "buy"))
 
 
 class MonitorTests(unittest.TestCase):
