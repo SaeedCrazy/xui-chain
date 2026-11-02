@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.9.1"
+VERSION = "5.9.2"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -2735,6 +2735,8 @@ class PanelAPI:
                 c = {k: v for k, v in rec.items() if k not in ("id", "uuid", "createdAt", "updatedAt")}
                 if rec.get("uuid"):
                     c["id"] = rec["uuid"]
+                if isinstance(c.get("allowedIPs"), str):  # read back as text, written as a list (3x-ui 3.11)
+                    c["allowedIPs"] = [x.strip() for x in c["allowedIPs"].split(",") if x.strip()]
                 c.update(changes)
                 status, j = self.call("POST", "/panel/api/clients/update/" + q(email), body=c)
                 self._ok(status, j, "ویرایش کاربر")

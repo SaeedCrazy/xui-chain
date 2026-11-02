@@ -1628,7 +1628,7 @@ class FakeXUI(BaseHTTPRequestHandler):
     nodes = []
     OLD = {"id": 7, "uuid": "11111111-1111-1111-1111-111111111111", "email": "old", "subId": "oldsub",
            "flow": "xtls-rprx-vision", "totalGB": 10 * GB, "expiryTime": 0, "enable": True, "limitIp": 1,
-           "limitHwid": 2, "comment": "", "createdAt": 1, "updatedAt": 2}
+           "limitHwid": 2, "comment": "", "createdAt": 1, "updatedAt": 2, "allowedIPs": "10.0.0.2/32"}
 
     def log_message(self, *a):
         pass
@@ -1790,6 +1790,7 @@ class PanelTests(unittest.TestCase):
         self.assertEqual((sent["id"], sent["totalGB"], sent["limitHwid"], sent["flow"]),
                          (FakeXUI.OLD["uuid"], 50 * GB, 2, "xtls-rprx-vision"))
         self.assertNotIn("uuid", sent)
+        self.assertEqual(sent["allowedIPs"], ["10.0.0.2/32"])  # text in the read, a list in the write
         api.reset_user("oldsub", ["old"])
         api.delete_user("oldsub", ["old"])
         self.assertEqual([c[0] for c in FakeXUI.calls[1:]], ["clients/resetTraffic/old", "clients/del/old"])
