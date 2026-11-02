@@ -104,7 +104,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/saeedcrazy/xui-chain/main/inst
 | اپ | فرمت |
 |---|---|
 | FlClash (اندروید، ویندوز، مک)، Clash Verge Rev، Clash Mi (آیفون) | Clash Meta، اولویت‌بندی دقیق |
-| v2rayNG، Streisand، V2Box، Happ | Xray JSON، سریع‌ترین مسیر سالم انتخاب می‌شه |
+| **Happ (پیشنهادی، اندروید و آیفون)**، v2rayNG، Streisand، V2Box | Xray JSON، سریع‌ترین مسیر سالم انتخاب می‌شه |
 | Hiddify، Karing، sing-box | Clash Meta |
 | NPV Tunnel، Shadowrocket و بقیه‌ی اپ‌ها | لیست لینک (base64)، بدون مسیرهای زنجیره‌ای (Deco) |
 

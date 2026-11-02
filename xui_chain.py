@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.8.1"
+VERSION = "5.8.2"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -7196,12 +7196,13 @@ function copy(t){const ok=()=>toast("کپی شد ✓");if(navigator.clipboard&&w
 
 const enc=encodeURIComponent;
 const APPS={
- android:[["v2rayNG","ساده و محبوب",u=>`v2rayng://install-sub?url=${enc(u)}&name=${enc(D.title)}`,"https://github.com/2dust/v2rayNG/releases/latest"],
+ android:[["Happ","پیشنهادی: همه‌ی مسیرها و Auto",u=>`happ://add/${u}`,"https://play.google.com/store/search?q=Happ%20Proxy&c=apps"],
+          ["v2rayNG","ساده و محبوب",u=>`v2rayng://install-sub?url=${enc(u)}&name=${enc(D.title)}`,"https://github.com/2dust/v2rayNG/releases/latest"],
           ["FlClash","اولویت‌بندی دقیق مسیرها",u=>`clash://install-config?url=${enc(u)}&name=${enc(D.title)}`,"https://github.com/chen08209/FlClash/releases/latest"],
           ["NPV Tunnel","لینک رو کپی کن و توی اپ به‌عنوان Subscription اضافه کن",null,"https://play.google.com/store/search?q=NPV%20Tunnel&c=apps"]],
- ios:[["Streisand","رایگان، از App Store",u=>`streisand://import/${u}#${enc(D.title)}`,"itms-apps://search.itunes.apple.com/WebObjects/MZSearch.woa/wa/search?media=software&term=Streisand"],
-      ["V2Box","رایگان، از App Store",u=>`v2box://install-sub?url=${enc(u)}&name=${enc(D.title)}`,"itms-apps://search.itunes.apple.com/WebObjects/MZSearch.woa/wa/search?media=software&term=V2Box"],
-      ["Happ","رایگان، از App Store",u=>`happ://add/${u}`,"itms-apps://search.itunes.apple.com/WebObjects/MZSearch.woa/wa/search?media=software&term=Happ%20Proxy"]],
+ ios:[["Happ","پیشنهادی، رایگان از App Store",u=>`happ://add/${u}`,"itms-apps://search.itunes.apple.com/WebObjects/MZSearch.woa/wa/search?media=software&term=Happ%20Proxy"],
+      ["Streisand","رایگان، از App Store",u=>`streisand://import/${u}#${enc(D.title)}`,"itms-apps://search.itunes.apple.com/WebObjects/MZSearch.woa/wa/search?media=software&term=Streisand"],
+      ["V2Box","رایگان، از App Store",u=>`v2box://install-sub?url=${enc(u)}&name=${enc(D.title)}`,"itms-apps://search.itunes.apple.com/WebObjects/MZSearch.woa/wa/search?media=software&term=V2Box"]],
  desktop:[["Clash Verge Rev","ویندوز و مک",u=>`clash://install-config?url=${enc(u)}&name=${enc(D.title)}`,"https://github.com/clash-verge-rev/clash-verge-rev/releases/latest"],
           ["FlClash","ویندوز، مک و لینوکس",u=>`clash://install-config?url=${enc(u)}&name=${enc(D.title)}`,"https://github.com/chen08209/FlClash/releases/latest"],
           ["v2rayN","ویندوز",null,"https://github.com/2dust/v2rayN/releases/latest"]]
@@ -7257,7 +7258,7 @@ function render(){
   <div class="card"><details id="cfgs"><summary><span style="display:flex;gap:8px;align-items:center">${ic("link")} کانفیگ‌ها</span></summary>
    <p class="small">هر کانفیگ رو جدا کپی کن یا QR بگیر. مسیرهای زنجیره‌ای فقط با لینک اشتراک میان.</p><div id="cfglist"></div></details></div>
   <div class="card"><h2>${ic("help")} راهنما</h2>
-   <details open><summary>چطور وصل شم؟</summary><ol><li>یکی از اپ‌های بالا رو نصب کن.</li><li>دکمه‌ی «افزودن» رو بزن؛ اگه باز نشد، لینک رو کپی کن و در اپ به‌عنوان Subscription اضافه کن.</li><li>گزینه‌ی <b>⚡ Auto</b> رو انتخاب کن و وصل شو.</li></ol></details>
+   <details open><summary>چطور وصل شم؟</summary><ol><li>اپ <b>Happ</b> (یا یکی دیگه از اپ‌های بالا) رو نصب کن.</li><li>دکمه‌ی «افزودن» رو بزن؛ اگه باز نشد، لینک رو کپی کن و در اپ به‌عنوان Subscription اضافه کن.</li><li>گزینه‌ی <b>⚡ Auto</b> رو انتخاب کن و وصل شو.</li></ol></details>
    <details><summary>وصل نمی‌شه؟</summary><ol><li>توی اپ، اشتراک رو آپدیت کن (Update subscription).</li><li>گزینه‌ی Auto یا یکی دیگه از کانفیگ‌ها رو امتحان کن.</li><li>اگه حجم یا زمانت تموم شده، برای تمدید پیام بده.</li></ol></details>
    <details><summary>تمدید کنم چی می‌شه؟</summary><p>لینکت عوض نمی‌شه. بعد از تمدید فقط اشتراک رو توی اپ آپدیت کن.</p></details>
    ${D.support?`<a class="btn block" style="margin-top:10px" href="${esc(D.support)}" target="_blank" rel="noopener">${ic("chat")} پشتیبانی و تمدید</a>`:""}</div>
