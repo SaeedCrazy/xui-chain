@@ -7151,6 +7151,10 @@ summary{cursor:pointer;font-weight:700;list-style:none;display:flex;justify-cont
 summary::after{content:"+";color:var(--mut);font-size:18px}details[open] summary::after{content:"−"}
 details p,details ol{margin:8px 0 0;color:var(--mut);font-size:13.5px}details ol{padding-inline-start:18px}
 .announce{background:linear-gradient(135deg,var(--warnbg),transparent);border-color:color-mix(in srgb,var(--warn) 40%,var(--line))}
+.cfg{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px dashed var(--line)}.cfg:last-child{border:0}
+.cfg .n{flex:1;min-width:0}.cfg .n b{display:block;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tag{display:inline-block;direction:ltr;font-size:11px;padding:1px 8px;border-radius:99px;background:var(--accbg);color:var(--acc)}
+.cfg .ibtn{width:34px;height:34px;border-radius:10px}.cfg .ibtn .i{width:17px;height:17px}
 .foot{text-align:center;color:var(--mut);font-size:12px;margin-top:18px}
 .skel{height:120px;border-radius:20px;background:linear-gradient(90deg,var(--card),var(--card2),var(--card));background-size:200% 100%;animation:sk 1.2s infinite;margin:12px 0}
 @keyframes sk{to{background-position:-200% 0}}
@@ -7193,7 +7197,8 @@ function copy(t){const ok=()=>toast("کپی شد ✓");if(navigator.clipboard&&w
 const enc=encodeURIComponent;
 const APPS={
  android:[["v2rayNG","ساده و محبوب",u=>`v2rayng://install-sub?url=${enc(u)}&name=${enc(D.title)}`,"https://github.com/2dust/v2rayNG/releases/latest"],
-          ["FlClash","اولویت‌بندی دقیق مسیرها",u=>`clash://install-config?url=${enc(u)}&name=${enc(D.title)}`,"https://github.com/chen08209/FlClash/releases/latest"]],
+          ["FlClash","اولویت‌بندی دقیق مسیرها",u=>`clash://install-config?url=${enc(u)}&name=${enc(D.title)}`,"https://github.com/chen08209/FlClash/releases/latest"],
+          ["NPV Tunnel","لینک رو کپی کن و توی اپ به‌عنوان Subscription اضافه کن",null,"https://play.google.com/store/search?q=NPV%20Tunnel&c=apps"]],
  ios:[["Streisand","رایگان، از App Store",u=>`streisand://import/${u}#${enc(D.title)}`,"itms-apps://search.itunes.apple.com/WebObjects/MZSearch.woa/wa/search?media=software&term=Streisand"],
       ["V2Box","رایگان، از App Store",u=>`v2box://install-sub?url=${enc(u)}&name=${enc(D.title)}`,"itms-apps://search.itunes.apple.com/WebObjects/MZSearch.woa/wa/search?media=software&term=V2Box"],
       ["Happ","رایگان، از App Store",u=>`happ://add/${u}`,"itms-apps://search.itunes.apple.com/WebObjects/MZSearch.woa/wa/search?media=software&term=Happ%20Proxy"]],
@@ -7249,6 +7254,8 @@ function render(){
   <div class="card"><h2>${ic("globe")} لوکیشن‌ها</h2>
    <div class="chips">${D.locations.map(l=>`<span class="chip">${esc(l)}</span>`).join("")}</div>
    ${D.decos?`<div class="note" style="margin-top:12px">${ic("shield")}<div class="mut">${fa(D.decos)} مسیر پشتیبان هم داری. اگه یه مسیر بسته بشه، با گزینه‌ی <b>⚡ Auto</b> اپ خودش می‌ره روی بعدی.</div></div>`:""}</div>
+  <div class="card"><details id="cfgs"><summary><span style="display:flex;gap:8px;align-items:center">${ic("link")} کانفیگ‌ها</span></summary>
+   <p class="small">هر کانفیگ رو جدا کپی کن یا QR بگیر. مسیرهای زنجیره‌ای فقط با لینک اشتراک میان.</p><div id="cfglist"></div></details></div>
   <div class="card"><h2>${ic("help")} راهنما</h2>
    <details open><summary>چطور وصل شم؟</summary><ol><li>یکی از اپ‌های بالا رو نصب کن.</li><li>دکمه‌ی «افزودن» رو بزن؛ اگه باز نشد، لینک رو کپی کن و در اپ به‌عنوان Subscription اضافه کن.</li><li>گزینه‌ی <b>⚡ Auto</b> رو انتخاب کن و وصل شو.</li></ol></details>
    <details><summary>وصل نمی‌شه؟</summary><ol><li>توی اپ، اشتراک رو آپدیت کن (Update subscription).</li><li>گزینه‌ی Auto یا یکی دیگه از کانفیگ‌ها رو امتحان کن.</li><li>اگه حجم یا زمانت تموم شده، برای تمدید پیام بده.</li></ol></details>
@@ -7261,6 +7268,7 @@ function render(){
   $("#cp").onclick=()=>copy(LINK);
   $("#qrb").onclick=()=>{const b=$("#qrbox");if(b.innerHTML){b.innerHTML="";return}b.innerHTML='<div class="qr" id="qr"></div>';
     if(window.QRCode)new QRCode($("#qr"),{text:LINK,width:220,height:220,correctLevel:QRCode.CorrectLevel.M});else $("#qr").textContent="QR بارگذاری نشد"};
+  $("#cfgs").ontoggle=()=>{if($("#cfgs").open&&!$("#cfglist").dataset.ok)loadConfigs()};
   document.querySelectorAll("[data-r]").forEach(b=>b.onclick=()=>{range=+b.dataset.r;document.querySelectorAll("[data-r]").forEach(x=>x.classList.toggle("on",x===b));renderChart()});
   document.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{platform=b.dataset.p;document.querySelectorAll("[data-p]").forEach(x=>x.classList.toggle("on",x===b));renderApps()});
 }
@@ -7281,6 +7289,26 @@ function renderChart(){
   tip(h.length-1);
   el.querySelectorAll(".b").forEach(b=>b.onclick=()=>{el.querySelectorAll(".b").forEach(x=>x.classList.toggle("sel",x===b));tip(+b.dataset.i)});
   el.insertAdjacentHTML("beforeend",`<div class="tip"><span>مجموع ${fa(range)} روز اخیر</span><b>${size(total)}</b></div><div class="tip" style="margin-top:2px"><span>میانگین روزانه</span><b>${size(total/range)}</b></div>`);
+}
+function cfgName(l){
+  try{if(l.startsWith("vmess://"))return JSON.parse(decodeURIComponent(escape(atob(l.slice(8).split("#")[0])))).ps||"vmess"}catch(e){}
+  const h=l.lastIndexOf("#");if(h<0)return l.split("://")[0];try{return decodeURIComponent(l.slice(h+1))}catch(e){return l.slice(h+1)}
+}
+async function loadConfigs(){
+  const el=$("#cfglist");el.innerHTML='<div class="skel" style="height:60px"></div>';
+  try{
+    const r=await fetch(location.pathname+"?format=plain",{cache:"no-store"});if(!r.ok)throw 0;
+    const L=(await r.text()).split("\n").map(x=>x.trim()).filter(x=>x.includes("://"));
+    if(!L.length){el.innerHTML='<div class="empty">کانفیگ تکی‌ای نیست؛ از لینک اشتراک استفاده کن.</div>';return}
+    el.dataset.ok=1;
+    el.innerHTML=L.map((l,i)=>`<div class="cfg"><div class="n"><b class="ltr" style="text-align:right">${esc(cfgName(l))}</b><span class="tag">${esc(l.split("://")[0])}</span></div>
+     <button class="ibtn" data-cq="${i}" aria-label="QR">${ic("qr")}</button><button class="ibtn" data-cc="${i}" aria-label="کپی">${ic("copy")}</button></div><div id="cq${i}"></div>`).join("")
+     +`<button class="btn ghost block sm" id="cpall" style="margin-top:10px">${ic("copy")} کپی همه</button>`;
+    el.querySelectorAll("[data-cc]").forEach(b=>b.onclick=()=>copy(L[+b.dataset.cc]));
+    el.querySelectorAll("[data-cq]").forEach(b=>b.onclick=()=>{const i=+b.dataset.cq,box=$("#cq"+i);if(box.innerHTML){box.innerHTML="";return}
+      box.innerHTML=`<div class="qr" id="qq${i}"></div>`;if(window.QRCode)new QRCode($("#qq"+i),{text:L[i],width:220,height:220,correctLevel:QRCode.CorrectLevel.L});else $("#qq"+i).textContent="QR بارگذاری نشد"});
+    $("#cpall").onclick=()=>copy(L.join("\n"));
+  }catch(e){el.innerHTML=`<div class="empty">کانفیگ‌ها خونده نشدن. <button class="btn sm" onclick="loadConfigs()">تلاش دوباره</button></div>`}
 }
 async function load(){
   try{const r=await fetch(location.pathname+"?format=info",{cache:"no-store"});if(!r.ok)throw 0;D=await r.json();render()}
