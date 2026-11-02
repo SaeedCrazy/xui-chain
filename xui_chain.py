@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.8.4"
+VERSION = "5.9.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -93,7 +93,11 @@ DEFAULTS = {
     "routes_custom": [],       # extra routes: [{id, entry: "deco:<key>", via: "deco:<key>"|"", exit: "main"|"x:<addr>"|"self"}]
                                # routes_cfg (saved on first change): per route key -> name, show, auto, price, unit,
                                #   quota_gb, bill_day, count, order
-    "order_mode": "manual",    # priority of the entries: "manual" order, or cheapest first ("price")
+    "order_mode": "manual",    # priority of the entries: "manual" order, cheapest first ("price") or by entry ("entry")
+    "deco_hidden": [],         # Deco configs (node keys) the admin deleted from a subscription; restorable
+    "deco_seen": {},           # node key -> unix time it first showed up (0 = came with its subscription)
+    "entries_order": [],       # entry ids in priority order: "direct", "srv:<id>", "sub:<gid>", "lnk:<node key>"
+    "entries_meta": {},        # entry id -> {"price", "unit"}: the default price of every route through it
     "skip_down": True,         # leave an entry out of the subscription while its tunnel / Deco is down
     "skip_exhausted": True,    # ... and while its volume quota is used up
     "info_config": True,       # first entry of every subscription: the user's name, volume left and days left
@@ -896,6 +900,29 @@ def route_settings(cfg, key, default_name, show=True, auto=True, price=None):
             "count": st.get("count") or "both", "order": st.get("order")}
 
 
+ORDER_MODES = ("manual", "price", "entry")
+
+
+def order_mode_of(value):
+    return value if value in ORDER_MODES else "manual"
+
+
+def entry_id(r):
+    """Which entry a route starts at: the direct entry, an Iran server, a Deco subscription or a lone Deco link."""
+    if r["kind"] == "direct":
+        return "direct"
+    if r["kind"] == "tunnel":
+        return "srv:%s" % r.get("server_id")
+    if r.get("group"):
+        return "sub:%s" % r["group"]
+    return "lnk:%s" % r["entry"].get("key", "")
+
+
+def entry_rank(cfg, eid):
+    order = cfg.get("entries_order") or []
+    return order.index(eid) if eid in order else None
+
+
 def route_cost(r):
     """Toman per GB for sorting by price; None when unknown."""
     price = r.get("price")
@@ -1044,15 +1071,25 @@ def routes(cfg, ups, usage=None, statuses=None, deco_down=None, nodes=None):
                 exit_id=exit_["id"], custom=c, group=sub_gid(n["src"]) if n.get("src") else None)
         r["down"] = bool(deco_down.get(node_key(n))) or (via is not None and bool(deco_down.get(node_key(via[1]))))
 
+    meta = cfg.get("entries_meta") or {}
     for r in out:
         if r["quota_gb"] and r["used"] is not None:
             r["remaining"] = max(0, r["quota_gb"] * GB_BYTES - r["used"])
             r["exhausted"] = r["remaining"] <= 0
+        r["entry_id"] = entry_id(r)
+        rank = entry_rank(cfg, r["entry_id"])
+        r["entry_rank"] = rank if rank is not None else 10 ** 6 + r["default_order"]
+        em = meta.get(r["entry_id"]) or {}
+        if r["price"] in (None, "") and em.get("price") not in (None, ""):
+            r["price"], r["unit"], r["price_from_entry"] = em["price"], em.get("unit") or "month", True
         r["cost"] = route_cost(r)
         r["skip"] = (r["kind"] != "direct") and ((r["down"] and cfg.get("skip_down", True)) or
                                                  (r["exhausted"] and cfg.get("skip_exhausted", True)))
-    if (cfg.get("order_mode") or "manual") == "price":
+    mode = order_mode_of(cfg.get("order_mode"))
+    if mode == "price":
         out.sort(key=lambda r: (r["cost"] is None, r["cost"] or 0, r["default_order"]))
+    elif mode == "entry":
+        out.sort(key=lambda r: (r["entry_rank"], r["order"] if r["order"] is not None else r["default_order"], r["default_order"]))
     else:
         out.sort(key=lambda r: (r["order"] if r["order"] is not None else r["default_order"], r["default_order"]))
     return out
@@ -1104,7 +1141,7 @@ def routes_public(rts, pings=None):
     """Routes for the admin page (no node or tunnel objects)."""
     keep = ("key", "kind", "idx", "name", "show", "auto", "price", "unit", "quota_gb", "bill_day", "count", "order",
             "used", "remaining", "down", "exhausted", "skip", "cost", "quota_from_sub", "server_id", "exit_id", "note", "group",
-            "auto_name", "default_order")
+            "auto_name", "default_order", "entry_id", "entry_rank", "price_from_entry")
     out = []
     for r in rts:
         d = {k: r.get(k) for k in keep}
@@ -1204,8 +1241,11 @@ def apply_view(rts, view):
             out.append(dict(r, view_order=10 ** 6 + r["default_order"]))
         else:
             out.append(dict(r, show=False, auto=False, view_order=10 ** 7 + r["default_order"]))
-    if (view.get("order_mode") or "manual") == "price":
+    mode = order_mode_of(view.get("order_mode"))
+    if mode == "price":
         out.sort(key=lambda r: (not (r["show"] or r["auto"]), r["cost"] is None, r["cost"] or 0, r["view_order"]))
+    elif mode == "entry":
+        out.sort(key=lambda r: (not (r["show"] or r["auto"]), r.get("entry_rank", 0), r["view_order"]))
     else:
         out.sort(key=lambda r: r["view_order"])
     return out
@@ -1815,6 +1855,7 @@ class Upstreams:
         self.cache = {}
         self.info = {}
         self.titles = {}  # subscription URL -> its own profile title, when it sends one
+        self.hidden = set()  # node keys the admin deleted; left out of every route
         self.lock = threading.Lock()
 
     def _fetch_sub(self, url):
@@ -1867,7 +1908,12 @@ class Upstreams:
                 out.extend(found)
             else:
                 out.extend(parse_nodes([line], errors, skip_loopback=True))
-        return out
+        return [n for n in out if node_key(n) not in self.hidden] if self.hidden else out
+
+    def forget(self, url):
+        """Drop one subscription from the cache, so the next read fetches it again."""
+        with self.lock:
+            self.cache.pop(url, None)
 
 
 def profile_title(value):
@@ -4474,9 +4520,16 @@ def link_base(rt, host):
     return "%s://%s/%s/" % (scheme, authority, rt["sub_path"])
 
 
+NEW_DAYS = 3  # a Deco config that showed up in a subscription is marked new this long
+
+
 def deco_lines(app):
-    """The Deco list line by line, with the Deco numbers, last test and volume of each."""
+    """The Deco list line by line, with the Deco numbers, last test and volume of each. Deleted
+    configs stay listed (hidden) so they can come back; ones a subscription added lately are new."""
     results = {node_key(it["node"]): it["result"] for it in app.monitor.results}
+    hidden = set(app.cfg.get("deco_hidden") or [])
+    seen = dict(app.cfg.get("deco_seen") or {})
+    changed, now = False, int(time.time())
     out, n = [], 0
     for line in UPSTREAMS.lines():
         is_sub = line.lower().startswith(("http://", "https://"))
@@ -4489,14 +4542,51 @@ def deco_lines(app):
         else:
             nodes = parse_nodes([line], errors, skip_loopback=True)
         items = []
+        mark = "@" + (sub_gid(line) if is_sub else line[:200])
+        first = mark not in seen  # a line seen for the first time: its configs came with it
+        if first:
+            seen[mark], changed = 0, True
         for node in nodes:
-            n += 1
-            items.append({"n": n, "name": node["name"], "proto": node["proto"], "server": node["server"],
-                          "port": node["port"], "status": results.get(node_key(node)), "key": node_key(node)})
+            key = node_key(node)
+            if key not in seen:
+                seen[key], changed = 0 if first else now, True
+            off = key in hidden
+            if not off:
+                n += 1
+            items.append({"n": 0 if off else n, "name": node["name"], "proto": node["proto"], "server": node["server"],
+                          "port": node["port"], "status": results.get(key), "key": key, "hidden": off,
+                          "new": bool(seen[key]) and now - seen[key] < NEW_DAYS * 86400})
         title = (UPSTREAMS.titles.get(line) or urllib.parse.urlsplit(line).hostname) if is_sub else (nodes[0]["name"] if nodes else line[:40])
         out.append({"line": line, "kind": "sub" if is_sub else "link", "title": title or line[:40], "nodes": items,
                     "gid": sub_gid(line) if is_sub else "",
+                    "eid": "sub:" + sub_gid(line) if is_sub else ("lnk:" + node_key(nodes[0]) if nodes else ""),
                     "error": "؛ ".join(e for e in errors), "quota": UPSTREAMS.info.get(line) if is_sub else None})
+    if changed:
+        cfg = load_config()
+        cfg["deco_seen"] = dict(cfg.get("deco_seen") or {}, **seen)
+        save_config(cfg)
+        app.cfg["deco_seen"] = cfg["deco_seen"]
+    return out
+
+
+def entries_public(cfg, rts, decos):
+    """Every entry once, in priority order, with its price: what the admin ranks and prices."""
+    titles = {d["eid"]: d["title"] for d in decos if d.get("eid")}
+    meta, out, seen = cfg.get("entries_meta") or {}, [], {}
+    for r in sorted(rts, key=lambda r: (r.get("entry_rank", 0), r["default_order"])):
+        eid = r.get("entry_id")
+        if not eid:
+            continue
+        if eid in seen:
+            seen[eid]["routes"] += 1
+            continue
+        kind = eid.split(":", 1)[0]
+        name = {"direct": "مستقیم"}.get(kind) or (r["entry"].get("name") if kind == "srv" else titles.get(eid) or r["entry"].get("name"))
+        m = meta.get(eid) or {}
+        e = {"eid": eid, "kind": kind, "name": name or eid, "routes": 1, "price": m.get("price"), "unit": m.get("unit") or "month",
+             "quota_gb": r.get("quota_gb") if kind in ("sub", "lnk") and r.get("quota_from_sub") else None}
+        seen[eid] = e
+        out.append(e)
     return out
 
 
@@ -4516,6 +4606,7 @@ def admin_state(app, host):
     ups = UPSTREAMS.nodes()
     live = live_routes(app, cfg, ups)
     rts = annotate_ports(routes_public(live, app.net.ping_by_key), panel["inbounds"], panel.get("nodes"))
+    decos = deco_lines(app)
     clients = clients_of(app)
     source = "nx" if on_nx(app) else "db"
     if not clients and panel["ok"] and not on_nx(app):
@@ -4557,7 +4648,8 @@ def admin_state(app, host):
             "backend": cfg.get("backend") or "xui", "nx_url": cfg.get("nx_url", ""), "nx_token_set": bool(cfg.get("nx_token")),
             "nx_sub_base": cfg.get("nx_sub_base", ""), "nx_check": cfg.get("nx_check") or {},
         },
-        "decos": deco_lines(app),
+        "decos": decos,
+        "entries": entries_public(cfg, rts, decos),
         "routes": rts,
         "cf": cf_public(cfg),
         "groups": deco_groups(cfg, ups),
@@ -4877,7 +4969,7 @@ def do_action(app, action, body, host):
                     cfg[k] = bool(body[k])
             if body.get("auto_mode") in ("priority", "fastest"):
                 cfg["auto_mode"] = body["auto_mode"]
-            if body.get("order_mode") in ("manual", "price"):
+            if body.get("order_mode") in ORDER_MODES:
                 cfg["order_mode"] = body["order_mode"]
             if "label_auto" in body:
                 cfg["label_auto"] = str(body["label_auto"] or "").strip()[:30] or DEFAULTS["label_auto"]
@@ -4925,7 +5017,7 @@ def do_action(app, action, body, host):
             ups = UPSTREAMS.nodes()
             valid = [r["key"] for r in routes(cfg, ups)]
             items = clean_items(body.get("items"), set(valid))
-            order_mode = "price" if body.get("order_mode") == "price" else "manual"
+            order_mode = order_mode_of(body.get("order_mode"))
             tid = str(body.get("id") or "")
             collapse = clean_collapse(body.get("collapse"), {g["id"] for g in deco_groups(cfg, ups)})
             if tid == "default":  # the default template is the routes' own settings
@@ -5019,7 +5111,7 @@ def do_action(app, action, body, host):
                 if not any(it["show"] or it["auto"] for it in items):
                     return fail("حداقل یک مسیر رو روشن کن")
                 subs[u["sub"]] = {"template": "custom", "items": items,
-                                  "order_mode": "price" if body.get("order_mode") == "price" else "manual",
+                                  "order_mode": order_mode_of(body.get("order_mode")),
                                   "include_new": bool(body.get("include_new")),
                                   "collapse": clean_collapse(body.get("collapse"), {g["id"] for g in deco_groups(cfg, UPSTREAMS.nodes())})}
             elif template_by_id(cfg, mode):
@@ -5167,6 +5259,65 @@ def do_action(app, action, body, host):
             save_config(cfg)
             app.reload()
             return done({"relay": "شد: فقط واسط", "own": "شد: خود کانفیگ", "both": "شد: هردو", "off": "خاموش شد"}[mode])
+
+        if action == "deco_hide":
+            keys = {str(k) for k in body.get("keys") or [] if str(k)}
+            if not keys:
+                return fail("کانفیگی انتخاب نشده")
+            cfg = load_config()
+            hidden = set(cfg.get("deco_hidden") or [])
+            hidden = hidden | keys if body.get("hide", True) else hidden - keys
+            cfg["deco_hidden"] = sorted(hidden)
+            save_config(cfg)
+            app.reload()
+            if body.get("hide", True):
+                return done("%s کانفیگ حذف شد؛ از «حذف‌شده‌ها» برمی‌گرده" % str(len(keys)).translate(FA_DIGITS))
+            return done("برگشت")
+
+        if action == "deco_refresh_one":
+            line = str(body.get("line") or "")
+            if line not in UPSTREAMS.lines() or not line.lower().startswith(("http://", "https://")):
+                return fail("این ساب پیدا نشد")
+            cfg = load_config()
+            seen = cfg.get("deco_seen") or {}
+            UPSTREAMS.forget(line)
+            try:
+                nodes = parse_nodes(UPSTREAMS._fetch_sub(line), [], skip_loopback=True)
+            except Exception as e:
+                return fail("ساب باز نشد: %s" % e)
+            keys = [node_key(x) for x in nodes]
+            fresh = [k for k in keys if k not in seen]
+            if fresh:  # marked new here, so the page shows them as new straight away
+                now = int(time.time())
+                cfg["deco_seen"] = dict(seen, **{k: now for k in fresh})
+                save_config(cfg)
+                app.reload()
+            fa_ = lambda x: str(x).translate(FA_DIGITS)
+            msg = "%s کانفیگ" % fa_(len(keys)) + ("، %s تا جدید" % fa_(len(fresh)) if fresh else "، چیز جدیدی نبود")
+            return done(msg, fresh=fresh)
+
+        if action == "entries_save":
+            cfg = load_config()
+            valid = {r["entry_id"] for r in routes(cfg, UPSTREAMS.nodes())}
+            order = [str(e) for e in body.get("order") or [] if str(e) in valid]
+            meta = {}
+            try:
+                for eid, m in (body.get("meta") or {}).items():
+                    if eid not in valid or not isinstance(m, dict):
+                        continue
+                    price = m.get("price")
+                    price = None if price in (None, "") else max(0.0, float(str(price).replace(",", "")))
+                    if price is not None:
+                        meta[eid] = {"price": price, "unit": "gb" if m.get("unit") == "gb" else "month"}
+            except (TypeError, ValueError):
+                return fail("قیمت باید عدد باشه")
+            cfg["entries_order"] = list(dict.fromkeys(order))
+            cfg["entries_meta"] = meta
+            if body.get("apply"):  # the default subscription follows this order
+                cfg["order_mode"] = "entry"
+            save_config(cfg)
+            app.reload()
+            return done("اولویت و قیمت ورودی‌ها ذخیره شد")
 
         if action == "decos_refresh":
             before = len(UPSTREAMS.nodes())
@@ -5524,6 +5675,15 @@ select.in{appearance:none;-webkit-appearance:none;background-image:linear-gradie
 .zap.on{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 55%,var(--line2))}.zap .i{width:16px;height:16px}
 .vmove{display:flex;flex-direction:column;gap:3px;flex:none}.vmove button{width:30px;height:24px;border-radius:7px;border:1px solid var(--line2);background:none;display:grid;place-items:center;cursor:pointer;color:var(--fg);padding:0}
 .vmove button[disabled]{opacity:.25}.vmove .i{width:14px;height:14px}
+.prow{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);transition:background .25s}.prow:last-child{border-bottom:0}
+.prow .rank{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;font-size:12.5px;font-weight:700;background:color-mix(in srgb,var(--acc) 14%,transparent);color:var(--acc);flex:none}
+.prow .t{flex:1;min-width:0}.prow .t b{display:block;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.prow .t small{color:var(--mut);font-size:12px}
+.prow.flash{background:color-mix(in srgb,var(--acc) 10%,transparent)}
+.pprice{display:flex;gap:6px;margin-top:6px}.pprice .in{padding:7px 10px;font-size:13.5px}.pprice select.in{flex:0 0 96px}
+.hidebtn{width:32px;height:32px;border-radius:9px;border:1px solid var(--line2);background:none;display:grid;place-items:center;cursor:pointer;color:var(--mut);flex:none}.hidebtn .i{width:15px;height:15px}.hidebtn:active{transform:scale(.94)}
+.gtools{display:flex;gap:6px;flex-wrap:wrap;padding:2px 0 8px}
+.savebar{position:sticky;bottom:calc(70px + env(safe-area-inset-bottom));z-index:3;background:var(--card);border:1px solid var(--line2);border-radius:16px;padding:10px 12px;margin-top:12px;box-shadow:0 10px 30px rgba(0,0,0,.25);display:flex;align-items:center;gap:10px}
+.savebar .check{flex:1;font-size:13px}
 .move{display:flex;gap:4px}.move button{width:34px;height:34px;border-radius:9px;border:1px solid var(--line2);background:none;display:grid;place-items:center;cursor:pointer;color:var(--fg)}.move button[disabled]{opacity:.3}.move .i{width:16px;height:16px}
 /* sheet */
 .ov{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.5);display:flex;align-items:flex-end;justify-content:center;animation:fade .15s}
@@ -5859,6 +6019,7 @@ function viewRows(view){
 function viewOrdered(view){
   const v=viewRows(view).filter(x=>x.show||x.auto);
   if(view.order_mode==="price")v.sort((a,b)=>(a.r.cost==null)-(b.r.cost==null)||(a.r.cost||0)-(b.r.cost||0));
+  else if(view.order_mode==="entry")v.sort((a,b)=>(a.r.entry_rank||0)-(b.r.entry_rank||0));
   return v;
 }
 const viewName=(view,x)=>view.id==="default"?x.r.name:x.name||x.r.name;
@@ -5904,7 +6065,8 @@ function tplGroup(b,fold,o){
   </div></div>`;
 }
 function editorHTML(o){
-  return `<div class="seg"><button type="button" data-om="manual" class="${o.order_mode!=="price"?"on":""}">ترتیب دستی</button><button type="button" data-om="price" class="${o.order_mode==="price"?"on":""}">ارزون‌ترین اول</button></div>
+  const om0=o.order_mode||"manual";
+  return `<div class="seg"><button type="button" data-om="manual" class="${om0==="manual"?"on":""}">دستی</button><button type="button" data-om="entry" class="${om0==="entry"?"on":""}">اولویت ورودی‌ها</button><button type="button" data-om="price" class="${om0==="price"?"on":""}">ارزون‌ترین</button></div>
   <div class="sec" style="margin:4px 2px 2px"><div class="hint" data-omhint style="margin:0;flex:1"></div><div class="acts"><button type="button" class="abtn" data-sort-natural>${ic("route")} مرتب کردن</button></div></div>
   <div class="tblocks">${blocks(viewRows(o.view),x=>x.r).map(b=>b.gid?tplGroup(b,(o.view.collapse||{})[b.gid],o):`<div class="tblk">${tplRow(b.items[0],o.isDefault)}</div>`).join("")}</div>
   ${o.showNew?sw("include_new",o.include_new,"مسیرهای جدید هم خودکار اضافه بشن","هر مسیری که بعداً بسازی، با همون تنظیم پیش‌فرضش"):""}`;
@@ -5916,22 +6078,22 @@ function bindEditor(el,o){
   const isOn=c=>$("[data-k=show]",c).checked||$(".zap",c).classList.contains("on");
   const sync=()=>{
     const blks=$$(":scope > .tblk",list);
-    blks.forEach((b,i)=>{const c=ctl(b);$("[data-mv='-1']",c).disabled=om==="price"||i===0;$("[data-mv='1']",c).disabled=om==="price"||i===blks.length-1});
+    blks.forEach((b,i)=>{const c=ctl(b);$("[data-mv='-1']",c).disabled=om!=="manual"||i===0;$("[data-mv='1']",c).disabled=om!=="manual"||i===blks.length-1});
     $$(".tblk.grp",list).forEach(blk=>{const rs=rowsOf($(".gbody",blk));
-      rs.forEach((c,i)=>{$("[data-mv='-1']",c).disabled=om==="price"||i===0;$("[data-mv='1']",c).disabled=om==="price"||i===rs.length-1});
+      rs.forEach((c,i)=>{$("[data-mv='-1']",c).disabled=om!=="manual"||i===0;$("[data-mv='1']",c).disabled=om!=="manual"||i===rs.length-1});
       const shown=rs.filter(c=>$("[data-k=show]",c).checked).length,zaps=rs.filter(c=>$(".zap",c).classList.contains("on")).length;
       const all=$("[data-gall]",blk);all.checked=rs.length>0&&shown===rs.length;all.indeterminate=shown>0&&shown<rs.length;
       $("[data-gzap]",blk).classList.toggle("on",rs.length>0&&zaps===rs.length);
       $("[data-gsum]",blk).innerHTML=`${fa(shown)} از ${fa(rs.length)} توی ساب، ⚡ ${fa(zaps)}${$("[data-fold]",blk).checked?'، <span class="acc">یکی توی اپ</span>':""}`;
       blk.classList.toggle("off",!rs.some(isOn))});
     $$(".trow[data-key]",list).forEach(c=>c.classList.toggle("off",!isOn(c)));
-    $("[data-omhint]",el).textContent=om==="price"?"توی ساب از ارزون‌ترین (تومان به ازای هر GB) چیده می‌شه؛ قیمت هر مسیر رو در «مسیرها» بذار.":"☑ = توی ساب، ⚡ = توی خودکار، فلش‌ها = ترتیب. اسم خالی = اسم خود مسیر."};
+    $("[data-omhint]",el).textContent=om==="price"?"توی ساب از ارزون‌ترین (تومان به ازای هر GB) چیده می‌شه؛ قیمت رو در «ورودی‌ها ← اولویت و قیمت» بذار.":om==="entry"?"توی ساب به ترتیب ورودی‌ها چیده می‌شه (ورودی‌ها ← اولویت و قیمت).":"☑ = توی ساب، ⚡ = توی خودکار، فلش‌ها = ترتیب. اسم خالی = اسم خود مسیر."};
   sync();
   $$("[data-om]",el).forEach(b=>b.onclick=()=>{om=b.dataset.om;$$("[data-om]",el).forEach(x=>x.classList.toggle("on",x===b));sync()});
   const natOrder=key=>{const r=(S.state.routes||[]).find(x=>x.key===key);return r?r.default_order:1e9};
   const sb=$("[data-sort-natural]",el);
   if(sb)sb.onclick=()=>{
-    if(om==="price"){om="manual";$$("[data-om]",el).forEach(x=>x.classList.toggle("on",x.dataset.om==="manual"))}
+    if(om!=="manual"){om="manual";$$("[data-om]",el).forEach(x=>x.classList.toggle("on",x.dataset.om==="manual"))}
     $$(".tblk.grp",list).forEach(blk=>{const body=$(".gbody",blk);rowsOf(body).sort((a,b)=>natOrder(a.dataset.key)-natOrder(b.dataset.key)).forEach(r=>body.appendChild(r))});
     const ord=blk=>{const rs=blk.classList.contains("grp")?rowsOf($(".gbody",blk)):[$(":scope > .trow[data-key]",blk)];return Math.min(...rs.filter(Boolean).map(r=>natOrder(r.dataset.key)))};
     $$(":scope > .tblk",list).sort((a,b)=>ord(a)-ord(b)).forEach(b=>list.appendChild(b));
@@ -6258,17 +6420,45 @@ SEGV.entries=()=>{
       qh=`<div class="meter"><div class="rw"><span>${q.total?gb(left)+" از "+gb(q.total)+" GB مانده":gb((q.upload||0)+(q.download||0))+" GB مصرف"}</span><span class="${days!==null&&days<=2?"bad":"mut"}">${days===null?"":days>0?fa(days)+" روز":"منقضی"}</span></div>${q.total?`<div class="bar"><i class="${barCls(p)}" style="width:${p}%"></i></div>`:""}</div>`}
     const moves=`<div class="move"><button data-act="deco-move" data-i="${i}" data-d="-1" ${i===0?"disabled":""} aria-label="بالا">${ic("up")}</button><button data-act="deco-move" data-i="${i}" data-d="1" ${i===ds.length-1?"disabled":""} aria-label="پایین">${ic("down")}</button><button data-act="deco-del" data-i="${i}" aria-label="حذف">${ic("trash")}</button></div>`;
     const stat=s=>!s?`<span class="mut">تست‌نشده</span>`:s.ok===null?`<span class="mut">UDP</span>`:s.ok?`<span class="ok">${ms_(s.ms)}</span>`:`<span class="bad">قطع</span>`;
-    const node=(nd,extra="")=>`<div class="crow"><div class="row">${mono(decoMono(nd.n))}<div class="t"><b class="ltr" style="text-align:right">${esc(nd.name)}</b><small class="ltr" style="text-align:right">${esc(nd.proto)} · ${esc(nd.server)}:${nd.port}${nd.status&&!nd.status.ok&&nd.status.error?"، "+esc(nd.status.error):""}</small></div><div class="r">${stat(nd.status)}</div>${extra}</div>${modeSeg([nd.key],decoMode(nd.key))}</div>`;
-    if(d.kind==="link"&&d.nodes.length===1)return `<div class="list">${node(d.nodes[0],moves)}${d.error?`<div class="err">${esc(d.error)}</div>`:""}</div>`;
-    const gid=d.gid||"l"+i,open=isOpen(gid),okN=d.nodes.filter(x=>x.status&&x.status.ok).length,badN=d.nodes.filter(x=>x.status&&x.status.ok===false).length;
+    const node=(nd,extra="",del=true)=>`<div class="crow"><div class="row">${mono(decoMono(nd.n))}<div class="t"><b class="ltr" style="text-align:right">${nd.new?'<span class="tag acc">جدید</span> ':""}${esc(nd.name)}</b><small class="ltr" style="text-align:right">${esc(nd.proto)} · ${esc(nd.server)}:${nd.port}${nd.status&&!nd.status.ok&&nd.status.error?"، "+esc(nd.status.error):""}</small></div><div class="r">${stat(nd.status)}${del?`<button class="hidebtn" data-act="deco-hide" data-k="${esc(nd.key)}" aria-label="حذف این کانفیگ">${ic("trash")}</button>`:""}</div>${extra}</div>${modeSeg([nd.key],decoMode(nd.key))}</div>`;
+    const hidRow=nd=>`<div class="row"><div class="t"><b class="ltr mut" style="text-align:right">${esc(nd.name)}</b><small class="ltr" style="text-align:right">${esc(nd.proto)} · ${esc(nd.server)}:${nd.port}</small></div><div class="r"><button class="abtn" data-act="deco-unhide" data-k="${esc(nd.key)}">${ic("refresh")} برگردون</button></div></div>`;
+    if(d.kind==="link"&&d.nodes.length===1)return `<div class="list">${node(d.nodes[0],moves,false)}${d.error?`<div class="err">${esc(d.error)}</div>`:""}</div>`;
+    const vis=d.nodes.filter(x=>!x.hidden),hid=d.nodes.filter(x=>x.hidden);
+    const gid=d.gid||"l"+i,open=isOpen(gid),okN=vis.filter(x=>x.status&&x.status.ok).length,bad=vis.filter(x=>x.status&&x.status.ok===false),badN=bad.length,newN=vis.filter(x=>x.new).length;
+    const refresh=d.kind==="sub"?`<button class="hidebtn" data-act="deco-sub-refresh" data-i="${i}" aria-label="آپدیت این ساب" style="color:var(--acc)">${ic("refresh")}</button>`:"";
     const left=q&&q.total?Math.max(0,q.total-(q.upload||0)-(q.download||0)):null;
-    return `<div class="list" data-gbox><div class="row btn-row ghead" data-gtoggle="${esc(gid)}">${chev(open)}<div class="t"><b class="ltr" style="text-align:right">${esc(d.title)}</b><small>${d.kind==="sub"?"لینک ساب، ":""}${fa(d.nodes.length)} کانفیگ${okN?`، <span class="ok">${fa(okN)} سالم</span>`:""}${badN?`، <span class="bad">${fa(badN)} قطع</span>`:""}${left!=null?`، ${gb(left)} GB مانده`:""}</small></div>${moves}</div>
-     <div class="gbody" ${open?"":"hidden"}><div class="gall"><span class="mut small">همه:</span>${modeSeg(d.nodes.map(n=>n.key),groupMode(d.nodes.map(n=>n.key)))}</div>${d.nodes.map(nd=>node(nd)).join("")}${qh?`<div style="padding:0 0 10px">${qh}</div>`:""}</div>
+    return `<div class="list" data-gbox><div class="row btn-row ghead" data-gtoggle="${esc(gid)}">${chev(open)}<div class="t"><b class="ltr" style="text-align:right">${esc(d.title)}</b><small>${d.kind==="sub"?"لینک ساب، ":""}${fa(vis.length)} کانفیگ${newN?`، <span class="acc">${fa(newN)} جدید</span>`:""}${okN?`، <span class="ok">${fa(okN)} سالم</span>`:""}${badN?`، <span class="bad">${fa(badN)} قطع</span>`:""}${left!=null?`، ${gb(left)} GB مانده`:""}</small></div>${refresh}${moves}</div>
+     <div class="gbody" ${open?"":"hidden"}>${vis.length?`<div class="gall"><span class="mut small">همه:</span>${modeSeg(vis.map(n=>n.key),groupMode(vis.map(n=>n.key)))}</div>`:""}
+      ${badN||d.kind==="sub"?`<div class="gtools">${d.kind==="sub"?`<button class="abtn" data-act="deco-sub-refresh" data-i="${i}">${ic("refresh")} آپدیت این ساب</button>`:""}${badN?`<button class="abtn" style="color:var(--bad)" data-act="deco-hide-bad" data-i="${i}">${ic("trash")} حذف ${fa(badN)} قطع</button>`:""}</div>`:""}
+      ${vis.map(nd=>node(nd)).join("")}${qh?`<div style="padding:0 0 10px">${qh}</div>`:""}
+      ${hid.length?`<div data-gbox><div class="row btn-row ghead" data-gtoggle="${esc("h"+gid)}">${chev(isOpen("h"+gid))}<div class="t"><b class="mut">${fa(hid.length)} حذف‌شده</b><small>توی هیچ مسیری نیستن؛ هر وقت خواستی برگردون</small></div></div><div class="gbody" ${isOpen("h"+gid)?"":"hidden"}>${hid.map(hidRow).join("")}</div></div>`:""}</div>
      ${d.error?`<div class="err" style="padding-bottom:8px">${esc(d.error)}</div>`:""}</div>`}).join(""):`<div class="list"><div class="note">کانفیگ یا لینک ساب یکی دیگه رو اضافه کن. برای هر کدوم انتخاب کن: «واسط» (کاربر از راهش به سرور تو می‌رسه)، «خودش» (همون کانفیگ عیناً توی ساب میاد)، یا «هردو». آخرین تست: ${ago(st.monitor.last_run)}</div></div>`}
   ${st.monitor.note?`<div class="note">${ic("info")} ${esc(st.monitor.note)}</div>`:""}`;
   const e=S.eseg||"srv";
-  return `<div class="seg sub"><button data-act="eseg" data-e="srv" class="${e==="srv"?"on":""}">${ic("server")} سرور</button><button data-act="eseg" data-e="cfg" class="${e==="cfg"?"on":""}">${ic("link")} کانفیگ</button></div>${e==="srv"?srvHtml:cfgHtml}`;
+  return `<div class="seg sub"><button data-act="eseg" data-e="srv" class="${e==="srv"?"on":""}">${ic("server")} سرور</button><button data-act="eseg" data-e="cfg" class="${e==="cfg"?"on":""}">${ic("link")} کانفیگ</button><button data-act="eseg" data-e="prio" class="${e==="prio"?"on":""}">${ic("chart")} اولویت و قیمت</button></div>${e==="srv"?srvHtml:e==="cfg"?cfgHtml:prioHtml()}`;
 };
+
+/* entries: priority and price, the order every subscription can follow */
+const EKIND={direct:["⌂","ok"],srv:["IR",""],sub:["S",""],lnk:["C",""]};
+function prioInit(){const cur=(S.state.entries||[]).map(e=>e.eid).join("|");
+  if(!S.prio||S.prio.src!==cur)S.prio={src:cur,dirty:false,list:(S.state.entries||[]).map(e=>({...e,price:e.price==null?"":String(Math.round(e.price))}))};return S.prio}
+function prioCost(e){const p=+String(e.price).replace(/,/g,"");if(!e.price||isNaN(p))return null;return e.unit==="gb"?p:p/(e.quota_gb||500)}
+function prioRows(){const P=S.prio,n=P.list.length;
+  return P.list.map((e,i)=>{const k=EKIND[e.kind]||["•",""],c=prioCost(e);
+   return `<div class="prow" data-pi="${i}"><span class="rank">${fa(i+1)}</span><div class="t"><b class="${e.kind==="direct"?"":"ltr"}" style="text-align:right">${esc(e.name)}</b>
+    <small>${{direct:"اتصال مستقیم به سرور خودت",srv:"سرور ایران (تانل)",sub:"ساب واسط",lnk:"کانفیگ واسط"}[e.kind]||""} · ${fa(e.routes)} مسیر${c!=null?` · ≈ ${toman(c)} تومان/GB`:""}</small>
+    <div class="pprice"><input class="in ltr" data-pp="${i}" inputmode="numeric" placeholder="قیمت (تومان)" value="${esc(e.price)}"><select class="in" data-pu="${i}"><option value="month" ${e.unit!=="gb"?"selected":""}>در ماه</option><option value="gb" ${e.unit==="gb"?"selected":""}>هر GB</option></select></div></div>
+    <div class="move" style="flex-direction:column"><button data-act="prio-mv" data-i="${i}" data-d="-1" ${i===0?"disabled":""} aria-label="بالاتر">${ic("up")}</button><button data-act="prio-mv" data-i="${i}" data-d="1" ${i===n-1?"disabled":""} aria-label="پایین‌تر">${ic("down")}</button></div></div>`}).join("")}
+function prioHtml(){const P=prioInit(),on=(S.state.settings.order_mode||"manual")==="entry";
+  if(!P.list.length)return `<div class="list"><div class="empty">${ic("route")}<p>هنوز ورودی‌ای نیست.</p></div></div>`;
+  return `<div class="note">${ic("info")} ورودی بالاتر = اولویت بیشتر. کانفیگ‌ها توی ساب به همین ترتیب چیده می‌شن و ⚡ Auto هم اول اینا رو امتحان می‌کنه. قیمت هر ورودی برای همه‌ی مسیرهاش حساب می‌شه، مگه اینکه برای یه مسیر قیمت جدا گذاشته باشی.</div>
+  <div class="list" id="prio">${prioRows()}</div>
+  <div class="savebar"><label class="check"><input type="checkbox" id="prio-apply" ${on?"checked":""}><span>ساب پیش‌فرض به همین ترتیب</span></label><button class="btn sm" data-act="prio-save">${ic("check")} ذخیره</button></div>`}
+function prioBind(){const box=$("#prio");if(!box||box.dataset.b)return;box.dataset.b=1;
+  box.addEventListener("input",ev=>{const t=ev.target,P=S.prio;if(t.dataset.pp!=null){P.list[+t.dataset.pp].price=t.value.replace(/[^\d۰-۹,]/g,"").replace(/[۰-۹]/g,d=>"۰۱۲۳۴۵۶۷۸۹".indexOf(d));if(t.value!==P.list[+t.dataset.pp].price)t.value=P.list[+t.dataset.pp].price;P.dirty=true}});
+  box.addEventListener("change",ev=>{const t=ev.target,P=S.prio;if(t.dataset.pu!=null){P.list[+t.dataset.pu].unit=t.value;P.dirty=true;prioRedraw()}})}
+function prioRedraw(flash){const box=$("#prio");if(!box)return;box.innerHTML=prioRows();if(flash!=null){const r=$(`[data-pi="${flash}"]`,box);if(r){r.classList.add("flash");setTimeout(()=>r.classList.remove("flash"),450)}}}
+{const _r=render;render=function(){_r.apply(this,arguments);prioBind()}}
 /* exits: own servers */
 SEGV.exits=()=>{
   const st=S.state,p=st.panel,n=st.net;
@@ -6657,6 +6847,14 @@ const ACTS={
   "auto-cfg":()=>autoSheet(),
   "deco-add":()=>decoAddSheet(),
   "deco-raw":()=>decoRawSheet(),
+  "deco-hide":b=>act(b,"deco_hide",{keys:[b.dataset.k],hide:true}),
+  "deco-unhide":b=>act(b,"deco_hide",{keys:[b.dataset.k],hide:false}),
+  "deco-hide-bad":async b=>{const d=S.state.decos[+b.dataset.i],keys=d.nodes.filter(x=>!x.hidden&&x.status&&x.status.ok===false).map(x=>x.key);
+    if(keys.length&&await confirmSheet("حذف کانفیگ‌های قطع",`${fa(keys.length)} کانفیگ قطعِ <span class="ltr">${esc(d.title)}</span> حذف بشن؟ از «حذف‌شده‌ها» برمی‌گردن.`,"حذف کن",true))act(null,"deco_hide",{keys,hide:true})},
+  "deco-sub-refresh":async b=>{const d=S.state.decos[+b.dataset.i];if(d.gid&&!isOpen(d.gid)){OPEN[d.gid]=true;try{localStorage.setItem("xc_open",JSON.stringify(OPEN))}catch(e){}}act(b,"deco_refresh_one",{line:d.line})},
+  "prio-mv":b=>{const P=S.prio,i=+b.dataset.i,j=i+(+b.dataset.d);if(!P||j<0||j>=P.list.length)return;[P.list[i],P.list[j]]=[P.list[j],P.list[i]];P.dirty=true;prioRedraw(j)},
+  "prio-save":async b=>{const P=S.prio;if(!P)return;const meta={};P.list.forEach(e=>{if(String(e.price).trim()!=="")meta[e.eid]={price:String(e.price).replace(/,/g,""),unit:e.unit}});
+    const j=await act(b,"entries_save",{order:P.list.map(e=>e.eid),meta,apply:$("#prio-apply").checked});if(j&&j.ok)S.prio=null},
   "deco-move":b=>{const l=decoLines(),i=+b.dataset.i,j=i+(+b.dataset.d);[l[i],l[j]]=[l[j],l[i]];saveDecos(l,null)},
   "deco-del":async b=>{const i=+b.dataset.i,d=S.state.decos[i];if(await confirmSheet("حذف واسط","<span class=\"ltr\">"+esc(d.title)+"</span> و مسیرهاش حذف بشن؟","حذف کن",true)){const l=decoLines();l.splice(i,1);saveDecos(l,null)}},
   "panel-test":b=>act(b,"panel_test",{}),
@@ -6749,6 +6947,7 @@ class App:
     def reload(self):
         self.cfg = load_config()
         self.rt = resolve_runtime(self.cfg, self.db_path)
+        UPSTREAMS.hidden = set(self.cfg.get("deco_hidden") or [])
 
     @property
     def panel(self):

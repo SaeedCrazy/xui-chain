@@ -908,6 +908,64 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(self.admin("decos_refresh")[1]["ok"])
         self.admin("deco_mode", {"keys": [key], "mode": "relay"})
 
+    def test_deco_hide_refresh_and_entries(self):
+        self.login()
+        xc.save_upstreams_text("\n".join([self.friend, UPS[3]]))
+        try:
+            st = self.admin("state")[1]["state"]
+            sub = st["decos"][0]
+            self.assertEqual(sub["eid"], "sub:" + sub["gid"])
+            self.assertFalse(any(n["new"] for n in sub["nodes"]))  # came with the subscription: not new
+            key = sub["nodes"][0]["key"]
+            out = self.admin("deco_hide", {"keys": [key]})[1]
+            self.assertTrue(out["ok"], out)
+            nodes = out["state"]["decos"][0]["nodes"]
+            self.assertTrue(next(n for n in nodes if n["key"] == key)["hidden"])
+            self.assertNotIn(key, {xc.node_key(n) for n in xc.UPSTREAMS.nodes()})
+            self.assertFalse(any(r["entry"].get("key") == key for r in out["state"]["routes"]))
+            status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
+            self.assertEqual(status, 200)
+            self.assertNotIn(nodes[0]["name"], body)
+            out = self.admin("deco_hide", {"keys": [key], "hide": False})[1]
+            self.assertIn(key, {xc.node_key(n) for n in xc.UPSTREAMS.nodes()})
+            self.assertFalse(self.admin("deco_hide", {"keys": []})[1]["ok"])
+            out = self.admin("deco_refresh_one", {"line": self.friend})[1]
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["fresh"], [])
+            self.assertFalse(self.admin("deco_refresh_one", {"line": "https://nope.example/x"})[1]["ok"])
+            cfg = xc.load_config()  # a config the subscription adds later is new
+            cfg["deco_seen"] = {k: v for k, v in cfg["deco_seen"].items() if k != key}
+            xc.save_config(cfg)
+            self.app.reload()
+            out = self.admin("deco_refresh_one", {"line": self.friend})[1]
+            self.assertEqual(out["fresh"], [key])
+            self.assertTrue(next(n for n in out["state"]["decos"][0]["nodes"] if n["key"] == key)["new"])
+            # entries: priority and price
+            ents = out["state"]["entries"]
+            eids = [e["eid"] for e in ents]
+            self.assertIn("direct", eids)
+            self.assertIn(sub["eid"], eids)
+            order = [sub["eid"]] + [e for e in eids if e != sub["eid"]]
+            out = self.admin("entries_save", {"order": order + ["bogus"], "meta": {sub["eid"]: {"price": "250000", "unit": "month"}},
+                                              "apply": True})[1]
+            self.assertTrue(out["ok"], out)
+            st = out["state"]
+            self.assertEqual(st["entries"][0]["eid"], sub["eid"])
+            self.assertEqual(st["settings"]["order_mode"], "entry")
+            self.assertEqual(st["routes"][0]["entry_id"], sub["eid"])  # the default order follows the entries
+            r = next(r for r in st["routes"] if r["entry_id"] == sub["eid"])
+            self.assertTrue(r["price_from_entry"])
+            self.assertAlmostEqual(r["cost"], 250000 / 50, places=3)  # monthly price over the subscription's 50 GB
+            self.assertFalse(self.admin("entries_save", {"order": order, "meta": {sub["eid"]: {"price": "x"}}})[1]["ok"])
+        finally:
+            cfg = xc.load_config()
+            for k in ("deco_hidden", "entries_order", "entries_meta", "deco_seen"):
+                cfg.pop(k, None)
+            cfg["order_mode"] = "manual"
+            xc.save_config(cfg)
+            xc.save_upstreams_text("\n".join(UPS[1:3]))
+            self.app.reload()
+
     def test_fold_actions(self):
         self.login()
         xc.save_upstreams_text("\n".join([self.friend, UPS[3]]))
