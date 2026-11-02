@@ -519,6 +519,11 @@ class ProfileTests(unittest.TestCase):
         self.assertFalse(xc.plain_vless(xc.parse_link(OWN[2])))  # loopback is allowed
         xc.to_xray(xc.parse_link(OWN[2]), "x")
 
+    def test_distinct_remarks(self):
+        self.assertEqual(xc.distinct_remarks(["NX-Reality-local", "NX-SS-local"]), ["NX-Reality", "NX-SS"])
+        self.assertEqual(xc.distinct_remarks(["user1-reality", "user1-ws"]), ["user1-reality", "user1-ws"])
+        self.assertEqual(xc.distinct_remarks(["a-local", "a-local"]), ["a-local", "a-local"])
+
     def test_share_link_round_trip(self):
         keys = ("proto", "server", "port", "id", "password", "cipher", "flow", "net", "path", "host", "service_name",
                 "mode", "security", "sni", "alpn", "fp", "pbk", "sid", "spx", "obfs", "obfs_password", "insecure")

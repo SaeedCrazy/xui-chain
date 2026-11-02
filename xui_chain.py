@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.9.0"
+VERSION = "5.9.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -853,6 +853,28 @@ def exit_inbound_ports(exit_id, inbounds, nodes):
                    and ((not ib.get("node")) if node is None else ib.get("node") == node)})
 
 
+_NX_PORTS = {"at": 0, "list": []}
+
+
+def nx_user_ports(app, ttl=60):
+    """On NX the panel's inbounds are NX's own business; the ports a tunnel must carry are those of
+    the configs a customer gets, read from one enabled user's subscription (cached)."""
+    if time.time() - _NX_PORTS["at"] < ttl:
+        return _NX_PORTS["list"]
+    out = []
+    try:
+        base = first_enabled_sub(app)
+        status, _, body = http_get(panel_sub_url(app.rt, base), connect=app.rt.get("xui_connect", "")) if base else (0, {}, "")
+        if status == 200:
+            proto = {"ss": "shadowsocks"}
+            out = [{"port": n["port"], "protocol": proto.get(n["proto"], n["proto"]), "enable": True}
+                   for n in parse_nodes(split_lines(body))]
+    except Exception:
+        out = _NX_PORTS["list"]
+    _NX_PORTS.update(at=time.time(), list=out)
+    return out
+
+
 def annotate_ports(rts, inbounds, nodes):
     """Tunnel routes get missing_ports: inbound ports of their exit the tunnel does not carry
     (configs on those ports cannot use the route)."""
@@ -1118,10 +1140,20 @@ def route_items(r, own, cfg):
             m, hops = n, []
         items.append({"name": r["name"], "target": m, "hops": hops, "own": n})
     if len(items) > 1:  # two inbounds on one exit: keep their remarks apart
-        for it in items:
-            extra = clean_remark(it["own"]["name"])
+        for it, extra in zip(items, distinct_remarks([it["own"]["name"] for it in items])):
             it["name"] = "%s · %s" % (r["name"], extra) if extra and extra != r["name"] else r["name"]
     return items
+
+
+def distinct_remarks(names):
+    """Remarks without the tail they all share ("NX-Reality-local", "NX-SS-local" -> "NX-Reality",
+    "NX-SS"; NX appends the node's name to every config)."""
+    names = [clean_remark(n) for n in names]
+    parts = [re.split(r"([-_ ·|]+)", n) for n in names]
+    while all(len(p) > 2 for p in parts) and len({p[-1].lower() for p in parts}) == 1:
+        parts = [p[:-2] for p in parts]
+    out = ["".join(p).strip() for p in parts]
+    return out if all(out) and len(set(out)) == len(out) else names
 
 
 def route_tag(r):
@@ -4605,7 +4637,8 @@ def admin_state(app, host):
     cfg, rt = app.cfg, app.rt
     ups = UPSTREAMS.nodes()
     live = live_routes(app, cfg, ups)
-    rts = annotate_ports(routes_public(live, app.net.ping_by_key), panel["inbounds"], panel.get("nodes"))
+    rts = annotate_ports(routes_public(live, app.net.ping_by_key), nx_user_ports(app) if on_nx(app) else panel["inbounds"],
+                         panel.get("nodes"))
     decos = deco_lines(app)
     clients = clients_of(app)
     source = "nx" if on_nx(app) else "db"
