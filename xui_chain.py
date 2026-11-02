@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.12.0"
+VERSION = "5.13.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -116,6 +116,8 @@ DEFAULTS = {
     "bot_days": "3,1",          # customer reminders this many days before expiry
     "bot_pcts": "80,95",        # ... and at these percents of the volume
     "bot_quiet": "0-8",         # no customer reminders in these Tehran hours
+    "bot_owner": "",            # Telegram numeric ids that manage everything from the bot (/id shows yours)
+    "bot_emoji": "",            # animated (custom) emoji per key, "key=id" lines; needs the owner's Telegram Premium
     "shop_enable": False,       # sales through the bot (shop.json holds plans, codes, wallets, orders)
     "shop_cards": "",           # card-to-card: one per line, "number | holder | bank"
     "shop_trial": "",           # free trial "GB,days"; empty = none
@@ -4780,7 +4782,7 @@ def net_state(app):
 
 SETTING_BOOLS = ("bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
                  "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable")
-SETTING_TEXTS = {"shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
+SETTING_TEXTS = {"bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
                  "shop_welcome": 1000, "shop_help": 2000, "shop_prefix": 10, "bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
@@ -7047,6 +7049,7 @@ function botCard(){
    <div style="display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 6px">${netLine(tg,"تلگرام")}${netLine(bl,"بله")}${b.enable?`<span class="tag">${fa(b.customers||0)} مشتری وصل</span>`:""}${b.queue?`<span class="tag warn">${fa(b.queue)} در صف ارسال</span>`:""}</div>
    ${tg.error&&tg.on?`<div class="err">${esc(tg.error)}</div>`:""}
    ${field("bot_token","توکن ربات تلگرام","",`class="in ltr" type="password" autocomplete="off" placeholder="${b.token_set?"ذخیره شده":"123456:ABC…"}"`,'از <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a> یه ربات <b>فقط برای EZ</b> بساز؛ ربات 3x-ui یا هر برنامه‌ی دیگه رو نذار.')}
+   ${field("bot_owner","آیدی عددی صاحب ربات",b.owner||"",'class="in ltr" inputmode="numeric" placeholder="123456789"',"مدیریت کامل پنل از داخل ربات. آیدیت رو با فرستادن <span class=\"ltr\">/id</span> به ربات بگیر؛ چندتا رو با , جدا کن")}
    ${sw("bot_bale",b.bale,"روی بله هم",b.bale_ready?"با همون ربات بله‌ی بخش بکاپ":"اول توی بخش بکاپ توکن بله رو بذار")}
    ${field("monitor_minutes","فاصله‌ی تست خودکار (دقیقه)",S.state.settings.monitor_minutes,'class="in ltr" inputmode="numeric"',"واسط‌ها، تانل‌ها و ترافیک سرورها؛ هشدارشون برای چت‌های مدیر میاد")}
    <details><summary>یادآوری مشتری‌ها</summary>
@@ -7549,6 +7552,7 @@ class Bot:
         self.threads = {}
         self.st = self._load()
         self.shop = Shop(self)
+        self.admin = AdminBot(self)
 
     # state ------------------------------------------------------------------
     def _load(self):
@@ -7732,6 +7736,20 @@ class Bot:
         arg = arg.strip()
         admin = self.st["admins"].get(cid)
         reply = lambda t, kb=None: self.send(net, chat, t, kind="reply", keyboard=kb, queue=False)
+        private = (msg.get("chat") or {}).get("type", "private") == "private"
+        if cmd == "/id":
+            return reply("🆔 آیدی عددی تو: %s" % who.get("id", chat))
+        if private and self.admin.is_owner(net, who.get("id")):
+            if not admin:
+                with self.lock:
+                    admin = self.st["admins"][cid] = {"name": name, "events": "all", "paused": False, "at": int(time.time())}
+                self.save()
+                self.app.reload()
+            if self.admin.on_text(net, chat, msg):
+                return
+            if cmd in ("/start", "/admin", "/panel") and not (cmd == "/start" and arg.startswith(("s_", "r_"))):
+                self.admin.wait.pop(cid, None)
+                return self.admin.home(net, chat)
 
         code = (arg if cmd == "/start" else text).strip().upper()
         if code in self.st["codes"] and self.st["codes"][code]["exp"] > time.time():
@@ -7833,11 +7851,28 @@ class Bot:
                 if up.get("message"):
                     self.handle(net, up["message"])
                 elif up.get("callback_query"):
-                    self.shop.on_callback(net, up["callback_query"])
+                    self.on_callback(net, up["callback_query"])
             except Exception as e:  # one bad update must not stop the bot
                 print("bot %s: %s" % (net, e), flush=True)
         if ups:
             self.save()
+
+    def on_callback(self, net, cq):
+        data = cq.get("data") or ""
+        if not data.startswith("a:"):
+            return self.shop.on_callback(net, cq)
+        msg = cq.get("message") or {}
+        note = ""
+        try:
+            note = self.admin.on_callback(net, (msg.get("chat") or {}).get("id"), cq.get("from") or {}, data, msg.get("message_id")) or ""
+            self.save()
+        except Exception as e:
+            print("admin callback: %s" % e, flush=True)
+            note = "خطا: %s" % str(e)[:120]
+        try:
+            self.call(net, "answerCallbackQuery", {"callback_query_id": cq.get("id"), "text": note[:180]}, timeout=10)
+        except (ValueError, OSError):
+            pass
 
     def poll_loop(self, net):
         while net in self.nets():
@@ -7850,6 +7885,7 @@ class Bot:
             self.me[net] = {"username": me.get("username", ""), "error": ""}
             try:
                 self.call(net, "setMyCommands", {"commands": [{"command": "start", "description": "منوی اصلی"},
+                                                              {"command": "id", "description": "آیدی عددی من"},
                                                               {"command": "stop", "description": "قطع اعلان‌ها"}]}, timeout=10)
             except (ValueError, OSError):
                 pass
@@ -8008,7 +8044,8 @@ class Bot:
                 "customers_by": {n: sum(1 for c in self.st["customers"] if c.startswith(n + ":")) for n in BOT_NETS},
                 "queue": len(self.st["queue"]), "log": self.st["log"][-30:][::-1],
                 "events": [{"key": k, "label": l} for k, l in BOT_EVENTS],
-                "days": cfg.get("bot_days") or "3,1", "pcts": cfg.get("bot_pcts") or "80,95", "quiet": cfg.get("bot_quiet") or ""}
+                "days": cfg.get("bot_days") or "3,1", "pcts": cfg.get("bot_pcts") or "80,95", "quiet": cfg.get("bot_quiet") or "",
+                "owner": cfg.get("bot_owner") or ""}
 
 
 # ---------------------------------------------------------------- the shop (sales through the bot)
@@ -8104,12 +8141,52 @@ class Shop:
         return max(0, o["price"] - o.get("discount", 0))
 
     # Telegram helpers -------------------------------------------------------------
-    def kb(self, rows):
-        def btn(t, d):
+    # colour of a button from what it does: green = buy / confirm, blue = the next step, red = cancel / delete
+    STYLE = (("app:", "primary"), ("a:ok", "success"), ("a:no", "danger"), ("a:new", "success"), ("a:mk", "success"),
+             ("a:ux", "primary"), ("a:del", "danger"), ("a:cust", "primary"), ("buy", "success"), ("bp:", "success"),
+             ("pw:", "success"), ("ok:", "success"), ("trial", "success"), ("renew", "primary"), ("rn:", "primary"),
+             ("rp:", "success"), ("tp:", "success"), ("tu:", "success"), ("pc:", "primary"), ("x:", "danger"), ("no:", "danger"))
+    ICON = {"buy": "buy", "bp": "buy", "renew": "renew", "rn": "renew", "svc": "svc", "sv": "svc", "wallet": "wallet", "tu": "wallet",
+            "trial": "trial", "gift": "gift", "ref": "ref", "help": "help", "guide": "guide", "m": "home", "app": "app",
+            "pw": "ok", "ok": "ok", "a:ok": "ok", "no": "no", "x": "no", "a:no": "no", "a:home": "admin", "a:cust": "home"}
+    EFFECT = {"party": "5046509860389126442", "fire": "5104841245755180586", "like": "5107584321108051014", "heart": "5159385139981059251"}
+
+    def emoji_map(self):
+        out = {}
+        for line in str(self.app.cfg.get("bot_emoji") or "").splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() and v.strip().isdigit():
+                out[k.strip()] = v.strip()
+        return out
+
+    def em(self, key, plain):
+        """An animated (custom) emoji when one is set for this key and Telegram takes them, else the plain one."""
+        eid = self.emoji_map().get(key)
+        if eid and not getattr(self, "plain", False):
+            return '<tg-emoji emoji-id="%s">%s</tg-emoji>' % (eid, plain)
+        return plain
+
+    def kb(self, rows, net="tg"):
+        icons = self.emoji_map() if net == "tg" and not getattr(self, "plain", False) else {}
+        colour = net == "tg" and not getattr(self, "plain", False)
+
+        def btn(item):
+            t, d = item[0], item[1]
             if d.startswith("app:"):
-                return {"text": t, "web_app": {"url": d[4:]}}
-            return {"text": t, "url": d} if d.startswith("http") else {"text": t, "callback_data": d}
-        return {"inline_keyboard": [[btn(t, d) for t, d in row] for row in rows if row]}
+                b = {"text": t, "web_app": {"url": d[4:]}}
+            elif d.startswith("http"):
+                b = {"text": t, "url": d}
+            else:
+                b = {"text": t, "callback_data": d}
+            if colour:
+                style = item[2] if len(item) > 2 else next((st for pre, st in self.STYLE if d.startswith(pre)), "")
+                if style:
+                    b["style"] = style
+                key = self.ICON.get(d) or self.ICON.get(d.split(":", 1)[0]) or self.ICON.get(":".join(d.split(":")[:2]))
+                if key and icons.get(key):
+                    b["icon_custom_emoji_id"] = icons[key]
+            return b
+        return {"inline_keyboard": [[btn(i) for i in row] for row in rows if row]}
 
     def app_url(self):
         """The mini app's address; Telegram opens only https pages."""
@@ -8118,21 +8195,45 @@ class Shop:
             return ""
         return base[:-len(self.app.rt["sub_path"]) - 1] + "app/"
 
-    def show(self, net, chat, text, rows=None, msg=None):
-        """Edit the message in place when there is one (smooth menus), else send a new one."""
-        payload = {"chat_id": chat, "text": text[:4000], "disable_web_page_preview": True, "parse_mode": "HTML"}
-        if rows is not None:
-            payload["reply_markup"] = self.kb(rows)
-        if msg:
+    def show(self, net, chat, text, rows=None, msg=None, effect=None):
+        """Edit the message in place when there is one (smooth menus), else send a new one. A message with
+        an effect (confetti, fire) is always a new one, since an edit cannot carry it."""
+        for attempt in (0, 1):
+            payload = {"chat_id": chat, "text": text[:4000], "disable_web_page_preview": True, "parse_mode": "HTML"}
+            if rows is not None:
+                payload["reply_markup"] = self.kb(rows, net)
             try:
-                return self.bot.call(net, "editMessageText", dict(payload, message_id=msg))
+                if msg and not effect:
+                    try:
+                        return self.bot.call(net, "editMessageText", dict(payload, message_id=msg))
+                    except (ValueError, OSError) as e:
+                        if "not modified" in str(e):
+                            return None
+                        if not re.search(r"emoji|style|button", str(e), re.I):
+                            raise ValueError("send")
+                        raise
+                if msg and effect:
+                    try:
+                        self.bot.call(net, "editMessageText", {"chat_id": chat, "message_id": msg, "text": "✅"})
+                    except (ValueError, OSError):
+                        pass
+                if effect and net == "tg" and str(chat).lstrip("-").isdigit() and not str(chat).startswith("-"):
+                    try:
+                        return self.bot.call(net, "sendMessage", dict(payload, message_effect_id=self.EFFECT.get(effect, effect)))
+                    except (ValueError, OSError) as e:
+                        if "effect" not in str(e).lower():
+                            raise
+                return self.bot.call(net, "sendMessage", payload)
             except (ValueError, OSError) as e:
-                if "not modified" in str(e):
-                    return None
-        try:
-            return self.bot.call(net, "sendMessage", payload)
-        except (ValueError, OSError) as e:
-            self.bot.log(net, chat, "shop", str(e)[:160])
+                if str(e) == "send":
+                    msg = None
+                    continue
+                if attempt == 0 and re.search(r"emoji|style|button|entit", str(e), re.I) and not getattr(self, "plain", False):
+                    self.plain = True  # Telegram refused the animated emoji or colours: go on without them
+                    text = re.sub(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>', r"\1", text)
+                    continue
+                self.bot.log(net, chat, "shop", str(e)[:160])
+                return None
 
     def esc(self, s):
         return html.escape(str(s or ""), quote=False)
@@ -8144,10 +8245,11 @@ class Shop:
     def main_menu(self, net, chat, uid, msg=None):
         cfg = self.app.cfg
         u = self.user(uid)
-        hello = cfg.get("shop_welcome") or "به فروشگاه %s خوش اومدی 🌟\nسریع، پایدار و بدون قطعی." % self.esc(cfg.get("title") or NAME)
-        text = "%s\n\n💰 کیف پول: <b>%s</b>" % (hello, toman(u.get("wallet", 0)))
+        hello = cfg.get("shop_welcome") or "%s به <b>%s</b> خوش اومدی\nاینترنت آزاد، سریع و بی‌دردسر ⚡️" % (
+            self.em("hello", "👋"), self.esc(cfg.get("title") or NAME))
+        text = "%s\n\n%s کیف پول: <b>%s</b>" % (hello, self.em("wallet", "💰"), toman(u.get("wallet", 0)))
         if u.get("subs"):
-            text += "\n📦 سرویس‌های فعال: <b>%s</b>" % fa_num(len(u["subs"]))
+            text += "\n%s سرویس‌ها: <b>%s</b>" % (self.em("svc", "📦"), fa_num(len(u["subs"])))
         rows = [[("🛒 خرید سرویس", "buy"), ("🔄 تمدید", "renew")],
                 [("📦 سرویس‌های من", "svc"), ("💰 کیف پول", "wallet")]]
         if net == "tg" and self.app_url():
@@ -8164,6 +8266,8 @@ class Shop:
             row.append(("💬 پشتیبانی", cfg["support_url"] if cfg["support_url"].startswith("http") else "help"))
         rows.append(row)
         rows.append([("📚 راهنمای اتصال", "guide")])
+        if self.bot.admin.is_owner(net, uid.split(":", 1)[1]):
+            rows.append([("🛠 پنل مدیریت", "a:home", "danger")])
         self.show(net, chat, text, rows, msg)
 
     def trial_cfg(self):
@@ -8482,8 +8586,8 @@ class Shop:
 
     def delivered(self, net, chat, sub, head, msg=None):
         link = self.bot.sub_link(sub)
-        self.show(net, chat, "%s\n\n🔗 لینک اشتراک (کپی کن و توی اپ اضافه کن):\n<code>%s</code>\n\n📱 آموزش اتصال و دکمه‌ی افزودن به اپ‌ها توی صفحه‌ی اشتراکه." % (head, self.esc(link)),
-                  [[("📱 صفحه‌ی اشتراک و آموزش", link)], [("📦 سرویس‌های من", "svc"), ("🏠 منو", "m")]], msg)
+        self.show(net, chat, "%s %s\n\n🔗 لینک اشتراک (لمس کن تا کپی بشه):\n<code>%s</code>\n\n📱 آموزش اتصال و دکمه‌ی افزودن به اپ‌ها توی صفحه‌ی اشتراکه." % (self.em("party", "🎉"), head, self.esc(link)),
+                  [[("📱 صفحه‌ی اشتراک و آموزش", link, "primary")], [("📦 سرویس‌های من", "svc"), ("🏠 منو", "m")]], msg, effect="party")
 
     def client_name(self, uid, tag=""):
         prefix = re.sub(r"[^A-Za-z0-9_]", "", str(self.app.cfg.get("shop_prefix") or "tg"))[:10] or "tg"
@@ -8515,7 +8619,7 @@ class Shop:
                 head = "✅ کیف پولت <b>%s</b> شارژ شد.\nموجودی: %s" % (toman(o["price"]), toman(u["wallet"]))
                 o["status"] = "done"
                 self.save()
-                self.show(net, chat, head, [[("🛒 خرید سرویس", "buy"), ("🏠 منو", "m")]], msg)
+                self.show(net, chat, head, [[("🛒 خرید سرویس", "buy"), ("🏠 منو", "m")]], msg, effect="like")
             elif o["kind"] == "buy":
                 sub = self.app.panel.add_client(self.client_name(uid), o["gb"], o["days"], o.get("devices") or 0, False, self.inbounds())
                 with self.lock:
@@ -8547,7 +8651,7 @@ class Shop:
                         if k.startswith(o["sub"] + "|"):
                             self.bot.st["sent"].pop(k)  # a new period: its reminders may come again
                 self.save()
-                self.show(net, chat, head, [[("📦 سرویس‌های من", "sv:%s" % o["sub"]), ("🏠 منو", "m")]], msg)
+                self.show(net, chat, head, [[("📦 سرویس‌های من", "sv:%s" % o["sub"]), ("🏠 منو", "m")]], msg, effect="fire")
         except Exception as e:
             with self.lock:
                 o["status"], o["error"] = "failed", str(e)[:200]
@@ -8626,7 +8730,7 @@ class Shop:
             if data in ("noop",):
                 pass
             elif data.startswith(("ok:", "no:")):
-                if cid not in self.bot.st["admins"]:
+                if cid not in self.bot.st["admins"] and not self.bot.admin.is_owner(net, who.get("id")):
                     note = "فقط مدیرها"
                 else:
                     note = self.review(_int(data[3:]), data.startswith("ok:"),
@@ -8870,6 +8974,400 @@ class Shop:
                 return r.read(5 * 1024 * 1024)
         except (ValueError, OSError, KeyError):
             return None
+
+
+class AdminBot:
+    """The owner's control room in the bot: dashboard, users (find, create, renew, add traffic, on/off,
+    reset, delete), receipts, the shop, routes, backups, messages to customers, and the customer view."""
+
+    PAGE = 8
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.app = bot.app
+        self.wait = {}  # chat -> {"what": ..., ...}
+
+    @property
+    def sh(self):
+        return self.bot.shop
+
+    def owners(self):
+        return {x for x in re.split(r"[,\s]+", str(self.app.cfg.get("bot_owner") or "")) if x.isdigit()}
+
+    def is_owner(self, net, user_id):
+        return str(user_id) in self.owners()
+
+    def show(self, net, chat, text, rows, msg=None, effect=None):
+        return self.sh.show(net, chat, text, rows, msg, effect)
+
+    def users(self):
+        return group_users(clients_of(self.app))
+
+    def find(self, sub):
+        return next((u for u in self.users() if u.get("sub") == sub), None)
+
+    # screens ------------------------------------------------------------------------
+    def home(self, net, chat, msg=None):
+        users = self.users()
+        ms = time.time() * 1000
+        act = [u for u in users if self.sh.active(u)]
+        soon = [u for u in act if (u["expiry"] > 0 and u["expiry"] - ms < 3 * 86400000) or (u["total"] and u["used"] / u["total"] >= .9)]
+        st = self.sh.public()["stats"] if self.sh.d["orders"] or self.sh.d["users"] else {"today": 0, "review": 0}
+        rev = sum(1 for o in self.sh.d["orders"] if o["status"] == "review")
+        text = ("%s <b>پنل مدیریت %s</b>\n\n👥 کاربر فعال: <b>%s</b> از %s\n⚠️ رو به پایان: <b>%s</b>\n💵 فروش امروز: <b>%s</b>%s" % (
+            self.sh.em("admin", "🛠"), self.sh.esc(self.app.cfg.get("title") or NAME), fa_num(len(act)), fa_num(len(users)),
+            fa_num(len(soon)), toman(st.get("today", 0)), "\n🧾 رسید منتظر: <b>%s</b>" % fa_num(rev) if rev else ""))
+        rows = [[("👥 کاربرها", "a:users:0"), ("➕ کاربر جدید", "a:new")],
+                [("🧾 رسیدها%s" % (" (%s)" % fa_num(rev) if rev else ""), "a:rcpt", "success" if rev else ""), ("🛍 فروشگاه", "a:shop")],
+                [("📊 وضعیت سرور", "a:dash"), ("🛣 مسیرها", "a:routes")],
+                [("📣 پیام همگانی", "a:cast"), ("💾 بکاپ", "a:bk")],
+                [("✨ اموجی متحرک", "a:emoji"), ("⚙️ تنظیمات", "a:set")],
+                [("👁 نمای مشتری", "a:cust")]]
+        self.show(net, chat, text, rows, msg)
+
+    def dash(self, net, chat, msg):
+        sv = server_stats()
+        lines = ["📊 <b>وضعیت سرور</b>\n"]
+        if sv.get("load") is not None:
+            p = min(1, sv["load"] / max(1, sv.get("cpus", 1)))
+            lines.append("🧠 پردازنده  %s  %s٪" % (bar(p), fa_num(int(p * 100))))
+        if sv.get("mem_total"):
+            p = sv["mem_used"] / sv["mem_total"]
+            lines.append("💾 رم        %s  %s٪" % (bar(p), fa_num(int(p * 100))))
+        if sv.get("disk_total"):
+            p = sv["disk_used"] / sv["disk_total"]
+            lines.append("🗄 دیسک      %s  %s٪" % (bar(p), fa_num(int(p * 100))))
+        try:
+            on = self.app.panel.onlines()
+            lines.append("\n🟢 آنلاین: <b>%s</b>" % fa_num(len(on or [])))
+        except Exception:
+            pass
+        lines.append("⏱ آخرین تست مسیرها: %s" % (fa_num(int((time.time() - self.app.monitor.last_run) // 60)) + " دقیقه پیش"
+                                                if getattr(self.app.monitor, "last_run", 0) else "هنوز نه"))
+        self.show(net, chat, "\n".join(lines), [[("🔄 تازه‌سازی", "a:dash")], [("⬅️ پنل", "a:home")]], msg)
+
+    def user_list(self, net, chat, page, msg, q=""):
+        users = self.users()
+        if q:
+            users = [u for u in users if q.lower() in u["name"].lower()]
+        ms = time.time() * 1000
+        def rank(u):  # the ones that need attention first
+            if not self.sh.active(u):
+                return (2, u["name"])
+            soon = (u["expiry"] > 0 and u["expiry"] - ms < 3 * 86400000) or (u["total"] and u["used"] / u["total"] >= .9)
+            return (0 if soon else 1, u["name"])
+        users.sort(key=rank)
+        pages = max(1, math.ceil(len(users) / self.PAGE))
+        page = min(max(0, page), pages - 1)
+        rows = []
+        for u in users[page * self.PAGE:(page + 1) * self.PAGE]:
+            r = rank(u)[0]
+            rows.append([("%s %s" % ("🔴" if r == 2 else "🟠" if r == 0 else "🟢", u["name"]), "a:u:%s" % u["sub"])])
+        nav = []
+        if page > 0:
+            nav.append(("‹ قبلی", "a:users:%d" % (page - 1)))
+        if page < pages - 1:
+            nav.append(("بعدی ›", "a:users:%d" % (page + 1)))
+        rows.append(nav)
+        rows.append([("🔎 جستجو", "a:find"), ("➕ کاربر جدید", "a:new")])
+        rows.append([("⬅️ پنل", "a:home")])
+        head = "👥 <b>کاربرها</b> %s\n🟢 فعال  🟠 رو به پایان  🔴 تموم/خاموش" % (
+            "(%s از %s)" % (fa_num(page + 1), fa_num(pages)) if pages > 1 else "")
+        if q:
+            head = "🔎 نتیجه‌ی «%s»: %s کاربر" % (self.sh.esc(q), fa_num(len(users)))
+        if not users:
+            head += "\n\nکاربری پیدا نشد."
+        self.show(net, chat, head, rows, msg)
+
+    def user_card(self, net, chat, sub, msg, note=""):
+        u = self.find(sub)
+        if not u:
+            return self.show(net, chat, "این کاربر پیدا نشد.", [[("⬅️ کاربرها", "a:users:0")]], msg)
+        text = self.bot.user_text(u, link=True)
+        if note:
+            text = note + "\n\n" + text
+        on = u.get("enable", True)
+        rows = [[("➕ ۳۰ روز", "a:ux:%s:d30"), ("➕ ۱۰ گیگ", "a:ux:%s:g10"), ("➕ ۵۰ گیگ", "a:ux:%s:g50")],
+                [("🔄 تمدید ۳۰ روزه", "a:ux:%s:renew", "success"), ("♻️ صفر کردن مصرف", "a:ux:%s:reset")],
+                [("⏸ خاموش کن" if on else "▶️ روشن کن", "a:ux:%s:%s" % ("%s", "off" if on else "on"), "danger" if on else "success"),
+                 ("🗑 حذف", "a:del:%s")],
+                [("⬅️ کاربرها", "a:users:0"), ("🏠 پنل", "a:home")]]
+        rows = [[tuple([b[0], b[1].replace("%s", sub, 1)] + list(b[2:])) for b in row] for row in rows]
+        self.show(net, chat, text, rows, msg)
+
+    def user_act(self, net, chat, sub, act, msg):
+        u = self.find(sub)
+        if not u:
+            return self.show(net, chat, "این کاربر پیدا نشد.", [[("⬅️ کاربرها", "a:users:0")]], msg)
+        p, ms = self.app.panel, time.time() * 1000
+        try:
+            if re.fullmatch(r"d\d+", act):
+                days = _int(act[1:])
+                base = u["expiry"] if u["expiry"] > ms else ms
+                p.update_user(sub, u["emails"], {"expiryTime": int(base + days * 86400000), "enable": True})
+                note = "✅ %s روز اضافه شد" % fa_num(days)
+            elif re.fullmatch(r"g\d+", act):
+                gb = _int(act[1:])
+                p.update_user(sub, u["emails"], {"totalGB": int((u["total"] or 0) + gb * GB_BYTES), "enable": True})
+                note = "✅ %s گیگ اضافه شد" % fa_num(gb)
+            elif act == "renew":
+                p.reset_user(sub, u["emails"])
+                p.update_user(sub, u["emails"], {"expiryTime": int(ms + 30 * 86400000), "enable": True})
+                note = "✅ تمدید شد: ۳۰ روز از امروز و مصرف صفر"
+            elif act == "reset":
+                p.reset_user(sub, u["emails"])
+                note = "✅ مصرف صفر شد"
+            elif act in ("on", "off"):
+                p.update_user(sub, u["emails"], {"enable": act == "on"})
+                note = "▶️ روشن شد" if act == "on" else "⏸ خاموش شد"
+            elif act == "delete":
+                p.delete_user(sub, u["emails"])
+                return self.show(net, chat, "🗑 %s حذف شد." % self.sh.esc(u["name"]), [[("⬅️ کاربرها", "a:users:0"), ("🏠 پنل", "a:home")]], msg)
+            else:
+                return
+        except Exception as e:
+            note = "⚠️ نشد: %s" % self.sh.esc(str(e)[:150])
+        self.user_card(net, chat, sub, msg, note)
+
+    def receipts(self, net, chat, msg):
+        rev = [o for o in self.sh.d["orders"] if o["status"] == "review" and o.get("method") != "wallet"]
+        if not rev:
+            return self.show(net, chat, "🧾 رسیدی منتظر نیست ✨", [[("⬅️ پنل", "a:home")]], msg)
+        users = self.sh.d["users"]
+        rows = [[("✅ #%s · %s · %s" % (fa_num(o["id"]), (users.get(o["uid"]) or {}).get("name") or "?", toman(self.sh.total(o))), "a:rv:%s" % o["id"], "success")]
+                for o in rev[:10]]
+        self.show(net, chat, "🧾 <b>رسیدهای منتظر</b>\nروی هر کدوم بزن تا عکس رسید و دکمه‌های تأیید بیاد.", rows + [[("⬅️ پنل", "a:home")]], msg)
+
+    def receipt(self, net, chat, oid):
+        o = self.sh.order(oid)
+        if not o or o["status"] != "review":
+            return self.show(net, chat, "این رسید دیگه منتظر نیست.", [[("🧾 رسیدها", "a:rcpt")]])
+        u = self.sh.d["users"].get(o["uid"]) or {}
+        cap = "🧾 <b>رسید #%s</b>\n👤 %s\n🛍 %s%s\n💳 <b>%s</b>" % (fa_num(o["id"]), self.sh.esc(u.get("name") or o["uid"]), self.sh.KINDS[o["kind"]],
+                                                                " · " + self.sh.esc(o["plan_name"]) if o["plan_name"] else "", toman(self.sh.total(o)))
+        kb = self.sh.kb([[("✅ تأیید", "ok:%s" % o["id"]), ("❌ رد", "no:%s" % o["id"])]], net)
+        if o.get("receipt") and o["net"] == net:
+            try:
+                m = "sendPhoto" if o.get("receipt_kind") == "photo" else "sendDocument"
+                r = self.bot.call(net, m, {"chat_id": chat, o.get("receipt_kind", "photo"): o["receipt"], "caption": cap, "parse_mode": "HTML", "reply_markup": kb})
+                o.setdefault("admin_msgs", []).append([net, str(chat), r.get("message_id")])
+                return
+            except (ValueError, OSError):
+                pass
+        self.show(net, chat, cap, [[("✅ تأیید", "ok:%s" % o["id"]), ("❌ رد", "no:%s" % o["id"])]])
+
+    def shop_menu(self, net, chat, msg, note=""):
+        sh, cfg = self.sh, self.app.cfg
+        st = sh.public()["stats"]
+        rows = [[("🟢 فروشگاه روشنه · خاموش کن" if sh.on() else "🔴 فروشگاه خاموشه · روشن کن", "a:tg:shop_enable", "danger" if sh.on() else "success")]]
+        for p in sorted(sh.d["plans"], key=lambda p: ((p.get("kind") or "") == "traffic", p.get("order", 0))):
+            rows.append([("%s %s · %s" % ("✅" if p.get("active", True) else "🚫", p["name"], toman(p["price"])), "a:pl:%s" % p["id"])])
+        rows.append([("🧾 رسیدها", "a:rcpt"), ("⬅️ پنل", "a:home")])
+        text = "%s🛍 <b>فروشگاه</b>\n\n💵 امروز: <b>%s</b>\n📅 ۳۰ روز: <b>%s</b>\n👥 مشتری: %s · خریدار: %s\n\nبا لمس هر پلن، توی ربات نمایش داده می‌شه یا مخفی می‌شه. ساختن و قیمت‌گذاری پلن‌ها از پنل وب (تب فروش)." % (
+            note + "\n\n" if note else "", toman(st["today"]), toman(st["month"]), fa_num(st["customers"]), fa_num(st["buyers"]))
+        if not cfg.get("shop_cards"):
+            text += "\n\n⚠️ شماره کارت تنظیم نشده."
+        self.show(net, chat, text, rows, msg)
+
+    def routes(self, net, chat, msg, note=""):
+        rts = active_routes(live_routes(self.app, self.app.rt, UPSTREAMS.nodes()))
+        lines = ["🛣 <b>مسیرها</b>%s\n" % ("\n" + note if note else "")]
+        for r in rts[:25]:
+            lines.append("%s %s" % ("🔴" if r.get("down") else "🟢", self.sh.esc(r["name"])))
+        self.show(net, chat, "\n".join(lines), [[("🧪 تست همین الان", "a:test")], [("⬅️ پنل", "a:home")]], msg)
+
+    def settings(self, net, chat, msg):
+        cfg = self.app.cfg
+        def t(key, label):
+            on = bool(cfg.get(key))
+            return ("%s %s" % ("🟢" if on else "⚪️", label), "a:tg:%s" % key)
+        rows = [[t("shop_enable", "فروشگاه")], [t("user_page", "صفحه‌ی اشتراک مشتری")], [t("skip_down", "حذف موقت مسیر قطع از ساب")],
+                [("⬅️ پنل", "a:home")]]
+        self.show(net, chat, "⚙️ <b>تنظیمات سریع</b>\nلمس کن تا روشن یا خاموش بشه. بقیه‌ی تنظیمات توی پنل وب.", rows, msg)
+
+    def emoji_help(self, net, chat, msg):
+        cur = self.sh.emoji_map()
+        keys = ["hello", "buy", "renew", "svc", "wallet", "trial", "gift", "ref", "help", "guide", "home", "ok", "no", "party", "admin"]
+        self.wait["%s:%s" % (net, chat)] = {"what": "emoji"}
+        self.show(net, chat, ("✨ <b>اموجی متحرک</b>\n\nبرای اینکه دکمه‌ها و پیام‌ها اموجی متحرک داشته باشن، <b>صاحب ربات باید تلگرام پرمیوم داشته باشه</b>.\n\n"
+                              "حالا یه پیام بفرست که هر خطش یه کلید و یه اموجی پرمیوم باشه، مثلاً:\n<code>buy 🛒\nwallet 💰\nparty 🎉</code>\n"
+                              "(به‌جای این‌ها اموجی‌های متحرک پرمیوم رو از پنل اموجی تلگرام بذار.)\n\nکلیدها: <code>%s</code>\n\nالان تنظیم‌شده: %s") % (
+            " ".join(keys), "، ".join(cur) or "هیچی"),
+            [[("🧹 پاک کردن همه", "a:emclear", "danger")], [("⬅️ پنل", "a:home")]], msg)
+
+    def cast_start(self, net, chat, msg):
+        self.wait["%s:%s" % (net, chat)] = {"what": "cast"}
+        self.show(net, chat, "📣 <b>پیام همگانی</b>\nمتن پیام رو بفرست. بعدش انتخاب می‌کنی به کی برسه.", [[("✖️ انصراف", "a:home", "danger")]], msg)
+
+    # input ---------------------------------------------------------------------------
+    def on_text(self, net, chat, msg):
+        """A message from the owner while a step waits for text. -> True when used."""
+        cid = "%s:%s" % (net, chat)
+        w = self.wait.get(cid)
+        text = (msg.get("text") or "").strip()
+        if not w or not text or text.startswith("/"):
+            return False
+        what = w["what"]
+        if what == "find":
+            self.wait.pop(cid)
+            self.user_list(net, chat, 0, None, q=text)
+        elif what == "new_name":
+            if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", text):
+                self.show(net, chat, "اسم فقط حروف انگلیسی، عدد و - _ . @ باشه. دوباره بفرست:", [[("✖️ انصراف", "a:home", "danger")]])
+                return True
+            if any(c["email"] == text for c in clients_of(self.app)):
+                self.show(net, chat, "این اسم هست؛ یه اسم دیگه بفرست:", [[("✖️ انصراف", "a:home", "danger")]])
+                return True
+            self.wait[cid] = {"what": "new", "name": text}
+            rows = [[("%s گیگ" % fa_num(g) if g else "♾ نامحدود", "a:ng:%d" % g) for g in r] for r in ((10, 20, 30), (50, 100, 0))]
+            self.show(net, chat, "👤 <b>%s</b>\nحجم رو انتخاب کن:" % self.sh.esc(text), rows + [[("✖️ انصراف", "a:home", "danger")]])
+        elif what == "cast":
+            self.wait[cid] = {"what": "cast_to", "text": text}
+            T = [("all", "همه"), ("active", "فعال‌ها"), ("expiring", "رو به پایان"), ("ended", "تموم‌شده‌ها")]
+            rows = [[("%s (%s)" % (l, fa_num(self.bot.broadcast(text, k, dry=True))), "a:cg:%s" % k)] for k, l in T]
+            self.show(net, chat, "📣 به کی برسه؟ (عدد = مشتری‌های وصل به ربات)", rows + [[("✖️ انصراف", "a:home", "danger")]])
+        elif what == "emoji":
+            self.wait.pop(cid)
+            got = {}
+            ents = [e for e in msg.get("entities") or [] if e.get("type") == "custom_emoji"]
+            raw = msg.get("text") or ""
+            u16 = raw.encode("utf-16-le")
+            for e in ents:  # offsets are in UTF-16 code units
+                before = u16[:e["offset"] * 2].decode("utf-16-le", "ignore")
+                line = before.split("\n")[-1].strip().split()
+                if line:
+                    got[line[0].lower()] = e["custom_emoji_id"]
+            if not got:
+                self.show(net, chat, "اموجی پرمیوم توی پیامت نبود. هر خط: کلید + اموجی متحرک.", [[("✨ دوباره", "a:emoji"), ("⬅️ پنل", "a:home")]])
+                return True
+            cfg = load_config()
+            cur = dict(self.sh.emoji_map(), **got)
+            cfg["bot_emoji"] = "\n".join("%s=%s" % kv for kv in cur.items())
+            save_config(cfg)
+            self.app.reload()
+            self.sh.plain = False
+            self.show(net, chat, "%s ذخیره شد: %s" % (self.sh.em("ok", "✅"), "، ".join(got)), [[("👁 دیدن منوی مشتری", "a:cust"), ("⬅️ پنل", "a:home")]])
+        else:
+            return False
+        return True
+
+    # buttons ------------------------------------------------------------------------
+    def on_callback(self, net, chat, who, data, mid):
+        """-> the toast text for the tap."""
+        if not self.is_owner(net, who.get("id")):
+            return "فقط صاحب ربات"
+        cid = "%s:%s" % (net, chat)
+        with self.bot.lock:  # the owner gets every alert in this chat
+            self.bot.st["admins"].setdefault(cid, {"name": who.get("first_name", "owner"), "events": "all", "paused": False, "at": int(time.time())})
+        parts = data.split(":")
+        head = parts[1] if len(parts) > 1 else "home"
+        if head not in ("ng", "nd", "mk", "cg"):
+            self.wait.pop(cid, None)
+        if head == "home":
+            self.home(net, chat, mid)
+        elif head == "dash":
+            self.dash(net, chat, mid)
+        elif head == "users":
+            self.user_list(net, chat, _int(parts[2]) if len(parts) > 2 else 0, mid)
+        elif head == "find":
+            self.wait[cid] = {"what": "find"}
+            self.show(net, chat, "🔎 اسم (یا بخشی از اسم) کاربر رو بفرست:", [[("✖️ انصراف", "a:users:0", "danger")]], mid)
+        elif head == "u":
+            self.user_card(net, chat, parts[2], mid)
+        elif head == "ux":
+            self.user_act(net, chat, parts[2], parts[3], mid)
+            return "انجام شد"
+        elif head == "del":
+            u = self.find(parts[2])
+            self.show(net, chat, "🗑 <b>%s</b> برای همیشه حذف بشه؟" % self.sh.esc(u["name"] if u else parts[2]),
+                      [[("🗑 آره، حذف کن", "a:ux:%s:delete" % parts[2], "danger"), ("نه", "a:u:%s" % parts[2])]], mid)
+        elif head == "new":
+            self.wait[cid] = {"what": "new_name"}
+            self.show(net, chat, "➕ <b>کاربر جدید</b>\nاسم کاربر رو بفرست (انگلیسی، مثلاً <code>ali</code>):", [[("✖️ انصراف", "a:home", "danger")]], mid)
+        elif head == "ng":
+            w = self.wait.get(cid) or {}
+            if w.get("what") != "new":
+                return "از اول شروع کن"
+            w["gb"] = _int(parts[2])
+            rows = [[("%s روز" % fa_num(d) if d else "♾ بدون محدودیت", "a:nd:%d" % d) for d in r] for r in ((30, 60, 90), (7, 180, 0))]
+            self.show(net, chat, "👤 <b>%s</b> · %s\nمدت رو انتخاب کن:" % (self.sh.esc(w["name"]), "%s گیگ" % fa_num(w["gb"]) if w["gb"] else "نامحدود"),
+                      rows + [[("✖️ انصراف", "a:home", "danger")]], mid)
+        elif head == "nd":
+            w = self.wait.get(cid) or {}
+            if w.get("what") != "new" or "gb" not in w:
+                return "از اول شروع کن"
+            w["days"] = _int(parts[2])
+            self.show(net, chat, "👤 <b>%s</b>\n📊 %s\n⏳ %s\n\nبسازم؟" % (self.sh.esc(w["name"]), "%s گیگ" % fa_num(w["gb"]) if w["gb"] else "حجم نامحدود",
+                                                                        "%s روز" % fa_num(w["days"]) if w["days"] else "بدون محدودیت زمان"),
+                      [[("✅ بساز", "a:mk", "success"), ("✖️ انصراف", "a:home", "danger")]], mid)
+        elif head == "mk":
+            w = self.wait.pop(cid, None) or {}
+            if w.get("what") != "new" or "days" not in w:
+                return "از اول شروع کن"
+            try:
+                sub = self.app.panel.add_client(w["name"], w["gb"], w["days"], 0, False, self.sh.inbounds())
+            except Exception as e:
+                self.show(net, chat, "⚠️ ساخته نشد: %s" % self.sh.esc(str(e)[:160]), [[("⬅️ پنل", "a:home")]], mid)
+                return ""
+            self.show(net, chat, "%s <b>%s</b> ساخته شد!\n\n🔗 <code>%s</code>" % (self.sh.em("party", "🎉"), self.sh.esc(w["name"]), self.sh.esc(self.bot.sub_link(sub))),
+                      [[("👤 کارت کاربر", "a:u:%s" % sub), ("➕ یکی دیگه", "a:new")], [("🏠 پنل", "a:home")]], mid, effect="party")
+        elif head == "rcpt":
+            self.receipts(net, chat, mid)
+        elif head == "rv":
+            self.receipt(net, chat, _int(parts[2]))
+        elif head == "shop":
+            self.shop_menu(net, chat, mid)
+        elif head == "pl":
+            p = self.sh.plan(parts[2])
+            if p:
+                with self.sh.lock:
+                    p["active"] = not p.get("active", True)
+                self.sh.save()
+            self.shop_menu(net, chat, mid)
+        elif head == "tg":
+            key = parts[2]
+            if key not in ("shop_enable", "user_page", "skip_down"):
+                return ""
+            cfg = load_config()
+            cfg[key] = not cfg.get(key, key != "shop_enable")
+            save_config(cfg)
+            self.app.reload()
+            threading.Thread(target=self.bot.menu_button, daemon=True).start()
+            (self.shop_menu if key == "shop_enable" else self.settings)(net, chat, mid)
+            return "روشن شد" if cfg[key] else "خاموش شد"
+        elif head == "routes":
+            self.routes(net, chat, mid)
+        elif head == "test":
+            threading.Thread(target=lambda: (self.app.monitor.run_once(servers=False), self.routes(net, chat, mid, "✅ تست تموم شد")), daemon=True).start()
+            return "در حال تست…"
+        elif head == "bk":
+            sent, errors = send_backup(self.app)
+            return "بکاپ فرستاده شد" if sent else "نشد: " + "؛ ".join(errors)[:150]
+        elif head == "cast":
+            self.cast_start(net, chat, mid)
+        elif head == "cg":
+            w = self.wait.pop(cid, None) or {}
+            if w.get("what") != "cast_to":
+                return "از اول شروع کن"
+            n = self.bot.broadcast(w["text"], parts[2], dry=True)
+            threading.Thread(target=self.bot.broadcast, args=(w["text"], parts[2]), daemon=True).start()
+            self.show(net, chat, "📣 در حال ارسال به %s چت…" % fa_num(n), [[("🏠 پنل", "a:home")]], mid)
+        elif head == "set":
+            self.settings(net, chat, mid)
+        elif head == "emoji":
+            self.emoji_help(net, chat, mid)
+        elif head == "emclear":
+            cfg = load_config()
+            cfg["bot_emoji"] = ""
+            save_config(cfg)
+            self.app.reload()
+            self.emoji_help(net, chat, mid)
+            return "پاک شد"
+        elif head == "cust":
+            uid = "%s:%s" % (net, who.get("id"))
+            self.sh.user(uid, who)
+            self.sh.main_menu(net, chat, uid, mid)
+        return ""
 
 
 def shop_action(app, act, body, done, fail):

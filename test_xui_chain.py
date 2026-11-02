@@ -1524,7 +1524,7 @@ class Telegram(BaseHTTPRequestHandler):
 
 class BotAPI(BaseHTTPRequestHandler):
     """A stand-in Bot API: records what is sent, answers getMe and getUpdates."""
-    sent, updates, blocked, other, outside = [], [], set(), [], False
+    sent, updates, blocked, other, outside, no_icons = [], [], set(), [], False, False
 
     def log_message(self, *a):
         pass
@@ -1537,6 +1537,8 @@ class BotAPI(BaseHTTPRequestHandler):
         elif method == "getUpdates":
             res, BotAPI.updates = list(BotAPI.updates), []
         elif method in ("sendMessage", "editMessageText", "sendPhoto", "sendDocument"):
+            if BotAPI.no_icons and "icon_custom_emoji_id" in json.dumps(body):
+                return self.answer(400, {"ok": False, "description": "Bad Request: custom emoji can't be used"})
             if str(body.get("chat_id")) in BotAPI.blocked:
                 return self.answer(403, {"ok": False, "description": "Forbidden: bot was blocked by the user"})
             BotAPI.sent.append(dict(body, method=method))
@@ -1596,7 +1598,7 @@ class BotBase(unittest.TestCase):
 
     def say(self, chat, text, name="Ali"):
         BotAPI.sent = []
-        self.bot.handle("tg", {"chat": {"id": chat}, "from": {"first_name": name}, "text": text})
+        self.bot.handle("tg", {"chat": {"id": chat}, "from": {"id": chat, "first_name": name}, "text": text})
         return BotAPI.sent[-1]["text"] if BotAPI.sent else ""
 
 
@@ -1692,6 +1694,12 @@ class FakeShopPanel:
 
     def reset_user(self, sub, emails):
         self.reset.append(sub)
+
+    def delete_user(self, sub, emails):
+        self.deleted = getattr(self, "deleted", []) + [sub]
+
+    def onlines(self):
+        return {"sara"}
 
     def configured(self):
         return False
@@ -1801,6 +1809,87 @@ class ShopTests(BotBase):
         self.tap(701, "trial")
         self.tap(701, "trial")
         self.assertEqual(sum(1 for a in self.panel.added if a[0].endswith("_t")), 1)
+
+    def admin_tap(self, user, data):
+        BotAPI.sent, BotAPI.other = [], []
+        self.bot.on_callback("tg", {"id": "q", "data": data, "from": {"id": user, "first_name": "Boss"},
+                                    "message": {"chat": {"id": user}, "message_id": 9}})
+        toast = next((b.get("text", "") for m, b in BotAPI.other if m == "answerCallbackQuery"), "")
+        return (BotAPI.sent[-1] if BotAPI.sent else {}), toast
+
+    def test_owner_runs_everything_from_the_bot(self):
+        cfg = xc.load_config()
+        cfg["bot_owner"] = "42"
+        xc.save_config(cfg)
+        self.app.reload()
+        self.assertIn("42", self.say(42, "/id"))
+        self.assertIn("43", self.say(43, "/id"))
+        out = self.say(42, "/start")
+        self.assertIn("پنل مدیریت", out)
+        self.assertIn("tg:42", self.bot.st["admins"])  # the owner gets the alerts too
+        m, toast = self.admin_tap(43, "a:home")
+        self.assertEqual(toast, "فقط صاحب ربات")
+        m, _ = self.admin_tap(42, "a:users:0")
+        self.assertIn("a:u:sarasub12345", json.dumps(m["reply_markup"]))
+        m, _ = self.admin_tap(42, "a:u:sarasub12345")
+        self.assertIn("sara", m["text"])
+        self.admin_tap(42, "a:ux:sarasub12345:d30")
+        sub, emails, ch = self.panel.updated[-1]
+        self.assertGreater(ch["expiryTime"], (time.time() + 32 * 86400) * 1000)
+        self.admin_tap(42, "a:ux:sarasub12345:g10")
+        self.assertEqual(self.panel.updated[-1][2]["totalGB"], 20 * GB)
+        self.admin_tap(42, "a:ux:sarasub12345:off")
+        self.assertEqual(self.panel.updated[-1][2], {"enable": False})
+        self.admin_tap(42, "a:ux:sarasub12345:delete")
+        self.assertEqual(self.panel.deleted, ["sarasub12345"])
+        # create a user step by step
+        self.admin_tap(42, "a:new")
+        self.say(42, "bad name!")
+        self.assertNotIn("gb", self.bot.admin.wait["tg:42"])
+        self.say(42, "newguy")
+        self.admin_tap(42, "a:ng:20")
+        self.admin_tap(42, "a:nd:30")
+        m, _ = self.admin_tap(42, "a:mk")
+        self.assertEqual(self.panel.added[-1][:3], ("newguy", 20, 30))
+        self.assertIn("ساخته شد", m["text"])
+        self.assertEqual(m.get("message_effect_id"), xc.Shop.EFFECT["party"])  # confetti
+        # the shop switch, and the customer view with a way back
+        self.admin_tap(42, "a:tg:shop_enable")
+        self.assertFalse(xc.load_config()["shop_enable"])
+        self.admin_tap(42, "a:tg:shop_enable")
+        m, _ = self.admin_tap(42, "a:cust")
+        self.assertIn("a:home", json.dumps(m["reply_markup"]))
+        self.assertIn("خوش اومدی", m["text"])
+
+    def test_colours_and_animated_emoji(self):
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 510, "type": "private"}, "from": {"id": 510}, "text": "/start"})
+        btns = {b.get("callback_data"): b for row in BotAPI.sent[-1]["reply_markup"]["inline_keyboard"] for b in row}
+        self.assertEqual(btns["buy"]["style"], "success")
+        self.assertEqual(btns["renew"]["style"], "primary")
+        cfg = xc.load_config()
+        cfg["bot_owner"] = "42"
+        xc.save_config(cfg)
+        self.app.reload()
+        self.admin_tap(42, "a:emoji")
+        text = "buy 🛒\nwallet 💰"
+        self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": text, "entities": [
+            {"type": "custom_emoji", "offset": 4, "length": 2, "custom_emoji_id": "111"},
+            {"type": "custom_emoji", "offset": 14, "length": 2, "custom_emoji_id": "222"}]})
+        self.assertEqual(self.shop.emoji_map(), {"buy": "111", "wallet": "222"})
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 511, "type": "private"}, "from": {"id": 511}, "text": "/start"})
+        m = BotAPI.sent[-1]
+        self.assertIn('emoji-id="222"', m["text"])
+        btns = {b.get("callback_data"): b for row in m["reply_markup"]["inline_keyboard"] for b in row}
+        self.assertEqual(btns["buy"]["icon_custom_emoji_id"], "111")
+        BotAPI.no_icons = True  # an owner without Premium: Telegram refuses, the bot goes on without them
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 512, "type": "private"}, "from": {"id": 512}, "text": "/start"})
+        m = BotAPI.sent[-1]
+        self.assertNotIn("tg-emoji", m["text"])
+        self.assertNotIn("icon_custom_emoji_id", json.dumps(m))
+        self.assertTrue(self.shop.plain)
 
     def init_data(self, uid, age=0, token="1:test"):
         q = {"auth_date": str(int(time.time()) - age), "query_id": "AAA",
