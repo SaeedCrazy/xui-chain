@@ -1,6 +1,8 @@
 """Tests: python3 -m unittest -v test_xui_chain.py"""
 
 import base64
+import hashlib
+import hmac
 import calendar
 import http.cookiejar
 import json
@@ -719,6 +721,17 @@ class EndToEnd(unittest.TestCase):
         status, h, plain = self.get("/chain/abc?format=plain", ua="clash.meta")
         self.assertEqual(status, 200)
         self.assertEqual(xc.split_lines(plain), links)
+
+    def test_mini_app_routes(self):
+        status, h, body = self.get("/app/")
+        self.assertEqual(status, 200)
+        self.assertIn("telegram-web-app.js", body)
+        req = urllib.request.Request(self.base + "/app/api", data=json.dumps({"action": "state", "initData": "x=1&hash=00"}).encode())
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            self.fail("unsigned call accepted")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 401)
 
     def test_unknown_user_and_paths(self):
         self.assertEqual(self.get("/chain/nope")[0], 404)
@@ -1788,6 +1801,40 @@ class ShopTests(BotBase):
         self.tap(701, "trial")
         self.tap(701, "trial")
         self.assertEqual(sum(1 for a in self.panel.added if a[0].endswith("_t")), 1)
+
+    def init_data(self, uid, age=0, token="1:test"):
+        q = {"auth_date": str(int(time.time()) - age), "query_id": "AAA",
+             "user": json.dumps({"id": uid, "first_name": "Mini", "username": "mini"})}
+        dcs = "\n".join("%s=%s" % (k, q[k]) for k in sorted(q))
+        secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+        q["hash"] = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
+        return urllib.parse.urlencode(q)
+
+    def test_mini_app(self):
+        self.assertEqual(self.shop.check_init(self.init_data(900))["id"], 900)
+        self.assertIsNone(self.shop.check_init(self.init_data(900, token="2:other")))  # signed by another bot
+        self.assertIsNone(self.shop.check_init(self.init_data(900, age=2 * 86400)))    # too old
+        self.assertIsNone(self.shop.check_init(self.init_data(900).replace("Mini", "Evil")))
+        user = {"id": 900, "first_name": "Mini"}
+        ok, st = self.shop.app_api(user, "state", {})
+        self.assertTrue(ok)
+        self.assertEqual([p["id"] for p in st["plans"]], ["p30"])
+        self.assertTrue(st["trial"])
+        self.shop.user("tg:900")["wallet"] = 200000
+        ok, inv = self.shop.app_api(user, "order", {"kind": "buy", "plan": "p30"})
+        self.assertEqual((ok, inv["total"]), (True, 150000))
+        self.assertFalse(self.shop.app_api({"id": 901}, "wallet", {"id": inv["id"]})[0])  # someone else's invoice
+        ok, res = self.shop.app_api(user, "wallet", {"id": inv["id"]})
+        self.assertTrue(ok, res)
+        self.assertIn(res["sub"], res["link"])
+        self.assertEqual(self.shop.user("tg:900")["wallet"], 50000)
+        self.assertEqual(self.shop.user("tg:900")["subs"], [res["sub"]])  # listed once the panel has it
+        ok, inv = self.shop.app_api(user, "order", {"kind": "topup", "amount": 100000})
+        ok, card = self.shop.app_api(user, "card", {"id": inv["id"]})
+        self.assertEqual(card["cards"][0]["number"], "6037-1111-2222-3333")
+        self.assertEqual(self.shop.wait["tg:900"]["order"], inv["id"])  # the receipt photo is awaited in the chat
+        self.assertFalse(self.shop.app_api(user, "order", {"kind": "topup", "amount": 123})[0])
+        self.assertFalse(self.shop.app_api(user, "order", {"kind": "renew", "plan": "p30", "sub": "sarasub12345"})[0])
 
     def test_renew_traffic_and_failed_panel(self):
         u = self.shop.user("tg:800")

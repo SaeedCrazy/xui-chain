@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.11.1"
+VERSION = "5.12.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -4955,9 +4955,9 @@ def do_action(app, action, body, host):
                 cfg["monitor_minutes"] = min(1440, max(2, _int(body["monitor_minutes"]) or 10))
             save_config(cfg)
             app.reload()
-            if any(k.startswith("bot_") or k == "bale_token" for k in body):
+            if any(k.startswith(("bot_", "shop_")) or k == "bale_token" for k in body):
                 app.bot.me = {}
-                threading.Thread(target=app.bot.start, daemon=True).start()
+                threading.Thread(target=lambda: (app.bot.start(), app.bot.menu_button()), daemon=True).start()
             if any(k in body for k in ("panel_user", "panel_pass", "panel_token", "panel_url", "panel_auto")):
                 app.panel.cookies, app.panel.version = {}, None
                 app.panel.forget()
@@ -7740,10 +7740,14 @@ class Bot:
                 self.st["admins"][cid] = {"name": name, "events": "all", "paused": False, "at": int(time.time())}
             self.save()
             self.app.reload()
-            return reply("✅ این چت به‌عنوان مدیر به %s وصل شد.\n\nدستورها:\n/status خلاصه\n/user اسم — وضعیت یه کاربر\n\nکدوم هشدارها بیاد رو از پنل انتخاب کن." % NAME,
+            return reply("✅ این چت به‌عنوان مدیر به %s وصل شد.\n\nدستورها:\n/status خلاصه\n/user اسم — وضعیت یه کاربر\n/backup بکاپ همین الان\n\nهشدارها، رسیدهای فروش و بکاپ‌های خودکار همین‌جا میاد." % NAME,
                          {"remove_keyboard": True})
         if admin and cmd in ("/status", "/user"):
             return reply(self.admin_status() if cmd == "/status" else self.admin_user(arg))
+        if admin and cmd == "/backup":
+            reply("💾 در حال ساخت بکاپ…")
+            sent, errors = send_backup(self.app)
+            return reply("✅ بکاپ فرستاده شد" if sent else "⚠️ " + "؛ ".join(errors or ["بکاپ فرستاده نشد"]))
         if self.shop.on() and self.shop.on_message(net, msg):
             return
         if not text:
@@ -7780,7 +7784,7 @@ class Bot:
             return reply("✅ وصل شد. قبل از تموم شدن حجم یا زمانت همین‌جا خبرت می‌کنم.\n\n" + self.user_text(u),
                          self.customer_keyboard())
         if admin:
-            return reply("دستورها:\n/status خلاصه\n/user اسم — وضعیت یه کاربر")
+            return reply("دستورها:\n/status خلاصه\n/user اسم — وضعیت یه کاربر\n/backup بکاپ همین الان")
         if self.shop.on() and (msg.get("chat") or {}).get("type", "private") == "private":
             return self.shop.on_start(net, chat, who, "")
         if cust:
@@ -7964,10 +7968,26 @@ class Bot:
         self.save()
         return len(chats)
 
+    def menu_button(self):
+        """The chat's menu button opens the mini app while the shop is on (set again when that changes)."""
+        if "tg" not in self.nets():
+            return
+        url = self.shop.app_url() if self.shop.on() else ""
+        if self.st.get("menu_url") == url:
+            return
+        btn = {"type": "web_app", "text": "فروشگاه", "web_app": {"url": url}} if url else {"type": "commands"}
+        try:
+            self.call("tg", "setChatMenuButton", {"menu_button": btn}, timeout=10)
+            self.st["menu_url"] = url
+            self.save()
+        except (ValueError, OSError) as e:
+            print("menu button: %s" % e, flush=True)
+
     def loop(self):
         while True:
             try:
                 self.start()
+                self.menu_button()
                 self.retry()
                 self.reminders()
                 self.daily_users()
@@ -8085,8 +8105,18 @@ class Shop:
 
     # Telegram helpers -------------------------------------------------------------
     def kb(self, rows):
-        return {"inline_keyboard": [[{"text": t, "callback_data": d} if not d.startswith("http") else {"text": t, "url": d}
-                                     for t, d in row] for row in rows if row]}
+        def btn(t, d):
+            if d.startswith("app:"):
+                return {"text": t, "web_app": {"url": d[4:]}}
+            return {"text": t, "url": d} if d.startswith("http") else {"text": t, "callback_data": d}
+        return {"inline_keyboard": [[btn(t, d) for t, d in row] for row in rows if row]}
+
+    def app_url(self):
+        """The mini app's address; Telegram opens only https pages."""
+        base = link_base(self.app.rt, self.bot.st.get("host") or "")
+        if not base.startswith("https://") or "//localhost" in base or "///" in base:
+            return ""
+        return base[:-len(self.app.rt["sub_path"]) - 1] + "app/"
 
     def show(self, net, chat, text, rows=None, msg=None):
         """Edit the message in place when there is one (smooth menus), else send a new one."""
@@ -8120,6 +8150,8 @@ class Shop:
             text += "\n📦 سرویس‌های فعال: <b>%s</b>" % fa_num(len(u["subs"]))
         rows = [[("🛒 خرید سرویس", "buy"), ("🔄 تمدید", "renew")],
                 [("📦 سرویس‌های من", "svc"), ("💰 کیف پول", "wallet")]]
+        if net == "tg" and self.app_url():
+            rows.insert(0, [("✨ باز کردن فروشگاه", "app:" + self.app_url())])
         extra = []
         if self.trial_cfg() and not u.get("trial"):
             extra.append(("🆓 تست رایگان", "trial"))
@@ -8350,20 +8382,27 @@ class Shop:
             self.bot.notify_admins("shop", "🧾 رسید #%s رسید ولی به هیچ چت مدیری نرسید؛ از پنل بررسی کن." % o["id"])
         return True
 
-    def apply_code(self, net, chat, uid, oid, text):
-        o = self.order(oid)
-        if not o or o["status"] not in ("new", "receipt"):
-            return True
+    def use_code(self, o, uid, text):
+        """Put a discount code on an order. -> "" or why not."""
+        if not o or o["status"] not in ("new", "receipt") or o["kind"] == "topup":
+            return "این فاکتور دیگه قابل تغییر نیست."
         code = text.strip().upper()
         c = next((c for c in self.d["codes"] if c.get("kind") == "discount" and c["code"].upper() == code), None)
         err = self.code_error(c, uid)
         if err:
-            self.show(net, chat, "❌ " + err, [[("🏷 یه کد دیگه", "dc:%s" % oid), ("⬅️ فاکتور", "iv:%s" % oid)]])
-            return True
+            return err
         disc = o["price"] * _int(c.get("pct")) // 100 if c.get("pct") else _int(c.get("amount"))
         with self.lock:
             o["discount"], o["code"] = min(o["price"], disc), c["code"]
         self.save()
+        return ""
+
+    def apply_code(self, net, chat, uid, oid, text):
+        o = self.order(oid)
+        err = self.use_code(o, uid, text)
+        if err:
+            self.show(net, chat, "❌ " + err, [[("🏷 یه کد دیگه", "dc:%s" % oid), ("⬅️ فاکتور", "iv:%s" % oid)]])
+            return True
         self.invoice(net, chat, o)
         return True
 
@@ -8378,18 +8417,27 @@ class Shop:
             return "این کد رو قبلاً استفاده کردی."
         return ""
 
-    def redeem(self, net, chat, uid, text):
+    def use_gift(self, uid, text):
+        """-> (error, amount)."""
         code = text.strip().upper()
         c = next((c for c in self.d["codes"] if c.get("kind") == "gift" and c["code"].upper() == code), None)
         err = self.code_error(c, uid)
         if err:
-            self.show(net, chat, "❌ " + err, [[("🎁 یه کد دیگه", "gift")], self.back()])
-            return True
+            return err, 0
         with self.lock:
             c.setdefault("used_by", []).append(uid)
             u = self.user(uid)
             u["wallet"] = u.get("wallet", 0) + _int(c.get("amount"))
         self.save()
+        return "", _int(c.get("amount"))
+
+    def redeem(self, net, chat, uid, text):
+        err, amount = self.use_gift(uid, text)
+        if err:
+            self.show(net, chat, "❌ " + err, [[("🎁 یه کد دیگه", "gift")], self.back()])
+            return True
+        u = self.user(uid)
+        c = {"amount": amount}
         self.show(net, chat, "🎉 <b>%s</b> به کیف پولت اضافه شد!\nموجودی: %s" % (toman(c.get("amount")), toman(u["wallet"])),
                   [[("🛒 خرید سرویس", "buy")], self.back()])
         return True
@@ -8406,22 +8454,30 @@ class Shop:
         self.show(net, chat, "⏳ در حال آماده‌سازی…", None, msg)
         self.fulfil(o, by="کیف پول", msg=msg)
 
-    def trial(self, net, chat, uid, who, msg):
+    def make_trial(self, uid, net, chat):
+        """-> (error, sub)."""
         t = self.trial_cfg()
         u = self.user(uid)
         if not t or u.get("trial"):
-            return self.show(net, chat, "تست رایگان قبلاً استفاده شده 🙏", [self.back()], msg)
+            return "تست رایگان قبلاً استفاده شده 🙏", ""
         try:
             sub = self.app.panel.add_client(self.client_name(uid, "t"), t[0], t[1], 1, False, self.inbounds())
         except Exception as e:
             self.bot.notify_admins("shop", "⚠️ ساخت تست رایگان نشد: %s" % e)
-            return self.show(net, chat, "الان نشد؛ چند دقیقه‌ی دیگه دوباره امتحان کن 🙏", [self.back()], msg)
+            return "الان نشد؛ چند دقیقه‌ی دیگه دوباره امتحان کن 🙏", ""
         with self.lock:
             u["trial"] = True
             u.setdefault("subs", []).append(sub)
             self.bot.st["customers"]["%s:%s" % (net, chat)] = {"sub": sub, "name": u.get("name", ""), "at": int(time.time())}
         self.save()
         self.bot.save()
+        return "", sub
+
+    def trial(self, net, chat, uid, who, msg):
+        err, sub = self.make_trial(uid, net, chat)
+        if err:
+            return self.show(net, chat, err, [self.back()], msg)
+        t = self.trial_cfg()
         self.delivered(net, chat, sub, "🎁 <b>تست رایگانت آماده‌ست!</b>\n%s گیگ · %s روز" % (fa_num(_fmt_num(t[0])), fa_num(t[1])), msg)
 
     def delivered(self, net, chat, sub, head, msg=None):
@@ -8670,6 +8726,121 @@ class Shop:
             return self.show(net, chat, g, [self.back()], mid)
         return self.main_menu(net, chat, uid, mid)
 
+    # mini app ---------------------------------------------------------------------
+    def check_init(self, init):
+        """Telegram's signed initData -> its user dict, or None (bad signature or older than a day)."""
+        token = (self.bot.nets().get("tg") or (None, ""))[1]
+        if not token or not init:
+            return None
+        q = dict(urllib.parse.parse_qsl(init, keep_blank_values=True))
+        got = q.pop("hash", "")
+        dcs = "\n".join("%s=%s" % (k, q[k]) for k in sorted(q))
+        secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+        if not got or not hmac.compare_digest(hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest(), got):
+            return None
+        if time.time() - _int(q.get("auth_date")) > 86400:
+            return None
+        try:
+            user = json.loads(q.get("user") or "{}")
+        except ValueError:
+            return None
+        return user if user.get("id") else None
+
+    def app_state(self, uid, chat):
+        cfg = self.app.cfg
+        u = self.user(uid)
+        svcs = []
+        for sub, x in self.services(uid, "tg:%s" % chat):
+            if x:
+                svcs.append({"sub": sub, "name": x["name"], "active": self.active(x), "used": x["used"], "total": x["total"],
+                             "expiry": x["expiry"], "link": self.bot.sub_link(sub)})
+        me = (self.bot.me.get("tg") or {}).get("username", "")
+        pub = lambda p: {k: p.get(k) for k in ("id", "name", "gb", "days", "price", "devices", "desc", "kind")}
+        return {"title": cfg.get("title") or NAME, "welcome": cfg.get("shop_welcome") or "", "name": u.get("name", ""),
+                "wallet": u.get("wallet", 0), "services": svcs,
+                "plans": [pub(p) for p in self.plans()], "traffic": [pub(p) for p in self.plans("traffic")],
+                "topups": [_int(a) for a in str(cfg.get("shop_topups") or "100000,200000,500000").split(",") if _int(a) > 0][:6],
+                "trial": bool(self.trial_cfg() and not u.get("trial")), "trial_cfg": self.trial_cfg(),
+                "codes": any(c.get("kind") == "discount" for c in self.d["codes"]), "cards": bool(self.cards()),
+                "ref": {"pct": _int(cfg.get("shop_ref")), "link": "https://t.me/%s?start=r_%s" % (me, uid.split(":", 1)[1]) if me else "",
+                        "invited": sum(1 for x in self.d["users"].values() if x.get("ref") == uid), "earned": u.get("ref_earned", 0)},
+                "support": cfg.get("support_url", ""), "guide": cfg.get("shop_help") or "",
+                "orders": [{"id": o["id"], "kind": o["kind"], "plan": o["plan_name"], "total": self.total(o), "status": o["status"], "at": o["at"]}
+                           for o in self.d["orders"] if o["uid"] == uid][-10:][::-1]}
+
+    def app_invoice(self, o):
+        return {"id": o["id"], "kind": o["kind"], "plan": o["plan_name"], "gb": o["gb"], "days": o["days"], "price": o["price"],
+                "discount": o.get("discount", 0), "code": o.get("code", ""), "total": self.total(o),
+                "wallet": self.user(o["uid"]).get("wallet", 0), "status": o["status"]}
+
+    def app_api(self, user, action, body):
+        """One call from the mini app, already authenticated. -> (ok, dict)"""
+        if not self.on():
+            return False, {"error": "فروشگاه فعلاً بسته‌ست"}
+        net, chat = "tg", user["id"]
+        uid = "tg:%s" % user["id"]
+        self.user(uid, user)
+        if not self.joined(net, user["id"]):
+            ch = str(self.app.cfg.get("shop_channel") or "")
+            return False, {"error": "اول عضو کانال شو", "join": "https://t.me/" + ch.lstrip("@") if ch.startswith("@") else ch}
+        if action == "state":
+            return True, self.app_state(uid, chat)
+        if action == "order":
+            kind = body.get("kind")
+            if kind == "topup":
+                amount = _int(body.get("amount"))
+                if amount not in self.app_state(uid, chat)["topups"]:
+                    return False, {"error": "مبلغ نامعتبر"}
+                return True, self.app_invoice(self.new_order(uid, net, chat, "topup", amount))
+            p = self.plan(str(body.get("plan") or ""))
+            if kind not in ("buy", "renew", "traffic") or not p or not p.get("active", True):
+                return False, {"error": "این پلن دیگه فروخته نمی‌شه"}
+            sub = str(body.get("sub") or "")
+            if kind != "buy" and sub not in [s for s, _ in self.services(uid, "tg:%s" % chat)]:
+                return False, {"error": "این سرویس مال تو نیست"}
+            return True, self.app_invoice(self.new_order(uid, net, chat, kind, p["price"], p, sub if kind != "buy" else ""))
+        o = self.order(_int(body.get("id")))
+        if action in ("code", "wallet", "card", "cancel") and (not o or o["uid"] != uid):
+            return False, {"error": "این فاکتور پیدا نشد"}
+        if action == "code":
+            err = self.use_code(o, uid, str(body.get("code") or ""))
+            return (False, {"error": err}) if err else (True, self.app_invoice(o))
+        if action == "cancel":
+            if o["status"] in ("new", "receipt"):
+                o["status"] = "cancelled"
+                self.save()
+            return True, {}
+        if action == "wallet":
+            total = self.total(o)
+            with self.lock:
+                u = self.user(uid)
+                if o["status"] not in ("new", "receipt") or o["kind"] == "topup" or u.get("wallet", 0) < total:
+                    return False, {"error": "موجودی کیف پول کافی نیست"}
+                u["wallet"] -= total
+                o["status"], o["method"] = "review", "wallet"
+            self.save()
+            ok = self.fulfil(o, by="کیف پول (مینی‌اپ)")
+            return ok, {"status": o["status"], "sub": o.get("sub", ""), "link": self.bot.sub_link(o["sub"]) if o.get("sub") else "",
+                        "error": "" if ok else "انجام نشد؛ مبلغ به کیف پولت برگشت"}
+        if action == "card":
+            if o["status"] not in ("new", "receipt") or not self.cards():
+                return False, {"error": "این فاکتور دیگه قابل پرداخت نیست"}
+            o["status"], o["method"] = "receipt", "card"
+            self.save()
+            self.wait["tg:%s" % chat] = {"what": "receipt", "order": o["id"]}
+            self.show(net, chat, self.card_text(o), [[("✖️ انصراف", "x:%s" % o["id"])]])
+            return True, {"cards": [{"number": c[0], "holder": c[1], "bank": c[2]} for c in self.cards()], "total": self.total(o)}
+        if action == "trial":
+            err, sub = self.make_trial(uid, net, chat)
+            if err:
+                return False, {"error": err}
+            self.delivered(net, chat, sub, "🎁 <b>تست رایگانت آماده‌ست!</b>")
+            return True, {"sub": sub, "link": self.bot.sub_link(sub)}
+        if action == "gift":
+            err, amount = self.use_gift(uid, str(body.get("code") or ""))
+            return (False, {"error": err}) if err else (True, {"amount": amount, "wallet": self.user(uid).get("wallet", 0)})
+        return False, {"error": "نامعتبر"}
+
     # admin page -------------------------------------------------------------------
     def public(self):
         now = time.time()
@@ -8800,6 +8971,191 @@ def shop_action(app, act, body, done, fail):
 def _fmt_num(x):
     x = float(x or 0)
     return str(int(x)) if x == int(x) else ("%.1f" % x)
+
+
+APP_HEADERS = {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline' https://telegram.org; "
+                               "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; "
+                               "img-src 'self' data:; connect-src 'self'; frame-ancestors https://web.telegram.org https://*.telegram.org",
+}
+
+APP_HTML = r"""<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>فروشگاه</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css">
+<style>
+:root{--bg:var(--tg-theme-bg-color,#0f1420);--sec:var(--tg-theme-secondary-bg-color,#161d2d);--fg:var(--tg-theme-text-color,#eef2fb);--mut:var(--tg-theme-hint-color,#8d99b5);
+--acc:var(--tg-theme-button-color,#4f8cff);--acct:var(--tg-theme-button-text-color,#fff);--card:var(--tg-theme-section-bg-color,var(--sec));--line:color-mix(in srgb,var(--mut) 22%,transparent);
+--ok:#22c55e;--bad:#f43f5e;--warn:#f5a524}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--fg)}
+body{font:15px/1.6 Vazirmatn,system-ui,sans-serif;padding-bottom:calc(84px + env(safe-area-inset-bottom));min-height:100vh}
+button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
+.wrap{max-width:560px;margin:0 auto;padding:14px 14px 0}
+.hero{border-radius:22px;padding:18px;background:linear-gradient(135deg,var(--acc),color-mix(in srgb,var(--acc) 55%,#8b5cff));color:var(--acct);box-shadow:0 12px 30px color-mix(in srgb,var(--acc) 35%,transparent);animation:up .35s ease-out both}
+.hero .hi{opacity:.85;font-size:13px}.hero .w{font-size:28px;font-weight:800;margin:4px 0 2px;letter-spacing:-.5px}.hero .k{opacity:.85;font-size:12.5px}
+.hero .acts{display:flex;gap:8px;margin-top:14px}.hero .acts button{flex:1;background:rgba(255,255,255,.18);border-radius:14px;padding:9px 6px;font-weight:700;font-size:13.5px;backdrop-filter:blur(6px)}
+h2{font-size:15px;margin:20px 4px 10px;display:flex;justify-content:space-between;align-items:center}
+h2 small{color:var(--mut);font-weight:500;font-size:12.5px}
+.card{background:var(--card);border-radius:18px;padding:14px;margin-bottom:10px;animation:up .3s ease-out both}
+.svc .top{display:flex;justify-content:space-between;align-items:center;gap:8px}.svc b{font-size:15px}
+.pill{font-size:11.5px;padding:2px 10px;border-radius:99px;font-weight:700}.pill.on{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}.pill.off{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}
+.bar{height:8px;border-radius:99px;background:var(--line);overflow:hidden;margin:12px 0 6px}.bar i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--acc),#8b5cff);transition:width .8s ease}
+.meta{display:flex;justify-content:space-between;color:var(--mut);font-size:12.5px}
+.row2{display:flex;gap:8px;margin-top:12px}.row2 button{flex:1}
+.btn{background:var(--acc);color:var(--acct);border-radius:14px;padding:11px 14px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;gap:6px;transition:transform .1s}
+.btn:active,.plan:active,.chip:active{transform:scale(.97)}
+.btn.ghost{background:color-mix(in srgb,var(--acc) 13%,transparent);color:var(--acc)}
+.btn.block{width:100%}.btn[disabled]{opacity:.45}
+.plans{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.plan{background:var(--card);border-radius:18px;padding:14px;text-align:right;position:relative;overflow:hidden;animation:up .3s ease-out both;transition:transform .1s}
+.plan .gb{font-size:24px;font-weight:800;line-height:1.1}.plan .gb small{font-size:12px;color:var(--mut);font-weight:500}
+.plan .nm{font-size:13px;color:var(--mut);margin-top:2px;min-height:21px}.plan .pr{margin-top:10px;font-weight:800;color:var(--acc)}
+.plan .d{font-size:11.5px;color:var(--mut)}
+.plan:after{content:"";position:absolute;inset:auto -30px -30px auto;width:90px;height:90px;border-radius:50%;background:color-mix(in srgb,var(--acc) 10%,transparent)}
+.chips{display:grid;grid-template-columns:1fr 1fr;gap:10px}.chip{background:var(--card);border-radius:16px;padding:14px;font-weight:800;text-align:center;transition:transform .1s}
+.list .it{display:flex;justify-content:space-between;align-items:center;padding:11px 2px;border-bottom:1px solid var(--line)}.list .it:last-child{border:0}
+.list .it span{color:var(--mut);font-size:12.5px}
+.empty{color:var(--mut);text-align:center;padding:26px 10px;font-size:14px}
+.empty .e{font-size:38px;display:block;margin-bottom:6px}
+.tabs{position:fixed;left:0;right:0;bottom:0;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(14px);border-top:1px solid var(--line);display:flex;padding:6px 8px calc(6px + env(safe-area-inset-bottom));z-index:5}
+.tabs button{flex:1;display:flex;flex-direction:column;align-items:center;gap:1px;font-size:11.5px;color:var(--mut);padding:4px 0;border-radius:12px}
+.tabs button .ic{font-size:21px;line-height:1.2;filter:grayscale(1);opacity:.7;transition:.2s}
+.tabs button.on{color:var(--acc)}.tabs button.on .ic{filter:none;opacity:1;transform:translateY(-1px) scale(1.08)}
+.sheet{position:fixed;inset:0;z-index:9;display:flex;align-items:flex-end;background:rgba(0,0,0,.45);animation:fade .2s}
+.sheet .in{background:var(--bg);width:100%;max-width:560px;margin:0 auto;border-radius:24px 24px 0 0;padding:10px 16px calc(18px + env(safe-area-inset-bottom));max-height:88vh;overflow:auto;animation:sl .28s cubic-bezier(.2,.9,.3,1)}
+.sheet .grab{width:40px;height:5px;border-radius:9px;background:var(--line);margin:0 auto 12px}
+.sheet h3{margin:0 0 12px;font-size:17px}
+.kv{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed var(--line);font-size:14px}.kv span:first-child{color:var(--mut)}
+.total{display:flex;justify-content:space-between;align-items:center;margin:14px 0;font-size:16px}.total b{font-size:22px;color:var(--acc)}
+.in input{width:100%;background:var(--sec);border:1px solid var(--line);border-radius:12px;padding:11px 12px;color:var(--fg);font:inherit;outline:none}
+.in input:focus{border-color:var(--acc)}
+.cardbox{background:linear-gradient(135deg,#1e293b,#334155);color:#fff;border-radius:18px;padding:16px;margin:10px 0;direction:ltr;text-align:left;box-shadow:0 10px 24px rgba(0,0,0,.25)}
+.cardbox .n{font-size:19px;letter-spacing:1.5px;font-weight:700;margin:14px 0 8px;font-family:ui-monospace,Menlo,monospace}
+.cardbox .h{direction:rtl;text-align:right;font-size:13px;opacity:.85}
+.note{background:color-mix(in srgb,var(--acc) 10%,transparent);border-radius:14px;padding:12px;font-size:13.5px;margin:10px 0}
+.link{direction:ltr;text-align:left;background:var(--sec);border-radius:12px;padding:10px;font:12px/1.5 ui-monospace,Menlo,monospace;word-break:break-all;margin:8px 0}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+.skel{height:110px;border-radius:20px;background:linear-gradient(90deg,var(--card),var(--sec),var(--card));background-size:200% 100%;animation:sk 1.1s infinite;margin-bottom:10px}
+#toast{position:fixed;left:50%;top:14px;transform:translate(-50%,-20px);opacity:0;background:var(--card);color:var(--fg);padding:10px 16px;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.3);transition:.25s;z-index:20;font-size:14px;pointer-events:none}
+#toast.show{opacity:1;transform:translate(-50%,0)}
+@keyframes up{from{opacity:0;transform:translateY(10px)}}@keyframes fade{from{opacity:0}}@keyframes sl{from{transform:translateY(100%)}}@keyframes sk{to{background-position:-200% 0}}
+</style>
+</head>
+<body>
+<div class="wrap" id="app"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>
+<nav class="tabs" id="tabs"></nav>
+<div id="toast"></div>
+<script>
+"use strict";
+const tg=window.Telegram&&Telegram.WebApp;tg&&(tg.ready(),tg.expand());
+const $=s=>document.querySelector(s),esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fa=n=>String(n).replace(/\d/g,d=>"۰۱۲۳۴۵۶۷۸۹"[d]);
+const tm=v=>fa(Math.round(+v||0).toLocaleString("en-US")).replace(/,/g,"٬");
+const gb=b=>{const g=b/1073741824;return fa(g>=10?g.toFixed(0):g.toFixed(1).replace(/\.0$/,""))};
+const hap=(k="light")=>{try{tg.HapticFeedback.impactOccurred(k)}catch(e){}};
+const okHap=t=>{try{tg.HapticFeedback.notificationOccurred(t)}catch(e){}};
+function toast(t){const e=$("#toast");e.textContent=t;e.classList.add("show");clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove("show"),2400)}
+let D=null,tab="home",busy=false;
+async function api(action,body={}){
+  const r=await fetch("api",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...body,action,initData:tg?tg.initData:""})});
+  const j=await r.json().catch(()=>({ok:false,error:"خطای شبکه"}));
+  if(!j.ok&&j.join){sheet(`<h3>📢 عضویت در کانال</h3><p class="mut">برای خرید، اول عضو کانال ما شو.</p><button class="btn block" onclick="tg.openTelegramLink('${esc(j.join)}')">عضویت در کانال</button><div style="height:8px"></div><button class="btn ghost block" onclick="closeSheet();load()">✅ عضو شدم</button>`)}
+  return j;
+}
+async function load(){const j=await api("state");if(!j.ok){$("#app").innerHTML=`<div class="empty"><span class="e">🔒</span>${esc(j.error||"خطا")}</div>`;return}D=j;render()}
+const TABS=[["home","🏠","خانه"],["buy","🛍","خرید"],["wallet","💳","کیف پول"],["more","✨","بیشتر"]];
+function render(){
+  $("#tabs").innerHTML=TABS.map(([k,i,l])=>`<button class="${tab===k?"on":""}" onclick="go('${k}')"><span class="ic">${i}</span>${l}</button>`).join("");
+  $("#app").innerHTML=V[tab]();
+  requestAnimationFrame(()=>document.querySelectorAll(".bar i[data-w]").forEach(b=>b.style.width=b.dataset.w));
+}
+function go(t){if(t===tab)return;hap();tab=t;scrollTo(0,0);render()}
+const V={};
+const days=x=>x.expiry>0?Math.max(0,Math.ceil((x.expiry-Date.now())/864e5)):null;
+function svcCard(x,i){const d=days(x),p=x.total?Math.max(0,1-x.used/x.total):1;
+  return `<div class="card svc" style="animation-delay:${i*40}ms"><div class="top"><b>${esc(x.name)}</b><span class="pill ${x.active?"on":"off"}">${x.active?"فعال":"غیرفعال"}</span></div>
+   <div class="bar"><i data-w="${(p*100).toFixed(1)}%" style="width:0"></i></div>
+   <div class="meta"><span>${x.total?`${gb(x.total-x.used)} از ${gb(x.total)} گیگ`:"حجم نامحدود"}</span><span>${d===null?(x.expiry<0?"از اولین اتصال":"بدون محدودیت"):d?fa(d)+" روز مانده":"منقضی"}</span></div>
+   <div class="row2"><button class="btn" onclick="renew('${esc(x.sub)}')">🔄 تمدید</button>${D.traffic.length?`<button class="btn ghost" onclick="traffic('${esc(x.sub)}')">➕ حجم</button>`:""}<button class="btn ghost" onclick="linkSheet(${i})">🔗</button></div></div>`}
+V.home=()=>{const n=(D.name||"").split(" ")[0];
+  return `<div class="hero"><div class="hi">سلام ${esc(n)} 👋</div><div class="w">${tm(D.wallet)} <span style="font-size:14px;font-weight:600">تومان</span></div><div class="k">موجودی کیف پول</div>
+   <div class="acts"><button onclick="go('buy')">🛍 خرید</button><button onclick="go('wallet')">➕ شارژ</button>${D.trial?`<button onclick="trial()">🎁 تست</button>`:""}</div></div>
+   <h2>سرویس‌های من <small>${fa(D.services.length)}</small></h2>
+   ${D.services.length?D.services.map(svcCard).join(""):`<div class="card empty"><span class="e">📦</span>هنوز سرویسی نداری<div style="height:10px"></div><button class="btn" onclick="go('buy')">🛍 خرید اولین سرویس</button></div>`}`};
+function planCard(p,i,act){return `<button class="plan" style="animation-delay:${i*35}ms" onclick="${act}"><div class="gb">${p.gb?fa(+p.gb)+' <small>گیگ</small>':"∞"}</div>
+  <div class="nm">${esc(p.name)}</div><div class="d">${p.kind==="traffic"?"به حجم فعلی اضافه می‌شه":p.days?fa(p.days)+" روزه":"بدون محدودیت زمان"}${p.devices?" · "+fa(p.devices)+" دستگاه":""}</div><div class="pr">${tm(p.price)} <small style="font-weight:500">تومان</small></div></button>`}
+V.buy=()=>`<h2>پلن‌ها</h2>${D.plans.length?`<div class="plans">${D.plans.map((p,i)=>planCard(p,i,`order('buy','${p.id}')`)).join("")}</div>`:`<div class="card empty"><span class="e">🛍</span>فعلاً پلنی برای فروش نیست</div>`}
+  ${D.plans.some(p=>p.desc)?`<div class="card" style="margin-top:10px">${D.plans.filter(p=>p.desc).map(p=>`<div class="kv"><span>${esc(p.name)}</span><span>${esc(p.desc)}</span></div>`).join("")}</div>`:""}`;
+V.wallet=()=>`<div class="hero"><div class="hi">موجودی</div><div class="w">${tm(D.wallet)} <span style="font-size:14px;font-weight:600">تومان</span></div><div class="k">خرید و تمدید با یه لمس</div></div>
+  <h2>شارژ کیف پول</h2><div class="chips">${D.topups.map(a=>`<button class="chip" onclick="order('topup','',${a})">${tm(a)}<div class="mut" style="font-size:11.5px;font-weight:500">تومان</div></button>`).join("")}</div>
+  <h2>آخرین سفارش‌ها</h2><div class="card list">${D.orders.length?D.orders.map(o=>`<div class="it"><div>${({buy:"خرید",renew:"تمدید",traffic:"حجم اضافه",topup:"شارژ"})[o.kind]}${o.plan?" · "+esc(o.plan):""}<br><span>${({done:"✅ انجام شد",review:"⏳ در حال بررسی",receipt:"📸 منتظر رسید",new:"در انتظار پرداخت",rejected:"❌ رد شد",cancelled:"لغو",failed:"⚠️ ناموفق",refunded:"↩️ برگشت به کیف پول",approving:"⏳"})[o.status]||o.status}</span></div><b>${tm(o.total)}</b></div>`).join(""):`<div class="empty">هنوز سفارشی نیست</div>`}</div>`;
+V.more=()=>`<h2>بیشتر</h2>
+  <div class="card list">
+   <div class="it" onclick="giftSheet()" style="cursor:pointer"><div>🎁 کد هدیه<br><span>شارژ رایگان کیف پول</span></div><b>‹</b></div>
+   ${D.ref.pct&&D.ref.link?`<div class="it" onclick="refSheet()" style="cursor:pointer"><div>👥 دعوت دوستان<br><span>${fa(D.ref.pct)}٪ از اولین خرید هر دوست</span></div><b>‹</b></div>`:""}
+   ${D.trial?`<div class="it" onclick="trial()" style="cursor:pointer"><div>🆓 تست رایگان<br><span>${D.trial_cfg?fa(D.trial_cfg[0])+" گیگ · "+fa(D.trial_cfg[1])+" روز":""}</span></div><b>‹</b></div>`:""}
+   <div class="it" onclick="guide()" style="cursor:pointer"><div>📚 راهنمای اتصال<br><span>Happ، v2rayNG و…</span></div><b>‹</b></div>
+   ${D.support?`<div class="it" onclick="support()" style="cursor:pointer"><div>💬 پشتیبانی<br><span>سؤال، تمدید، مشکل</span></div><b>‹</b></div>`:""}
+  </div>`;
+function sheet(html){closeSheet();const s=document.createElement("div");s.className="sheet";s.id="sheet";s.innerHTML=`<div class="in"><div class="grab"></div>${html}</div>`;
+  s.onclick=e=>{if(e.target===s)closeSheet()};document.body.append(s);tg&&tg.BackButton.show()}
+function closeSheet(){const s=$("#sheet");if(s)s.remove();tg&&tg.BackButton.hide()}
+tg&&tg.BackButton.onClick(closeSheet);
+function invoice(o){
+  const kind={buy:"خرید",renew:"تمدید",traffic:"حجم اضافه",topup:"شارژ کیف پول"}[o.kind];
+  sheet(`<h3>🧾 فاکتور #${fa(o.id)}</h3>
+   <div class="kv"><span>${kind}</span><span>${o.plan?esc(o.plan):tm(o.price)+" تومان"}</span></div>
+   ${o.kind!=="topup"&&o.plan?`<div class="kv"><span>جزئیات</span><span>${o.gb?fa(+o.gb)+" گیگ":"نامحدود"}${o.days?" · "+fa(o.days)+" روز":""}</span></div>`:""}
+   ${o.discount?`<div class="kv"><span>تخفیف (${esc(o.code)})</span><span class="ok">−${tm(o.discount)}</span></div>`:""}
+   <div class="total"><span>مبلغ قابل پرداخت</span><b>${tm(o.total)} <small style="font-size:13px">تومان</small></b></div>
+   ${o.kind!=="topup"&&!o.code&&D.codes?`<div class="in" style="display:flex;gap:8px;margin-bottom:12px"><input id="cc" placeholder="کد تخفیف" style="direction:ltr;text-align:center"><button class="btn ghost" onclick="code(${o.id})">اعمال</button></div>`:""}
+   ${o.kind!=="topup"?`<button class="btn block" ${o.wallet<o.total?"disabled":""} onclick="payWallet(${o.id})">💰 پرداخت از کیف پول <small style="opacity:.8">(${tm(o.wallet)})</small></button><div style="height:8px"></div>`:""}
+   ${D.cards?`<button class="btn ${o.kind==="topup"?"":"ghost"} block" onclick="payCard(${o.id})">💳 کارت به کارت</button>`:""}
+   ${!D.cards&&(o.kind==="topup"||o.wallet<o.total)?`<div class="note">روش پرداختی تنظیم نشده؛ با پشتیبانی در تماس باش.</div>`:""}
+   <div style="height:8px"></div><button class="btn ghost block" style="color:var(--mut);background:transparent" onclick="cancel(${o.id})">انصراف</button>`)}
+async function order(kind,plan,amount,sub){if(busy)return;busy=true;hap();try{const j=await api("order",{kind,plan,amount,sub});if(j.ok)invoice(j);else toast(j.error)}finally{busy=false}}
+function renew(sub){hap();if(!D.plans.length)return toast("پلنی برای تمدید نیست");
+  sheet(`<h3>🔄 تمدید</h3><p class="mut" style="margin-top:-6px;font-size:13px">حجم از نو شروع می‌شه و روزها به باقی‌مونده اضافه می‌شن.</p><div class="plans">${D.plans.map((p,i)=>planCard(p,i,`order('renew','${p.id}',0,'${esc(sub)}')`)).join("")}</div>`)}
+function traffic(sub){hap();sheet(`<h3>➕ حجم اضافه</h3><div class="plans">${D.traffic.map((p,i)=>planCard(p,i,`order('traffic','${p.id}',0,'${esc(sub)}')`)).join("")}</div>`)}
+async function code(id){const v=$("#cc").value.trim();if(!v)return;const j=await api("code",{id,code:v});if(j.ok){okHap("success");invoice(j);toast("تخفیف اعمال شد 🎉")}else{okHap("error");toast(j.error)}}
+async function cancel(id){await api("cancel",{id});closeSheet()}
+async function payWallet(id){if(busy)return;busy=true;try{
+  sheet(`<div class="empty"><span class="e">⏳</span>در حال آماده‌سازی…</div>`);
+  const j=await api("wallet",{id});await load();
+  if(j.ok){okHap("success");sheet(`<div class="empty"><span class="e">🎉</span><b>انجام شد!</b><br>${j.link?"لینک اشتراک توی چت ربات هم فرستاده شد.":"کیف پولت به‌روز شد."}</div>${j.link?`<div class="link">${esc(j.link)}</div><button class="btn block" onclick="copy('${esc(j.link)}')">📋 کپی لینک</button>`:""}<div style="height:8px"></div><button class="btn ghost block" onclick="closeSheet();go('home')">سرویس‌های من</button>`)}
+  else{okHap("error");sheet(`<div class="empty"><span class="e">⚠️</span>${esc(j.error)}</div><button class="btn block" onclick="closeSheet()">باشه</button>`)}}finally{busy=false}}
+async function payCard(id){if(busy)return;busy=true;try{const j=await api("card",{id});if(!j.ok)return toast(j.error);okHap("success");
+  sheet(`<h3>💳 کارت به کارت</h3><p class="mut" style="margin-top:-6px">مبلغ <b style="color:var(--fg)">${tm(j.total)} تومان</b> رو واریز کن:</p>
+   ${j.cards.map(c=>`<div class="cardbox" onclick="copy('${esc(c.number.replace(/[^\d]/g,""))}')"><div style="opacity:.7;font-size:12px">${esc(c.bank||"")}</div><div class="n">${esc(c.number)}</div><div class="h">${esc(c.holder)} · برای کپی لمس کن</div></div>`).join("")}
+   <div class="note">📸 بعد از واریز، <b>عکس رسید</b> رو توی چت ربات بفرست. فاکتور و کارت‌ها توی چت هم فرستاده شدن. بعد از تأیید، سرویس خودکار فعال می‌شه.</div>
+   <button class="btn block" onclick="tg.close()">📸 رفتن به چت و ارسال رسید</button>`)}finally{busy=false}}
+async function trial(){if(busy)return;busy=true;hap("medium");try{const j=await api("trial");await load();
+  if(j.ok){okHap("success");sheet(`<div class="empty"><span class="e">🎁</span><b>تست رایگانت آماده‌ست!</b></div><div class="link">${esc(j.link)}</div><button class="btn block" onclick="copy('${esc(j.link)}')">📋 کپی لینک</button><div style="height:8px"></div><button class="btn ghost block" onclick="guide()">📚 راهنمای اتصال</button>`)}else toast(j.error)}finally{busy=false}}
+function giftSheet(){sheet(`<h3>🎁 کد هدیه</h3><div class="in"><input id="gc" placeholder="کد رو اینجا بنویس" style="direction:ltr;text-align:center;font-size:17px"></div><div style="height:10px"></div><button class="btn block" onclick="gift()">ثبت</button>`);setTimeout(()=>$("#gc").focus(),200)}
+async function gift(){const v=$("#gc").value.trim();if(!v)return;const j=await api("gift",{code:v});if(j.ok){okHap("success");D.wallet=j.wallet;sheet(`<div class="empty"><span class="e">🎉</span><b>${tm(j.amount)} تومان</b> به کیف پولت اضافه شد!</div><button class="btn block" onclick="closeSheet();render()">عالیه</button>`)}else{okHap("error");toast(j.error)}}
+function refSheet(){sheet(`<h3>👥 دعوت دوستان</h3><p class="mut" style="margin-top:-6px">دوستت با لینک تو وارد ربات بشه، از اولین خریدش <b style="color:var(--fg)">${fa(D.ref.pct)}٪</b> به کیف پولت میاد.</p>
+  <div class="link">${esc(D.ref.link)}</div><div class="row2"><button class="btn" onclick="copy('${esc(D.ref.link)}')">📋 کپی</button><button class="btn ghost" onclick="tg.openTelegramLink('https://t.me/share/url?url='+encodeURIComponent('${esc(D.ref.link)}'))">📤 ارسال</button></div>
+  <div class="kv" style="margin-top:12px"><span>دعوت‌شده‌ها</span><span>${fa(D.ref.invited)}</span></div><div class="kv"><span>درآمد تا الان</span><span>${tm(D.ref.earned)} تومان</span></div>`)}
+function linkSheet(i){const x=D.services[i];sheet(`<h3>🔗 ${esc(x.name)}</h3><p class="mut" style="margin-top:-6px;font-size:13px">لینک رو کپی کن و توی اپ (Happ یا v2rayNG) به‌عنوان Subscription اضافه کن.</p><div class="link">${esc(x.link)}</div>
+  <div class="row2"><button class="btn" onclick="copy('${esc(x.link)}')">📋 کپی لینک</button><button class="btn ghost" onclick="tg.openLink('${esc(x.link)}')">📱 صفحه‌ی اشتراک</button></div>`)}
+function guide(){sheet(`<h3>📚 راهنمای اتصال</h3>${D.guide?`<div style="white-space:pre-wrap">${esc(D.guide)}</div>`:`<div class="kv"><span>۱</span><span>اپ <b>Happ</b> یا v2rayNG رو نصب کن</span></div><div class="kv"><span>۲</span><span>از «خانه» لینک سرویس رو کپی کن</span></div><div class="kv"><span>۳</span><span>توی اپ «+» و «از کلیپ‌بورد» رو بزن</span></div><div class="kv"><span>۴</span><span>گزینه‌ی ⚡ Auto رو انتخاب کن و وصل شو</span></div>`}`)}
+function support(){const s=D.support;if(/^https?:\/\/t\.me\//.test(s))tg.openTelegramLink(s);else if(/^https?:/.test(s))tg.openLink(s);else toast(s)}
+function copy(t){hap();const ok=()=>toast("کپی شد ✓");if(navigator.clipboard)navigator.clipboard.writeText(t).then(ok,legacy);else legacy();
+  function legacy(){const a=document.createElement("textarea");a.value=t;a.style.position="fixed";a.style.opacity="0";document.body.append(a);a.select();try{document.execCommand("copy");ok()}catch(e){}a.remove()}}
+load();
+</script>
+</body>
+</html>
+"""
 
 
 def backup_loop(app):
@@ -9198,6 +9554,8 @@ def make_handler(app):
 
         def do_GET(self):
             u, parts = self.route()
+            if parts == ["app"]:
+                return self.send(200, APP_HTML, APP_HEADERS)
             if len(parts) == 2 and parts[0] == app.cfg["sub_path"]:
                 q = urllib.parse.parse_qs(u.query)
                 if _q(q, "format") == "info":
@@ -9230,6 +9588,20 @@ def make_handler(app):
 
         def do_POST(self):
             u, parts = self.route()
+            if parts == ["app", "api"]:  # the mini app, signed by Telegram
+                try:
+                    body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536)).decode("utf-8") or "{}")
+                    user = app.bot.shop.check_init(str(body.get("initData") or ""))
+                except (ValueError, AttributeError):
+                    user = None
+                if not user:
+                    return self.json(401, {"ok": False, "error": "از داخل تلگرام باز کن"})
+                try:
+                    ok, out = app.bot.shop.app_api(user, str(body.get("action") or ""), body)
+                except Exception as e:
+                    print("mini app: %s" % e, flush=True)
+                    ok, out = False, {"error": "خطا؛ دوباره امتحان کن"}
+                return self.json(200, dict(out, ok=ok))
             if not (self.is_admin(parts) and len(parts) == 3 and parts[1] == "api"):
                 return self.send(404, "404 page not found\n")
             if self.headers.get("X-XC") != "1":
