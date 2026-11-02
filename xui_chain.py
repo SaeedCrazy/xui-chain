@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.11.0"
+VERSION = "5.11.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -284,6 +284,9 @@ def resolve_runtime(cfg, db_path=XUI_DB):
     rt["tg_source"] = "own" if rt.get("tg_token") else ("panel" if s.get("tgBotToken") else "")
     rt["tg_token_rt"] = rt.get("tg_token") or s.get("tgBotToken", "")
     rt["tg_chat_rt"] = rt.get("tg_chat") or s.get("tgBotChatId", "")
+    if rt.get("bot_enable") and rt.get("bot_token"):  # one bot for everything: EZ's own
+        rt["tg_source"], rt["tg_token_rt"] = "bot", rt["bot_token"]
+        rt["tg_chat_rt"] = rt.get("tg_chat") or ",".join(bot_admin_chats("tg"))
     return rt
 
 
@@ -5298,6 +5301,7 @@ def do_action(app, action, body, host):
                         keys = {k for k, _ in BOT_EVENTS}
                         a["events"] = "all" if ev == "all" else [e for e in ev or [] if e in keys]
             app.bot.save()
+            app.reload()
             return done("چت جدا شد" if action == "bot_unpair" else "ذخیره شد")
 
         if action == "bot_test":
@@ -6889,18 +6893,18 @@ VIEWS.settings=()=>{
 
   ${botCard()}
 
-  <form class="card" data-sec="tg"><h2>هشدار تلگرام</h2>
+  ${s.tg_source==="bot"?"":`<form class="card" data-sec="tg"><h2>هشدار تلگرام</h2>
    <p class="mut small">قطع و وصل شدن واسط‌ها و تانل‌ها، و تموم شدن حجم یا زمان. ${s.tg_source==="panel"?"الان از ربات خود پنل 3x-ui استفاده می‌شه.":""}</p>
    ${sw("tg_enable",s.tg_enable,"هشدار روشن باشد")}
    ${field("tg_token","توکن ربات","",`class="in ltr" type="password" autocomplete="off" placeholder="${s.tg_token_set?"ذخیره شده":s.tg_source==="panel"?"ربات پنل (خودکار)":"123456:ABC…"}"`)}
    ${field("tg_chat","Chat ID",s.tg_chat,`class="in ltr" placeholder="${esc(s.tg_chat_rt||"123456789")}"`,"چندتا را با , جدا کن")}
    ${field("monitor_minutes","فاصله‌ی تست خودکار (دقیقه)",s.monitor_minutes,'class="in ltr" inputmode="numeric"',"واسط‌ها، تانل‌ها و ترافیک سرورها")}
-   <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="tg-test">${ic("bell")} پیام آزمایشی</button></div></form>
+   <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost" data-act="tg-test">${ic("bell")} پیام آزمایشی</button></div></form>`}
 
   <form class="card" data-sec="backup" id="bk-sec"><h2>بکاپ</h2>
    <p class="mut small">آخرین بکاپ: ${s.bk_last?ago(s.bk_last):"هنوز نه"}${s.bk_note?"، "+esc(s.bk_note):""}</p>
    <label class="f"><span>ارسال خودکار</span><select class="in" name="bk_hours">${[[0,"خاموش (فقط دستی)"],[6,"هر ۶ ساعت"],[12,"هر ۱۲ ساعت"],[24,"هر روز"],[72,"هر ۳ روز"],[168,"هر هفته"]].map(([v,l])=>`<option value="${v}" ${s.bk_hours===v?"selected":""}>${l}</option>`).join("")}</select></label>
-   ${sw("bk_tg",s.bk_tg,"ربات تلگرام",s.tg_token_set||s.tg_source==="panel"?"همون ربات و چت هشدارها":"اول توی «هشدار تلگرام» ربات رو تنظیم کن")}
+   ${sw("bk_tg",s.bk_tg,"ربات تلگرام",s.tg_source==="bot"?"ربات EZ، به چت‌های مدیر":s.tg_token_set||s.tg_source==="panel"?"همون ربات و چت هشدارها":"اول ربات رو تنظیم کن")}
    ${sw("bk_bale",s.bk_bale,"ربات بله",s.bale_token_set&&s.bale_chat?"وصله":"توکن و Chat ID پایین")}
    <details ${s.bk_bale&&!(s.bale_token_set&&s.bale_chat)?"open":""}><summary>تنظیم ربات بله</summary>
     <div class="hint">توی بله با <a href="https://ble.ir/botfather" target="_blank" rel="noopener">BotFather</a> یه ربات بساز و توکنش رو اینجا بذار؛ بعد به ربات خودت یه پیام بده و «پیدا کردن» رو بزن.</div>
@@ -7044,6 +7048,7 @@ function botCard(){
    ${tg.error&&tg.on?`<div class="err">${esc(tg.error)}</div>`:""}
    ${field("bot_token","توکن ربات تلگرام","",`class="in ltr" type="password" autocomplete="off" placeholder="${b.token_set?"ذخیره شده":"123456:ABC…"}"`,'از <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a> یه ربات <b>فقط برای EZ</b> بساز؛ ربات 3x-ui یا هر برنامه‌ی دیگه رو نذار.')}
    ${sw("bot_bale",b.bale,"روی بله هم",b.bale_ready?"با همون ربات بله‌ی بخش بکاپ":"اول توی بخش بکاپ توکن بله رو بذار")}
+   ${field("monitor_minutes","فاصله‌ی تست خودکار (دقیقه)",S.state.settings.monitor_minutes,'class="in ltr" inputmode="numeric"',"واسط‌ها، تانل‌ها و ترافیک سرورها؛ هشدارشون برای چت‌های مدیر میاد")}
    <details><summary>یادآوری مشتری‌ها</summary>
     <div class="cols2">${field("bot_days","روزهای قبل از انقضا",b.days,'class="in ltr" placeholder="3,1"')}${field("bot_pcts","درصد مصرف حجم",b.pcts,'class="in ltr" placeholder="80,95"')}</div>
     ${field("bot_quiet","ساعت سکوت (تهران)",b.quiet,'class="in ltr" placeholder="0-8"',"توی این ساعت‌ها یادآوری نمی‌ره؛ بعدش می‌ره. خالی = همیشه")}
@@ -7522,6 +7527,16 @@ def bot_state_path():
     return conf_path("bot.json")
 
 
+def bot_admin_chats(net):
+    """Chat ids of the paired admin chats on one network (alerts and backups go there)."""
+    try:
+        with open(bot_state_path(), encoding="utf-8") as f:
+            admins = json.load(f).get("admins") or {}
+    except (OSError, ValueError):
+        return []
+    return [cid.split(":", 1)[1] for cid, a in admins.items() if cid.startswith(net + ":") and not a.get("paused")]
+
+
 class Bot:
     """Long-polls each configured bot, answers chats and delivers notices with retries."""
 
@@ -7724,6 +7739,7 @@ class Bot:
                 self.st["codes"].pop(code)
                 self.st["admins"][cid] = {"name": name, "events": "all", "paused": False, "at": int(time.time())}
             self.save()
+            self.app.reload()
             return reply("✅ این چت به‌عنوان مدیر به %s وصل شد.\n\nدستورها:\n/status خلاصه\n/user اسم — وضعیت یه کاربر\n\nکدوم هشدارها بیاد رو از پنل انتخاب کن." % NAME,
                          {"remove_keyboard": True})
         if admin and cmd in ("/status", "/user"):

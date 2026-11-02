@@ -1644,6 +1644,13 @@ class BotTests(BotBase):
         self.assertEqual(self.bot.reminders(), 0)
         self.assertEqual(self.bot.st["sent"], {})  # held back, not dropped
 
+    def test_one_bot_for_alerts_and_backups(self):
+        self.bot.st["admins"]["tg:900"] = {"name": "boss", "events": "all"}
+        self.bot.save()
+        self.app.reload()
+        self.assertEqual((self.app.rt["tg_source"], self.app.rt["tg_token_rt"]), ("bot", "1:test"))
+        self.assertIn("900", self.app.rt["tg_chat_rt"])
+
     def test_failed_send_is_retried(self):
         self.bot.st["admins"]["tg:400"] = {"name": "x", "events": "all"}
         xc.TG_API = "http://127.0.0.1:9"  # nothing listens
