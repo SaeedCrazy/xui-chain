@@ -1861,6 +1861,26 @@ class ShopTests(BotBase):
         self.assertIn("a:home", json.dumps(m["reply_markup"]))
         self.assertIn("خوش اومدی", m["text"])
 
+    def test_code_cannot_stretch_over_invoices(self):
+        self.shop.d["codes"] = [{"code": "ONCE", "kind": "discount", "pct": 50, "amount": 0, "max": 0, "exp": 0}]
+        u = self.shop.user("tg:950")
+        u["wallet"] = 1000000
+        a = self.shop.new_order("tg:950", "tg", 950, "buy", 150000, self.shop.plan("p30"))
+        b = self.shop.new_order("tg:950", "tg", 950, "buy", 150000, self.shop.plan("p30"))
+        self.assertEqual(self.shop.use_code(a, "tg:950", "once"), "")
+        self.assertEqual(self.shop.use_code(b, "tg:950", "once"), "")  # both invoices show it...
+        self.tap(950, "pw:%d" % a["id"])
+        self.assertEqual(a["status"], "done")
+        self.tap(950, "pw:%d" % b["id"])
+        self.assertEqual(b["status"], "new")  # ...but only the first one paid gets it
+        self.assertEqual(b["discount"], 0)
+        self.assertEqual(u["wallet"], 1000000 - 75000)
+        c = self.shop.new_order("tg:951", "tg", 951, "buy", 150000, self.shop.plan("p30"))
+        self.shop.use_code(c, "tg:951", "once")
+        self.shop.take_code(c)
+        self.shop.give_code_back(c)  # a rejected receipt hands the code back
+        self.assertNotIn("tg:951", self.shop.d["codes"][0]["used_by"])
+
     def test_colours_and_animated_emoji(self):
         BotAPI.sent = []
         self.bot.handle("tg", {"chat": {"id": 510, "type": "private"}, "from": {"id": 510}, "text": "/start"})
