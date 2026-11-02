@@ -24,6 +24,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TMP = tempfile.mkdtemp()
 os.environ["XUI_CHAIN_DIR"] = os.path.join(TMP, "conf")
+# never find a real 3x-ui on the machine running the tests
+os.environ["XUI_DB_FOLDER"] = os.path.join(TMP, "no-xui")
+os.environ["XUI_MAIN_FOLDER"] = os.path.join(TMP, "no-xui")
 
 import xui_chain as xc  # noqa: E402
 
@@ -499,7 +502,24 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(xc.pick_format("", "FlClash/v0.8 clash-verge"), "clash")
         self.assertEqual(xc.pick_format("", "v2rayNG/1.9.30"), "xray")
         self.assertEqual(xc.pick_format("json", "clash.meta"), "xray")
-        self.assertEqual(xc.pick_format("", "Mozilla/5.0"), "clash")
+        self.assertEqual(xc.pick_format("", "Mozilla/5.0"), "links")
+        self.assertEqual(xc.pick_format("", "NPV Tunnel"), "links")
+        self.assertEqual(xc.pick_format("", "okhttp/4.12.0"), "links")
+        self.assertEqual(xc.pick_format("", ""), "links")
+        self.assertEqual(xc.pick_format("", "HiddifyNext/2.5"), "clash")
+        self.assertEqual(xc.pick_format("base64", "v2rayNG/1.9"), "links")
+        self.assertEqual(xc.pick_format("plain", "clash.meta"), "plain")
+
+    def test_share_link_round_trip(self):
+        keys = ("proto", "server", "port", "id", "password", "cipher", "flow", "net", "path", "host", "service_name",
+                "mode", "security", "sni", "alpn", "fp", "pbk", "sid", "spx", "obfs", "obfs_password", "insecure")
+        for link in OWN + UPS:
+            n = xc.parse_link(link)
+            back = xc.parse_link(xc.to_link(n, "x y/ز"))
+            self.assertEqual({k: n.get(k) for k in keys}, {k: back.get(k) for k in keys}, link)
+            self.assertEqual(back["name"], "x y/ز")
+        v6 = dict(xc.parse_link(OWN[0]), server="2001:db8::1")
+        self.assertEqual(xc.parse_link(xc.to_link(v6, "v6"))["server"], "2001:db8::1")
 
 
 class FakePanel(BaseHTTPRequestHandler):
@@ -671,6 +691,20 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(h["Content-Type"].startswith("application/json"))
         self.assertIn("dialerProxy", body)
+
+    def test_links_subscription(self):
+        for ua in ("NPV Tunnel", "okhttp/4.12.0", ""):
+            status, h, body = self.get("/chain/abc", ua=ua)
+            self.assertEqual(status, 200, ua)
+            self.assertTrue(h["Content-Type"].startswith("text/plain"), ua)
+            links = xc.split_lines(body)
+            self.assertTrue(links, ua)
+            self.assertNotIn("://", body)  # base64, like every v2ray-style subscription
+            for l in links:
+                xc.parse_link(l)
+        status, h, plain = self.get("/chain/abc?format=plain", ua="clash.meta")
+        self.assertEqual(status, 200)
+        self.assertEqual(xc.split_lines(plain), links)
 
     def test_unknown_user_and_paths(self):
         self.assertEqual(self.get("/chain/nope")[0], 404)

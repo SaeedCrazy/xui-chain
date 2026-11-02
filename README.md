@@ -105,8 +105,10 @@ bash <(curl -Ls https://raw.githubusercontent.com/saeedcrazy/xui-chain/main/inst
 |---|---|
 | FlClash (اندروید، ویندوز، مک)، Clash Verge Rev، Clash Mi (آیفون) | Clash Meta، اولویت‌بندی دقیق |
 | v2rayNG، Streisand، V2Box، Happ | Xray JSON، سریع‌ترین مسیر سالم انتخاب می‌شه |
+| Hiddify، Karing، sing-box | Clash Meta |
+| NPV Tunnel، Shadowrocket و بقیه‌ی اپ‌ها | لیست لینک (base64)، بدون مسیرهای زنجیره‌ای (Deco) |
 
-فرمت خودکار از روی اپ تشخیص داده می‌شه. برای انتخاب دستی، آخر لینک `?format=clash` یا `?format=json` بذار.
+فرمت خودکار از روی اپ تشخیص داده می‌شه. برای انتخاب دستی، آخر لینک `?format=clash`، `?format=json`، `?format=base64` یا `?format=plain` بذار. مسیر زنجیره‌ای توی لینک تکی جا نمی‌شه، پس توی لیست لینک نمیاد.
 
 ## نکته‌های مهم
 

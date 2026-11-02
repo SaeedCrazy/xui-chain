@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.8.0"
+VERSION = "5.8.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -595,6 +595,64 @@ def yaml_dump(obj, ind=0):
 # ---------------------------------------------------------------- Xray
 
 XRAY_PROTOCOL = {"ss": "shadowsocks"}
+
+
+def to_link(node, name):
+    """Neutral node -> share link (the format plain-list apps such as NPV Tunnel import)."""
+    proto, q = node["proto"], {}
+    frag = "#" + urllib.parse.quote(name or node.get("name") or node["server"], safe="")
+    host = node["server"]
+    if ":" in host and not host.startswith("["):
+        host = "[%s]" % host
+    addr = "%s:%d" % (host, int(node["port"]))
+    if proto == "ss":
+        user = base64.urlsafe_b64encode(("%s:%s" % (node["cipher"], node["password"])).encode()).decode().rstrip("=")
+        if node["cipher"].startswith("2022-"):  # SIP022 keys are base64 already; clients want them percent-encoded
+            user = "%s:%s" % (node["cipher"], urllib.parse.quote(node["password"], safe=""))
+        return "ss://%s@%s%s" % (user, addr, frag)
+    if proto == "vmess":
+        net = node.get("net") or "tcp"
+        j = {"v": "2", "ps": name or node.get("name") or node["server"], "add": node["server"], "port": str(node["port"]),
+             "id": node["id"], "aid": str(node.get("alter_id") or 0), "scy": node.get("cipher") or "auto",
+             "net": net, "type": node.get("header_type") or "none", "host": node.get("host", ""),
+             "path": node.get("service_name", "") if net == "grpc" else node.get("path", ""),
+             "tls": "tls" if node.get("security") == "tls" else "", "sni": node.get("sni", ""),
+             "alpn": ",".join(node.get("alpn") or []), "fp": node.get("fp", "")}
+        return "vmess://" + base64.b64encode(json.dumps(j, ensure_ascii=False).encode()).decode()
+    if proto == "hysteria2":
+        for k, v in (("sni", node.get("sni")), ("obfs", node.get("obfs")), ("obfs-password", node.get("obfs_password")),
+                     ("mport", node.get("ports")), ("alpn", ",".join(node.get("alpn") or []))):
+            if v:
+                q[k] = v
+        if node.get("insecure"):
+            q["insecure"] = "1"
+        return "hysteria2://%s@%s/?%s%s" % (urllib.parse.quote(node["password"], safe=""), addr, urllib.parse.urlencode(q), frag)
+    if proto not in ("vless", "trojan"):
+        raise ValueError("%s has no share link" % proto)
+    user = node["id"] if proto == "vless" else node["password"]
+    net = node.get("net") or "tcp"
+    q["type"] = "tcp" if net == "raw" else net
+    if proto == "vless":
+        q["encryption"] = node.get("encryption") or "none"
+        if node.get("flow"):
+            q["flow"] = node["flow"]
+    q["security"] = node.get("security") or "none"
+    for k, v in (("path", node.get("path")), ("host", node.get("host")), ("headerType", node.get("header_type")),
+                 ("mode", node.get("mode")), ("sni", node.get("sni")), ("fp", node.get("fp")),
+                 ("pbk", node.get("pbk")), ("sid", node.get("sid")), ("spx", node.get("spx")), ("pqv", node.get("pqv")),
+                 ("alpn", ",".join(node.get("alpn") or []))):
+            if v:
+                q[k] = v
+    if net == "grpc":
+        q.pop("path", None)
+        if node.get("service_name"):
+            q["serviceName"] = node["service_name"]
+    if isinstance(node.get("extra"), dict) and node["extra"]:
+        q["extra"] = json.dumps(node["extra"], separators=(",", ":"))
+    if node.get("insecure"):
+        q["allowInsecure"] = "1"
+    return "%s://%s@%s?%s%s" % (proto, urllib.parse.quote(user, safe=""), addr,
+                                urllib.parse.urlencode(q, quote_via=urllib.parse.quote), frag)
 
 
 def to_xray(node, tag):
@@ -1363,6 +1421,30 @@ def build_xray(own, ups, cfg, remarks, rts=None, info=None):
     return json.dumps(with_info([auto] + singles, info), ensure_ascii=False, indent=2), skipped
 
 
+def build_links(own, ups, cfg, rts=None, info=None):
+    """Share links, one per visible route config. A chain (a config dialing through hops) has no
+    share-link form, so those configs are left out: apps that want chains get Clash or Xray JSON."""
+    skipped, links = [], []
+    rts = rts if rts is not None else routes(cfg, ups)
+    for r in active_routes(rts):
+        if not r["show"]:
+            continue
+        try:
+            for it in route_items(r, own, cfg):
+                if it["hops"]:
+                    skipped.append("%s: chained" % it["name"])
+                    continue
+                links.append(to_link(it["target"], it["name"]))
+        except ValueError as ex:
+            skipped.append("%s: %s" % (r["name"], ex))
+    if not links:
+        raise ValueError("no config of this user has a share-link form")
+    first = next((l for l in links if not l.startswith("vmess://")), None)
+    if info and first:  # the user's info as the name of a working copy at the top, as in the other formats
+        links.insert(0, first.rsplit("#", 1)[0] + "#" + urllib.parse.quote(info, safe=""))
+    return "\n".join(links) + "\n", skipped
+
+
 def with_info(confs, info):
     """Put a working copy of the first config, named with the user's info, at the top."""
     if not info or not confs:
@@ -1784,20 +1866,27 @@ def profile_title(value):
 UPSTREAMS = Upstreams()
 
 CLASH_UA = re.compile(r"clash|mihomo|meta|flclash|verge|stash|nyanpasu|koala", re.I)
-XRAY_UA = re.compile(r"v2rayng|v2box|streisand|happ|v2raytun|npv|foxray|v2rayn", re.I)
+XRAY_UA = re.compile(r"v2rayng|v2box|streisand|happ|v2raytun|foxray|v2rayn", re.I)
+YAML_UA = re.compile(r"hiddify|karing|sing-?box|\bSF[AIMT]\b", re.I)  # read Clash/Mihomo YAML, keep chains
 
 
 def pick_format(query_format, ua):
+    """clash (YAML), xray (JSON) or links (base64 share links). Apps that only import a list of
+    share links (NPV Tunnel, Shadowrocket, okhttp clients, anything unknown) get links."""
     f = (query_format or "").lower()
     if f in ("clash", "mihomo", "yaml"):
         return "clash"
     if f in ("json", "xray", "v2ray"):
         return "xray"
-    if CLASH_UA.search(ua or ""):
+    if f in ("links", "base64", "b64"):
+        return "links"
+    if f in ("plain", "raw", "txt"):
+        return "plain"
+    if CLASH_UA.search(ua or "") or YAML_UA.search(ua or ""):
         return "clash"
     if XRAY_UA.search(ua or ""):
         return "xray"
-    return "clash"
+    return "links"
 
 
 def clean_remark(name):
@@ -1876,6 +1965,11 @@ def build_subscription(sub_id, fmt, rt, app=None):
         if fmt == "xray":
             text, _ = build_xray(own, ups, rt, title, rts, info)
             ctype, ext = "application/json; charset=utf-8", "json"
+        elif fmt in ("links", "plain"):
+            text, _ = build_links(own, ups, rt, rts, info)
+            if fmt == "links":
+                text = base64.b64encode(text.encode()).decode()
+            ctype, ext = "text/plain; charset=utf-8", "txt"
         else:
             text, _ = build_mihomo(own, ups, rt, rts, info)
             ctype, ext = "text/yaml; charset=utf-8", "yaml"
