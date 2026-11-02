@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.8.2"
+VERSION = "5.8.3"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -5727,11 +5727,17 @@ function chainText(r){
   parts.push(r.exit.id==="self"?"خروجی خودش":r.exit.name);
   return parts.map(esc).join('<span class="arr">←</span>');
 }
+function subBtn(r){
+  /* a tunnel's Iran server: put its links behind a subdomain (or change it) from the route itself */
+  if(r.kind!=="tunnel"||!r.entry||r.entry.type!=="server"||!srvBy(r.entry.id))return "";
+  const d=r.entry.host&&r.entry.host!==r.entry.ip?r.entry.host:"";
+  return ` <button type="button" class="lnk" data-act="cf-sub" data-id="${esc(r.entry.id)}">🌐 ${d?`<span class="ltr">${esc(d)}</span>`:"ساب‌دامین"}</button>`;
+}
 function chainChips(r){
   const n=(t,sub,me)=>`<span class="node ${me?"me":""}">${esc(t)}${sub?`<small>${esc(sub)}</small>`:""}</span>`;
   const out=[];
   const e=r.entry;
-  out.push(e.type==="direct"?n("مستقیم","",true):e.type==="server"?n(e.name,e.ip):n(decoName(e.idx),e.name));
+  out.push(e.type==="direct"?n("مستقیم","",true):e.type==="server"?n(e.name,e.host&&e.host!==e.ip?e.host:e.ip):n(decoName(e.idx),e.name));
   if(r.kind==="tunnel")out.push(n("تانل",r.tunnel?r.tunnel.engine+(r.tunnel.transport?" "+r.tunnel.transport:""):""));
   if(r.via)out.push(n(r.via.idx?decoName(r.via.idx):"واسط",r.via.name));
   out.push(r.exit.id==="self"?n("خروجی خودش",""):n(r.exit.name,"",true));
@@ -5859,7 +5865,7 @@ function tplRow(x,isDefault){
   const r=x.r,on=x.show||x.auto;
   return `<div class="trow ${on?"":"off"}" data-key="${esc(r.key)}">
   <label class="tk"><input type="checkbox" data-k="show" ${x.show?"checked":""} aria-label="توی ساب"></label>
-  <div class="t"><input class="in tn" value="${esc(isDefault?(r.name===r.auto_name?"":r.name):x.name)}" placeholder="${esc(isDefault?(r.auto_name||r.name):r.name)}" maxlength="40" autocomplete="off"><small>${chainText(r)}${x.fresh&&!isDefault?"، جدید":""}${r.down?'، <span class="bad">قطع</span>':""}${portsMissing(r)?`، <span class="warn">پورت ${portsText(r.missing_ports)} توی تانل نیست</span>`:""}</small></div>
+  <div class="t"><input class="in tn" value="${esc(isDefault?(r.name===r.auto_name?"":r.name):x.name)}" placeholder="${esc(isDefault?(r.auto_name||r.name):r.name)}" maxlength="40" autocomplete="off"><small>${chainText(r)}${subBtn(r)}${x.fresh&&!isDefault?"، جدید":""}${r.down?'، <span class="bad">قطع</span>':""}${portsMissing(r)?`، <span class="warn">پورت ${portsText(r.missing_ports)} توی تانل نیست</span>`:""}</small></div>
   <button type="button" class="zap ${x.auto?"on":""}" aria-pressed="${x.auto}" title="توی خودکار">${ic("zap")}</button>
   <div class="vmove"><button type="button" data-mv="-1" aria-label="بالاتر">${ic("up")}</button><button type="button" data-mv="1" aria-label="پایین‌تر">${ic("down")}</button></div></div>`;
 }
