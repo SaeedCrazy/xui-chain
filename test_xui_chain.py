@@ -510,6 +510,15 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(xc.pick_format("base64", "v2rayNG/1.9"), "links")
         self.assertEqual(xc.pick_format("plain", "clash.meta"), "plain")
 
+    def test_plain_vless_left_out_of_xray(self):
+        plain = xc.parse_link("vless://11111111-2222-3333-4444-555555555555@9.9.9.9:80?type=ws&path=%2F#plain")
+        self.assertTrue(xc.plain_vless(plain))
+        with self.assertRaises(ValueError):
+            xc.to_xray(plain, "x")
+        self.assertFalse(xc.plain_vless(xc.parse_link(OWN[0])))  # reality
+        self.assertFalse(xc.plain_vless(xc.parse_link(OWN[2])))  # loopback is allowed
+        xc.to_xray(xc.parse_link(OWN[2]), "x")
+
     def test_share_link_round_trip(self):
         keys = ("proto", "server", "port", "id", "password", "cipher", "flow", "net", "path", "host", "service_name",
                 "mode", "security", "sni", "alpn", "fp", "pbk", "sid", "spx", "obfs", "obfs_password", "insecure")

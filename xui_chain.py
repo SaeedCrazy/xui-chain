@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.8.3"
+VERSION = "5.8.4"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -655,9 +655,27 @@ def to_link(node, name):
                                 urllib.parse.urlencode(q, quote_via=urllib.parse.quote), frag)
 
 
+def private_host(host):
+    """A loopback, private or link-local IP address (Xray's exception for plain VLESS)."""
+    try:
+        a = ipaddress.ip_address((host or "").strip("[]"))
+    except ValueError:
+        return (host or "").lower() in ("localhost",) or (host or "").lower().endswith((".local", ".lan", ".internal"))
+    return a.is_private or a.is_loopback or a.is_link_local
+
+
+def plain_vless(node):
+    """VLESS with neither TLS/REALITY nor VLESS Encryption, to a public address. Current Xray
+    (Happ, new v2rayNG) refuses the whole config when one outbound is like this."""
+    return (node.get("proto") == "vless" and node.get("security") not in ("tls", "reality")
+            and (node.get("encryption") or "none") == "none" and not private_host(node.get("server")))
+
+
 def to_xray(node, tag):
     """Neutral node -> Xray outbound dict. Raises ValueError when not representable."""
     proto = node["proto"]
+    if plain_vless(node):
+        raise ValueError("VLESS without TLS is refused by current Xray")
     if proto == "vless":
         user = {"id": node["id"], "encryption": node.get("encryption") or "none", "level": 8}
         if node.get("flow"):
