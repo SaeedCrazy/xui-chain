@@ -524,6 +524,94 @@ class FakePanel(BaseHTTPRequestHandler):
             self.end_headers()
 
 
+
+class FakeNX(BaseHTTPRequestHandler):
+    """NX Panel: /panel/api/v1 (Bearer token) and public subscriptions at /nxsub/sub/<subId>[/plain]."""
+    TOKEN = "nx-token-0123456789"
+    users, calls = [], []
+    LINKS = ["vless://aaaaaaaa-1111-2222-3333-444444444444@203.0.113.50:24443?type=tcp&security=reality&pbk=%s"
+             "&sid=ab&sni=www.microsoft.com&fp=chrome#nx-reality" % ("A" * 43)]
+
+    def log_message(self, *a):
+        pass
+
+    def reply(self, code, obj=None):
+        body = b"" if obj is None else json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}") if n else {}
+
+    def route(self, method):
+        u = urllib.parse.urlsplit(self.path)
+        if method == "GET" and u.path.startswith("/nxsub/sub/"):
+            sid, _, fmt = u.path[len("/nxsub/sub/"):].partition("/")
+            if fmt != "plain" or not any(x["subId"] == sid for x in FakeNX.users):
+                return self.reply(404, {"error": "not found"})
+            self.send_response(200)
+            self.send_header("Subscription-Userinfo", "upload=5; download=6; total=1000; expire=0")
+            self.end_headers()
+            self.wfile.write("\n".join(FakeNX.LINKS).encode())
+            return
+        if self.headers.get("Authorization") != "Bearer " + FakeNX.TOKEN:
+            return self.reply(401, {"error": "invalid token"})
+        path = u.path[len("/panel/api/v1"):] if u.path.startswith("/panel/api/v1") else None
+        if path is None:
+            return self.reply(404, {"error": "no route"})
+        FakeNX.calls.append((method, path, self.body() if method != "GET" else None))
+        body = FakeNX.calls[-1][2]
+        if method == "GET" and path == "/users":
+            q = urllib.parse.parse_qs(u.query)
+            off, lim = int(q.get("offset", ["0"])[0]), int(q.get("limit", ["100"])[0])
+            return self.reply(200, {"items": FakeNX.users[off:off + lim], "total": len(FakeNX.users), "limit": lim, "offset": off})
+        if method == "POST" and path == "/users":
+            uid = max([x["id"] for x in FakeNX.users] + [0]) + 1
+            user = dict(FakeNX.user(uid, body["name"], "nx%d" % uid, self.server.server_address[1]), **body)
+            FakeNX.users.append(user)
+            return self.reply(201, user)
+        m = re.fullmatch(r"/users/(\d+)", path)
+        if m:
+            user = next((x for x in FakeNX.users if x["id"] == int(m.group(1))), None)
+            if not user:
+                return self.reply(404, {"error": "no such user"})
+            if method == "PATCH":
+                user.update(body)
+                return self.reply(200, user)
+            if method == "DELETE":
+                FakeNX.users.remove(user)
+                return self.reply(204)
+        if method == "POST" and path == "/users/bulk/reset-traffic":
+            for x in FakeNX.users:
+                if x["id"] in body.get("ids", []):
+                    x["up"] = x["down"] = 0
+            return self.reply(200, {"affected": len(body.get("ids", []))})
+        self.reply(404, {"error": "no route"})
+
+    @staticmethod
+    def user(uid, name, sub, port, **kw):
+        return dict({"id": uid, "name": name, "subId": sub, "enable": True, "volume": 50 * 1024 ** 3, "up": 1024 ** 3,
+                     "down": 2 * 1024 ** 3, "expiry": 0, "duration": 0, "activatedAt": 0, "ipLimit": 2,
+                     "onlineAt": int(time.time()), "licensed": True,
+                     "subUrl": "http://127.0.0.1:%d/nxsub/sub/%s" % (port, sub)}, **kw)
+
+    def do_GET(self):
+        self.route("GET")
+
+    def do_POST(self):
+        self.route("POST")
+
+    def do_PATCH(self):
+        self.route("PATCH")
+
+    def do_DELETE(self):
+        self.route("DELETE")
+
+
 def start(server):
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -958,6 +1046,80 @@ class EndToEnd(unittest.TestCase):
             cfg["order_mode"] = "manual"
             xc.save_config(cfg)
             self.app.reload()
+
+    def test_nx_backend(self):
+        nx = start(ThreadingHTTPServer(("127.0.0.1", 0), FakeNX))
+        port = nx.server_address[1]
+        FakeNX.users[:] = [FakeNX.user(1, "ali", "abc", port), FakeNX.user(2, "nx-only", "zzz", port, onlineAt=0)]
+        FakeNX.calls.clear()
+        url = "http://127.0.0.1:%d/panel" % port
+        self.login()
+        try:
+            # a wrong token is refused and nothing is switched
+            out = self.admin("nx_connect", {"url": url + "/api/v1", "token": "wrong-token-xxxxxxxx"})[1]
+            self.assertFalse(out["ok"])
+            self.assertIn("توکن", out["error"])
+            self.assertFalse(self.admin("backend_set", {"backend": "nx"})[1]["ok"])  # no subscription base yet
+            out = self.admin("nx_connect", {"url": url, "token": FakeNX.TOKEN})[1]
+            self.assertTrue(out["ok"], out)
+            st = out["state"]["settings"]
+            self.assertEqual((st["nx_url"], st["nx_token_set"], st["nx_sub_base"], st["backend"]),
+                             (url, True, "http://127.0.0.1:%d/nxsub/sub/" % port, "xui"))
+            self.assertEqual((st["nx_check"]["xui"], st["nx_check"]["matched"], st["nx_check"]["missing"]), (1, 1, []))
+            self.assertNotIn(FakeNX.TOKEN, json.dumps(out["state"]))  # the token never leaves the server
+            # still on 3x-ui: the users' configs come from the 3x-ui subscription
+            self.assertNotIn("203.0.113.50", self.get("/chain/abc", ua="v2rayNG/1.9")[2])
+            # switch: users, quotas and their own configs come from NX, the link stays the same
+            out = self.admin("backend_set", {"backend": "nx"})[1]
+            self.assertTrue(out["ok"], out)
+            st = out["state"]
+            self.assertEqual((st["panel"]["ok"], st["panel"]["version"]), (True, "nx"))
+            users = {u["sub"]: u for u in st["users"]}
+            self.assertEqual(set(users), {"abc", "zzz"})
+            self.assertEqual((users["abc"]["used"], users["abc"]["total"], users["abc"]["online"], users["zzz"]["online"]),
+                             (3 * 1024 ** 3, 50 * 1024 ** 3, True, False))
+            status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
+            self.assertEqual(status, 200)
+            self.assertIn("203.0.113.50", body)  # the user's own config, from NX
+            self.assertNotIn("203.0.113.10", body)  # not from 3x-ui
+            self.assertEqual(h["Subscription-Userinfo"], "upload=5; download=6; total=1000; expire=0")
+            self.assertEqual(self.get("/chain/nobody", ua="v2rayNG/1.9")[0], 404)
+            # managing users goes to NX
+            out = self.admin("user_add", {"name": "neda", "gb": 10, "days": 30, "devices": 1, "inbounds": []})[1]
+            self.assertTrue(out["ok"], out)
+            made = next(c for c in FakeNX.calls if c[0] == "POST" and c[1] == "/users")[2]
+            self.assertEqual((made["name"], made["volume"], made["ipLimit"]), ("neda", 10 * 1024 ** 3, 1))
+            self.assertAlmostEqual(made["expiry"], time.time() + 30 * 86400, delta=60)
+            self.assertTrue(self.admin("user_update", {"sub": "abc", "gb": 20, "days": 7, "devices": 3, "first_use": True})[1]["ok"])
+            patch = next(c for c in reversed(FakeNX.calls) if c[0] == "PATCH")
+            self.assertEqual((patch[1], patch[2]["volume"], patch[2]["ipLimit"], patch[2]["duration"], patch[2]["expiry"]),
+                             ("/users/1", 20 * 1024 ** 3, 3, 7 * 86400, 0))
+            self.assertTrue(self.admin("user_enable", {"sub": "abc", "enable": False})[1]["ok"])
+            self.assertEqual(next(c for c in reversed(FakeNX.calls) if c[0] == "PATCH")[2], {"enable": False})
+            self.assertTrue(self.admin("user_reset", {"sub": "abc"})[1]["ok"])
+            self.assertEqual(next(c for c in reversed(FakeNX.calls) if c[1] == "/users/bulk/reset-traffic")[2], {"ids": [1]})
+            neda = next(u for u in FakeNX.users if u["name"] == "neda")
+            self.assertTrue(self.admin("user_delete", {"sub": neda["subId"]})[1]["ok"])
+            self.assertFalse(any(u["name"] == "neda" for u in FakeNX.users))
+            # locations and dedicated links are not EZ's business on NX
+            self.assertIn("NX", self.admin("loc_attach", {"node": 1})[1]["error"])
+            tid = self.admin("template_save", {"name": "t-nx", "items": [{"key": "direct>main", "show": True, "auto": True}]})[1]["id"]
+            self.assertIn("NX", self.admin("sub_dedicated", {"id": tid, "on": True})[1]["error"])
+            self.admin("template_delete", {"id": tid})
+            # back to 3x-ui in one step, and NX disconnects cleanly
+            self.assertTrue(self.admin("backend_set", {"backend": "xui"})[1]["ok"])
+            self.assertNotIn("203.0.113.50", self.get("/chain/abc", ua="v2rayNG/1.9")[2])
+            out = self.admin("nx_disconnect")[1]
+            self.assertTrue(out["ok"], out)
+            self.assertEqual((out["state"]["settings"]["nx_token_set"], out["state"]["settings"]["backend"]), (False, "xui"))
+        finally:
+            cfg = xc.load_config()
+            for k in ("nx_url", "nx_token", "nx_sub_base"):
+                cfg[k] = ""
+            cfg["backend"], cfg["nx_check"] = "xui", {}
+            xc.save_config(cfg)
+            self.app.reload()
+            nx.shutdown()
 
     def test_self_update(self):
         class Raw(BaseHTTPRequestHandler):

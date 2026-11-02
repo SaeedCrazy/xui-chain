@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.7.1"
+VERSION = "5.8.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -209,7 +209,11 @@ def resolve_runtime(cfg, db_path=XUI_DB):
     s = xui_settings(db_path)
     sub_cert = s.get("subCertFile", "")
     sub_key = s.get("subKeyFile", "")
-    if rt.get("xui_sub_url", "auto") in ("", "auto"):
+    if rt.get("backend") == "nx":
+        rt["xui_sub_url"] = rt.get("nx_sub_base") or ""
+        rt["xui_sub_suffix"] = "/plain"
+        rt["xui_connect"] = ""
+    elif rt.get("xui_sub_url", "auto") in ("", "auto"):
         port = s.get("subPort") or "2096"
         path = s.get("subPath") or "/sub/"
         if not path.startswith("/"):
@@ -1071,7 +1075,7 @@ def sub_view(cfg, sub_id):
 
 
 def first_enabled_sub(app):
-    for _, sub, en in list_clients(app.db_path):
+    for _, sub, en in subs_of(app):
         if en and sub:
             return sub
     return ""
@@ -1371,7 +1375,7 @@ def with_info(confs, info):
 def sub_configs(rt, sub_id):
     """The user's own configs from the panel subscription -> (own nodes, headers) or raises PanelError."""
     try:
-        status, hdrs, body = http_get(rt["xui_sub_url"] + urllib.parse.quote(sub_id), connect=rt.get("xui_connect", ""))
+        status, hdrs, body = http_get(panel_sub_url(rt, sub_id), connect=rt.get("xui_connect", ""))
     except Exception as e:
         raise PanelError("ساب پنل در دسترس نیست: %s" % e)
     if status != 200:
@@ -1387,7 +1391,7 @@ def route_tests(app, sub, log=None, limit=24):
     hop and, with the panel's Xray, a real request through the whole route. Stored in app.net.pings."""
     rt = app.rt
     log = log or (lambda m: None)
-    subs = [sub] if sub else [s for _, s, en in list_clients(app.db_path) if en][:1]
+    subs = [sub] if sub else [s for _, s, en in subs_of(app) if en][:1]
     if not subs:
         raise PanelError("کاربری برای تست نیست")
     sub = subs[0]
@@ -1580,7 +1584,7 @@ def sub_map(app, sub):
         g = geo.get(ips[h]) or {}
         where[h] = {"ip": ips[h], "cc": g.get("cc", ""), "flag": flag_of(g.get("cc")), "country": g.get("country", ""),
                     "city": g.get("city", ""), "isp": g.get("isp", "")}
-    users = group_users([c for c in read_clients(app.db_path) if c["sub"] == sub])
+    users = group_users([c for c in clients_of(app) if c["sub"] == sub])
     return {"sub": sub, "user": users[0]["name"] if users else sub, "at": int(time.time() * 1000), "entries": entries,
             "hosts": where}
 
@@ -1824,7 +1828,7 @@ def info_line(rt, sub_id, own, hdrs, app=None, now=None):
     total, used = info.get("total", 0), info.get("upload", 0) + info.get("download", 0)
     expiry, name = info.get("expire", 0) * 1000, ""
     if app is not None:
-        users = group_users([c for c in read_clients(app.db_path) if c["sub"] == sub_id])
+        users = group_users([c for c in clients_of(app) if c["sub"] == sub_id])
         if users:
             u = users[0]
             name, expiry = u["name"], u["expiry"]
@@ -1849,10 +1853,12 @@ def info_line(rt, sub_id, own, hdrs, app=None, now=None):
 def build_subscription(sub_id, fmt, rt, app=None):
     """-> (status, headers, body)."""
     ded = dedicated_sub(rt, sub_id)
+    if ded and on_nx(rt):
+        return 404, {}, "dedicated links are off while EZ-XUI runs on NX\n"
     base = (ded.get("base") or (first_enabled_sub(app) if app else "")) if ded else sub_id
     if ded and not base:
         return 404, {}, "no base user for this sub\n"
-    url = rt["xui_sub_url"] + urllib.parse.quote(base)
+    url = panel_sub_url(rt, base)
     try:
         status, hdrs, body = http_get(url, connect=rt.get("xui_connect", ""))
     except Exception as e:
@@ -2093,10 +2099,10 @@ class Monitor:
             return node
         rt = self.app.rt
         subs = [rt["test_sub_id"]] if rt.get("test_sub_id") else [
-            sub for _, sub, en in list_clients(self.app.db_path) if en]
+            sub for _, sub, en in subs_of(self.app) if en]
         for sub in subs[:20]:
             try:
-                status, _, body = http_get(rt["xui_sub_url"] + urllib.parse.quote(sub), connect=rt.get("xui_connect", ""))
+                status, _, body = http_get(panel_sub_url(rt, sub), connect=rt.get("xui_connect", ""))
             except Exception:
                 continue
             if status != 200:
@@ -2653,6 +2659,216 @@ class PanelAPI:
                 pass
         self._cache = (now, out)
         return out
+
+
+# ---------------------------------------------------------------- NX Panel as the user backend (nx-panel.org)
+#
+# EZ-XUI can sit on NX instead of 3x-ui: users, quotas and their own configs then live in NX and are
+# read and changed through its public REST API (/api/v1, Bearer token). EZ keeps everything it adds on
+# top - the user links, the relays (Decos), the Iran tunnels, the subscription layout - exactly as it
+# does on 3x-ui. 3x-ui is never touched, so switching back is one setting.
+
+NX_ONLINE_SECS = 90
+
+
+class NXPanel:
+    """The PanelAPI surface EZ uses, on the NX Panel REST API."""
+
+    def __init__(self, app):
+        self.app = app
+        self.cookies, self.version = {}, None
+        self._cache = None
+        self._users = (0, None)
+        self.lock = threading.Lock()
+
+    def base(self):
+        return (self.app.rt.get("nx_url") or "").rstrip("/")
+
+    def configured(self):
+        return bool(self.base() and self.app.rt.get("nx_token"))
+
+    def call(self, method, path, body=None, query=None, timeout=20):
+        url = self.base() + "/api/v1" + path + ("?" + urllib.parse.urlencode(query) if query else "")
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": "Bearer " + (self.app.rt.get("nx_token") or ""), "Accept": "application/json",
+            "Content-Type": "application/json", "User-Agent": "%s/%s" % (NAME, VERSION)})
+        host = urllib.parse.urlsplit(url).hostname or ""
+        ctx = ssl._create_unverified_context() if host in LOOPBACK else None
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                raw = r.read().decode("utf-8")
+                return r.status, (json.loads(raw) if raw.strip() else None)
+        except urllib.error.HTTPError as e:
+            try:
+                j = json.loads(e.read().decode("utf-8") or "{}")
+            except ValueError:
+                j = {}
+            msg = (j.get("error") or j.get("message") or "") if isinstance(j, dict) else ""
+            if e.code in (401, 403):
+                raise PanelError("پنل NX اجازه نداد: توکن API درست نیست یا دسترسی کافی نداره" + (" (%s)" % msg if msg else ""))
+            if e.code == 402:
+                raise PanelError("پنل NX: سقف لایسنس پر شده" + (" (%s)" % msg if msg else ""))
+            raise PanelError("پنل NX: %s" % (msg or "HTTP %d" % e.code))
+        except (OSError, ValueError) as e:
+            raise PanelError("پنل NX در دسترس نیست: %s" % (getattr(e, "reason", None) or e))
+
+    def users(self, ttl=15):
+        """Every NX user the token may see (cached briefly)."""
+        with self.lock:
+            when, rows = self._users
+            if rows is not None and time.time() - when < ttl:
+                return rows
+            out, offset = [], 0
+            while True:
+                _, j = self.call("GET", "/users", query={"limit": 1000, "offset": offset})
+                items = (j or {}).get("items") if isinstance(j, dict) else j
+                items = items or []
+                out += items
+                offset += len(items)
+                if not items or not isinstance(j, dict) or offset >= _int(j.get("total")):
+                    break
+            self._users = (time.time(), out)
+            return out
+
+    def forget(self):
+        self._cache = None
+        self._users = (0, None)
+
+    def _id(self, sub):
+        for fresh in (False, True):
+            if fresh:
+                self.forget()
+            for u in self.users():
+                if u.get("subId") == sub:
+                    return u["id"]
+        raise PanelError("این کاربر توی پنل NX پیدا نشد")
+
+    def clients(self):
+        """Users in read_clients' shape: expiry in ms, negative = days counted from the first connection."""
+        out = []
+        for u in self.users():
+            dur, act, exp = _int(u.get("duration")), _int(u.get("activatedAt")), _int(u.get("expiry"))
+            out.append({"email": u.get("name") or "user%s" % u.get("id"), "sub": u.get("subId") or "",
+                        "enable": bool(u.get("enable", True)) and u.get("licensed", True) is not False,
+                        "total": _int(u.get("volume")), "expiry": -dur * 1000 if dur and not act else exp * 1000,
+                        "devices": _int(u.get("ipLimit")), "inbounds": [],
+                        "used": _int(u.get("up")) + _int(u.get("down"))})
+        return out
+
+    def onlines(self):
+        now = time.time()
+        return {u.get("name") for u in self.users() if now - _int(u.get("onlineAt")) <= NX_ONLINE_SECS}
+
+    def sub_base(self):
+        """The subscription prefix, read off a user's subUrl (.../sub/<subId>)."""
+        for u in self.users():
+            url, sid = u.get("subUrl") or "", u.get("subId") or ""
+            if sid and url.endswith("/" + sid):
+                return url[: -len(sid)]
+        return ""
+
+    def maybe_auto(self):
+        pass
+
+    def auto_connect(self):
+        return False, "اتصال خودکار فقط برای 3x-ui هست"
+
+    def overview(self, ttl=20, auto=True):
+        empty = {"configured": False, "ok": False, "error": "", "inbounds": [], "onlines": None, "version": None,
+                 "nodes": [], "backend": "nx"}
+        if not self.configured():
+            return empty
+        now = time.time()
+        if self._cache and now - self._cache[0] < (ttl if self._cache[1]["ok"] else 30):
+            return self._cache[1]
+        out = dict(empty, configured=True, version="nx")
+        try:
+            self.users(ttl=0)
+            out["ok"] = True
+            out["onlines"] = sorted(self.onlines())
+        except PanelError as e:
+            out["error"] = str(e)
+        self._cache = (now, out)
+        return out
+
+    def add_client(self, name, gb, days, devices, first_use, inbound_ids):
+        """Create a user on NX (its templates decide the configs) -> its subId."""
+        body = {"name": name, "enable": True, "volume": int(float(gb) * 1024 ** 3), "ipLimit": int(devices),
+                "desc": "EZ-XUI", "expiry": 0}
+        if days and first_use:
+            body["duration"] = int(days) * 86400
+        elif days:
+            body["expiry"] = int(time.time() + int(days) * 86400)
+        _, j = self.call("POST", "/users", body)
+        self.forget()
+        return (j or {}).get("subId") or ""
+
+    def update_user(self, sub, emails, changes):
+        """changes as for 3x-ui: totalGB (bytes), expiryTime (ms, negative = days from the first use), limitIp, enable."""
+        p = {}
+        if "enable" in changes:
+            p["enable"] = bool(changes["enable"])
+        if "totalGB" in changes:
+            p["volume"] = int(changes["totalGB"])
+        if "limitIp" in changes:
+            p["ipLimit"] = int(changes["limitIp"])
+        if "expiryTime" in changes:
+            ms = int(changes["expiryTime"])
+            p.update({"duration": -ms // 1000, "expiry": 0} if ms < 0 else {"duration": 0, "expiry": ms // 1000})
+        if p:
+            self.call("PATCH", "/users/%d" % self._id(sub), p)
+        self.forget()
+
+    def reset_user(self, sub, emails):
+        self.call("POST", "/users/bulk/reset-traffic", {"ids": [self._id(sub)]})
+        self.forget()
+
+    def delete_user(self, sub, emails):
+        self.call("DELETE", "/users/%d" % self._id(sub))
+        self.forget()
+
+    # nodes and inbounds are NX's own business
+    def _nx_only(self, *a, **k):
+        raise PanelError("با پنل NX، نودها و inboundها رو توی خود NX مدیریت کن")
+
+    add_node = clone_inbound = attach_all = delete_node = _nx_only
+
+    def inbounds(self):
+        return []
+
+    def nodes(self):
+        return []
+
+
+def on_nx(app_or_rt):
+    rt = app_or_rt.rt if hasattr(app_or_rt, "rt") else app_or_rt
+    return rt.get("backend") == "nx"
+
+
+def clients_of(app, fallback=False):
+    """Every client: from NX when EZ sits on it, else from the 3x-ui DB (fallback: its API)."""
+    if on_nx(app):
+        try:
+            return app.panel.clients()
+        except PanelError:
+            return []
+    clients = read_clients(app.db_path)
+    if not clients and fallback:
+        clients = clients_from_panel(app.panel.overview()["inbounds"])
+    return clients
+
+
+def subs_of(app):
+    """[(email, subId, enabled)] like list_clients."""
+    if on_nx(app):
+        return [(c["email"], c["sub"], c["enable"]) for c in clients_of(app) if c["sub"]]
+    return list_clients(app.db_path)
+
+
+def panel_sub_url(rt, sub):
+    """Where the user's own configs come from: the 3x-ui subscription, or NX's (plain links)."""
+    return rt["xui_sub_url"] + urllib.parse.quote(sub) + (rt.get("xui_sub_suffix") or "")
 
 
 # ---------------------------------------------------------------- users, server stats
@@ -4188,9 +4404,9 @@ def admin_state(app, host):
     ups = UPSTREAMS.nodes()
     live = live_routes(app, cfg, ups)
     rts = annotate_ports(routes_public(live, app.net.ping_by_key), panel["inbounds"], panel.get("nodes"))
-    clients = read_clients(app.db_path)
-    source = "db"
-    if not clients and panel["ok"]:
+    clients = clients_of(app)
+    source = "nx" if on_nx(app) else "db"
+    if not clients and panel["ok"] and not on_nx(app):
         clients, source = clients_from_panel(panel["inbounds"]), "panel"
     onlines = set(panel["onlines"]) if panel["onlines"] is not None else None
     users = group_users(clients, onlines)
@@ -4226,6 +4442,8 @@ def admin_state(app, host):
             "auto_note": cfg.get("auto_note", ""),
             "panel_token_set": bool(cfg.get("panel_token")), "panel_pass_set": bool(cfg.get("panel_pass")),
             "panel_rt": rt.get("panel_url", ""), "xui_rt": rt.get("xui_sub_url", ""),
+            "backend": cfg.get("backend") or "xui", "nx_url": cfg.get("nx_url", ""), "nx_token_set": bool(cfg.get("nx_token")),
+            "nx_sub_base": cfg.get("nx_sub_base", ""), "nx_check": cfg.get("nx_check") or {},
         },
         "decos": deco_lines(app),
         "routes": rts,
@@ -4435,7 +4653,7 @@ def do_action(app, action, body, host):
         return status, {"ok": False, "error": error}
 
     def all_clients():
-        return read_clients(app.db_path) or clients_from_panel(app.panel.overview()["inbounds"])
+        return clients_of(app, fallback=True)
 
     def find_user(sub):
         for u in group_users(all_clients()):
@@ -4486,6 +4704,59 @@ def do_action(app, action, body, host):
             if ok and p["ok"]:
                 return done("%s؛ %d inbound پیدا شد" % (note, len(p["inbounds"])))
             return fail(p["error"] or note)
+
+        if action == "nx_connect":
+            url = re.sub(r"/api(/v1)?$", "", str(body.get("url") or "").strip().rstrip("/"))
+            if not re.match(r"https?://[^/\s]+", url):
+                return fail("آدرس پنل NX رو کامل بذار، مثلاً https://nx.example.com:17899/path")
+            cfg = load_config()
+            token = str(body.get("token") or "").strip() or cfg.get("nx_token", "")
+            if not token:
+                return fail("توکن API پنل NX رو بذار")
+            cfg.update(nx_url=url, nx_token=token)
+            save_config(cfg)
+            app.reload()
+            nx = app.nx_panel
+            nx.forget()
+            users = nx.users(ttl=0)
+            manual = str(body.get("sub_base") or "").strip()
+            base = (manual.rstrip("/") + "/") if manual else nx.sub_base()
+            mine = {sub: email for email, sub, _ in list_clients(app.db_path) if sub}  # the 3x-ui users
+            theirs = {u.get("subId") for u in users}
+            missing = sorted(email for sub, email in mine.items() if sub not in theirs)
+            cfg = load_config()
+            cfg["nx_sub_base"] = base or cfg.get("nx_sub_base", "")
+            cfg["nx_check"] = {"users": len(users), "xui": len(mine), "matched": len(mine) - len(missing),
+                               "missing": missing[:20], "at": int(time.time())}
+            save_config(cfg)
+            app.reload()
+            msg = "پنل NX وصل شد: %d کاربر" % len(users)
+            if mine:
+                msg += "؛ %d از %d کاربر 3x-ui توش هست" % (len(mine) - len(missing), len(mine))
+            if not cfg["nx_sub_base"]:
+                msg += "؛ آدرس ساب پیدا نشد، دستی بذارش"
+            return done(msg)
+
+        if action == "backend_set":
+            want = "nx" if body.get("backend") == "nx" else "xui"
+            cfg = load_config()
+            if want == "nx" and not (cfg.get("nx_url") and cfg.get("nx_token") and cfg.get("nx_sub_base")):
+                return fail("اول پنل NX رو وصل کن")
+            cfg["backend"] = want
+            save_config(cfg)
+            app.reload()
+            app.nx_panel.forget()
+            return done("از این به بعد کاربرها و کانفیگ‌هاشون از NX میان" if want == "nx" else "برگشت روی 3x-ui")
+
+        if action == "nx_disconnect":
+            cfg = load_config()
+            for k in ("nx_url", "nx_token", "nx_sub_base"):
+                cfg[k] = ""
+            cfg["nx_check"], cfg["backend"] = {}, "xui"
+            save_config(cfg)
+            app.reload()
+            app.nx_panel.forget()
+            return done("پنل NX جدا شد؛ کاربرها از 3x-ui خونده می‌شن")
 
         if action == "routes_save":
             cfg = load_config()
@@ -4597,6 +4868,8 @@ def do_action(app, action, body, host):
             t = template_by_id(cfg, str(body.get("id") or ""))
             if not t:
                 return fail("این ساب پیدا نشد")
+            if body.get("on") and on_nx(app):
+                return fail("با پنل NX هر مشتری باید کاربر خودش رو توی NX داشته باشه؛ لینک اختصاصی فقط با 3x-ui کار می‌کنه")
             if body.get("on"):
                 if not t.get("token"):
                     t["token"] = secrets.token_urlsafe(9).replace("-", "x").replace("_", "y")
@@ -4905,6 +5178,8 @@ def do_action(app, action, body, host):
 
         if action in ("loc_add", "loc_setup", "loc_attach", "loc_delete"):
             p = app.panel.overview()
+            if p.get("backend") == "nx":
+                return fail("با پنل NX، نود و لوکیشن رو توی خود NX اضافه کن")
             if not p["ok"]:
                 return fail(p["error"] or "اول پنل 3x-ui را وصل کن")
             if p["version"] != 3:
@@ -5570,6 +5845,7 @@ function tplEditor(o){
 }
 function dedBlock(t){
   if(!t||t.id==="default")return "";
+  if(S.state.settings.backend==="nx")return `<div class="sec"><h3>لینک اختصاصی</h3></div><div class="hint" style="margin:0 2px 8px">با پنل NX هر مشتری باید کاربر خودش رو توی NX داشته باشه؛ لینک اختصاصی فقط با 3x-ui کار می‌کنه.</div>`;
   if(!t.token)return `<div class="sec"><h3>لینک اختصاصی</h3></div>
    <div class="hint" style="margin:0 2px 8px">یه لینک ساب جدا با همین چیدمان که به هیچ کاربری وصل نیست؛ برای فروش، تست یا اشتراک‌گذاری. کانفیگ‌هاش از یه کاربر پایه خونده می‌شه.</div>
    <button type="button" class="btn ghost block" data-ded-on>${ic("link")} ساخت لینک اختصاصی</button>`;
@@ -5883,7 +6159,7 @@ SEGV.exits=()=>{
   <div class="list">${st.locations.map(l=>{const on=l.status==="online";const ibs=st.inbounds.filter(ib=>l.inbounds.includes(ib.id));
     return `<div class="row btn-row" data-act="exit-more" data-id="${l.id}">${mono(l.main?"⌂":(l.name.match(/\p{Regional_Indicator}{2}/u)||["EX"])[0],l.main||on?"on":l.status==="offline"?"bad":"")}<div class="t"><b>${esc(l.name)}</b><small>${l.main?"این پنل":esc(l.address||"")}، ${fa(usersOn(l))} کاربر، ${ibs.length?ibs.map(ib=>esc(ib.remark||ib.protocol)+" :"+ib.port).join("، "):"بدون inbound"}${l.latency!=null&&!l.main?"، "+ms_(l.latency):""}</small></div>
     <div class="r">${l.error?`<span class="bad">خطا</span>`:""}<span class="dot ${l.main||on?"ok":l.status==="offline"?"bad":""}"></span></div></div>`}).join("")}</div>
-  ${!p.ok?`<div class="note">${p.configured?esc(p.error||"پنل در دسترس نیست"):"برای خروجی‌های بیشتر (لوکیشن) اول پنل 3x-ui رو در تنظیمات وصل کن."}</div>`:p.version!==3?`<div class="note">خروجی‌های بیشتر به 3x-ui نسخه‌ی ۳ نیاز دارند: <span class="cmd">x-ui update</span></div>`:""}
+  ${p.version==="nx"?`<div class="note">${ic("info")} نودها و خروجی‌های NX رو توی خود پنل NX اضافه کن.</div>`:!p.ok?`<div class="note">${p.configured?esc(p.error||"پنل در دسترس نیست"):"برای خروجی‌های بیشتر (لوکیشن) اول پنل 3x-ui رو در تنظیمات وصل کن."}</div>`:p.version!==3?`<div class="note">خروجی‌های بیشتر به 3x-ui نسخه‌ی ۳ نیاز دارند: <span class="cmd">x-ui update</span></div>`:""}
   <div class="sec"><h3>سرورهای خارج</h3><div class="acts"><button type="button" class="abtn" data-act="srv-add" data-role="foreign">${ic("plus")} افزودن</button></div></div>
   <div class="list">${n.servers.filter(s=>s.role!=="iran").map(s=>{const f=s.facts||{},on=!s.error&&f.ip,isExit=s.local||!notExit.includes(s);
     return `<div class="row btn-row" data-act="srv-more" data-id="${s.id}">${mono(s.local?"⌂":"EX",on?"ok":s.error?"bad":"")}<div class="t"><b>${esc(s.name)}</b><small><span class="ltr">${esc(f.ip||s.host||"")}</span>${f.os?"، "+esc(f.os):""}${f.cc==="bbr"?"، BBR":""}${f.xui?"، 3x-ui":""}${isExit?"":"، هنوز خروجی نیست"}</small></div>
@@ -6093,7 +6369,7 @@ function userForm(u){
    <label class="f"><span>دستگاه</span><input class="in ltr" name="devices" value="${u?u.devices:0}" inputmode="numeric"></label>
   </div><div class="hint">۰ یعنی نامحدود</div>
   ${sw("first_use",u?u.expiry<0:false,"روزها از اولین اتصال شروع شود","تا کاربر وصل نشده، زمانش نمی‌گذره")}
-  ${isNew?(ibs.length?`<div class="mut small" style="margin-top:6px">${multiLoc()?"خروجی‌ها و inboundها":"روی کدام inbound"}</div>${st.locations.map(l=>{const list=ibs.filter(ib=>l.main?!ib.node:ib.node===l.id);if(!list.length)return "";return `${multiLoc()?`<div class="mut xs" style="margin:8px 2px 0">${esc(l.name)}</div>`:""}${list.map((ib,k)=>`<label class="check"><input type="checkbox" name="inbound" value="${ib.id}" ${k===0?"checked":""}><span><b>${esc(ib.remark||"#"+ib.id)}</b> <span class="mut small ltr">${esc(ib.protocol)} · ${ib.port}</span></span></label>`).join("")}`}).join("")}`:
+  ${isNew&&st.panel.version==="nx"?`<div class="hint" style="margin-top:8px">${ic("info")} کانفیگ‌های کاربر رو تمپلیت‌های پنل NX تعیین می‌کنن.</div>`:isNew?(ibs.length?`<div class="mut small" style="margin-top:6px">${multiLoc()?"خروجی‌ها و inboundها":"روی کدام inbound"}</div>${st.locations.map(l=>{const list=ibs.filter(ib=>l.main?!ib.node:ib.node===l.id);if(!list.length)return "";return `${multiLoc()?`<div class="mut xs" style="margin:8px 2px 0">${esc(l.name)}</div>`:""}${list.map((ib,k)=>`<label class="check"><input type="checkbox" name="inbound" value="${ib.id}" ${k===0?"checked":""}><span><b>${esc(ib.remark||"#"+ib.id)}</b> <span class="mut small ltr">${esc(ib.protocol)} · ${ib.port}</span></span></label>`).join("")}`}).join("")}`:
    `<div class="err">${st.panel.configured?esc(st.panel.error||"inboundی پیدا نشد"):"اول پنل 3x-ui را در تنظیمات وصل کن."}</div>`):sw("zero",false,"مصرف صفر شود","برای شروع دوره‌ی جدید")}`;
 }
 function addUserSheet(){
@@ -6106,7 +6382,7 @@ function addUserSheet(){
     $$("[data-preset]",el).forEach(b=>b.onclick=()=>{const[g,d]=b.dataset.preset.split(",");f.gb.value=g;f.days.value=d;$$("[data-preset]",el).forEach(x=>x.classList.toggle("on",x===b))});
     f.onsubmit=async e=>{e.preventDefault();const b=$("button:not([type=button])",f);
       const body={name:f.uname.value.trim(),gb:f.gb.value,days:f.days.value,devices:f.devices.value,first_use:f.first_use.checked,inbounds:$$("input[name=inbound]:checked",f).map(x=>+x.value),template:f.tpl?f.tpl.value:"default"};
-      if(!body.inbounds.length){toast("حداقل یک inbound انتخاب کن","bad");return}
+      if(!body.inbounds.length&&S.state.panel.version!=="nx"){toast("حداقل یک inbound انتخاب کن","bad");return}
       const j=await act(b,"user_add",body);if(j.ok)shareSheet(userBy(j.sub)||{sub:j.sub,name:body.name})};
   });
 }
@@ -6133,6 +6409,21 @@ function moreSheet(u){
 }
 
 /* settings */
+function backendCard(){
+  const s=S.state.settings,nx=s.backend==="nx",c=s.nx_check||{},p=S.state.panel;
+  const stat=c.at?`<div class="kv"><span>آخرین بررسی</span><span>${fa(c.users)} کاربر توی NX${c.xui?`، ${fa(c.matched)} از ${fa(c.xui)} کاربر 3x-ui`:""}</span></div>${(c.missing||[]).length?`<div class="hint">توی NX نیستن: <span class="ltr">${c.missing.map(esc).join("، ")}</span></div>`:""}`:"";
+  return `<div class="card" id="nx-sec"><h2>پنل کاربرها <span class="tag ${nx?(p.ok?"ok":"bad"):""}">${nx?(p.ok?"NX، وصل":"NX، خطا"):"3x-ui"}</span></h2>
+   <div class="seg"><button type="button" data-act="backend" data-b="xui" class="${nx?"":"on"}">3x-ui</button><button type="button" data-act="backend" data-b="nx" class="${nx?"on":""}">NX</button></div>
+   <div class="hint">کاربرها، حجمشون و کانفیگ‌های خودشون از کدوم پنل بیان. لینک ساب مشتری‌ها عوض نمی‌شه و واسط‌ها، تانل‌ها و چیدمان ساب سر جاشون می‌مونن. 3x-ui دست‌نخورده می‌مونه و هر وقت خواستی برمی‌گردی.</div>
+   ${nx&&p.error?`<div class="err">${esc(p.error)}</div>`:""}
+   <details style="margin-top:10px" ${s.nx_token_set?"":"open"}><summary>اتصال به پنل NX</summary>
+   <form id="nxf">
+    ${field("nx_url","آدرس پنل NX",s.nx_url,'class="in ltr" placeholder="https://nx.example.com:17899/path" autocomplete="off" autocapitalize="off"',"همون آدرسی که پنل NX رو باهاش باز می‌کنی")}
+    ${field("nx_token","توکن API",'',`class="in ltr" type="password" autocomplete="off" placeholder="${s.nx_token_set?"ذخیره شده":"از Settings ← API tokens پنل NX"}"`)}
+    ${field("nx_sub_base","آدرس ساب (اختیاری)",s.nx_sub_base,'class="in ltr" placeholder="خودکار پیدا می‌شه" autocomplete="off"',"مثل <span class=\"ltr\">https://nx.example.com:17899/xyz/sub/</span>")}
+    <div class="bar-btns"><button class="btn">${ic("check")} وصل کن و بررسی کن</button>${s.nx_token_set?`<button type="button" class="btn danger icon" data-act="nx-off" title="جدا کن">${ic("trash")}</button>`:""}</div>
+   </form>${stat}</details></div>`;
+}
 VIEWS.settings=()=>{
   const s=S.state.settings,p=S.state.panel;
   const ph=(set,txt)=>set?"ذخیره شده":txt;
@@ -6149,7 +6440,9 @@ VIEWS.settings=()=>{
 
   ${cfCard()}
 
-  <form class="card" data-sec="panel" id="panel-sec"><h2>پنل 3x-ui <span class="tag ${p.ok?"ok":p.configured?"bad":""}">${p.ok?"وصل"+(s.panel_source==="auto"?"، خودکار":"، دستی")+"، API v"+fa(p.version||""):p.configured?"خطا":"وصل نیست"}</span></h2>
+  ${backendCard()}
+
+  <form class="card" data-sec="panel" id="panel-sec"><h2>پنل 3x-ui ${s.backend==="nx"?`<span class="tag">الان کاربرها از NX میان</span>`:`<span class="tag ${p.ok?"ok":p.configured?"bad":""}">${p.ok?"وصل"+(s.panel_source==="auto"?"، خودکار":"، دستی")+"، API v"+fa(p.version||""):p.configured?"خطا":"وصل نیست"}</span>`}</h2>
    ${p.error?`<div class="err">${esc(p.error)}</div>`:""}
    ${sw("panel_auto",s.panel_auto,"اتصال خودکار از روی سرور","EZ-XUI خودش به پنل وصل می‌شه و یه توکن به اسم xui-chain می‌سازه (Settings ← API Tokens پنل).")}
    ${s.panel_auto&&s.auto_note?`<div class="hint">${esc(s.auto_note)}</div>`:""}
@@ -6209,6 +6502,7 @@ VIEWS.settings=()=>{
 };
 document.addEventListener("submit",async e=>{
   const f=e.target;
+  if(f.id==="nxf"){e.preventDefault();await act($("button:not([type=button])",f),"nx_connect",{url:f.nx_url.value.trim(),token:f.nx_token.value.trim(),sub_base:f.nx_sub_base.value.trim()});return}
   if(f.id==="pwf"){e.preventDefault();const j=await act($("button",f),"password",{old:f.old.value,new:f.new.value});if(j.ok)f.reset();return}
   if(!f.dataset.sec)return;
   e.preventDefault();
@@ -6279,6 +6573,11 @@ const ACTS={
   "deco-mode":b=>{const seg=b.closest("[data-keys]");if(seg)act(b,"deco_mode",{keys:seg.dataset.keys.split(","),mode:b.dataset.m})},
   "deco-refresh":b=>act(b,"decos_refresh",{}),
   "bk-send":b=>act(b,"backup_send",{}),
+  backend:async b=>{const want=b.dataset.b,s=S.state.settings;if((s.backend==="nx")===(want==="nx"))return;
+    if(want==="nx"&&!(s.nx_token_set&&s.nx_sub_base)){toast("اول پایین همین کارت پنل NX رو وصل کن","bad");return}
+    const ok=await confirmSheet(want==="nx"?"کاربرها از NX":"برگشت به 3x-ui",want==="nx"?"از این به بعد کاربرها و کانفیگ‌هاشون از NX میان. لینک ساب مشتری‌ها همونه، ولی کانفیگ‌های داخلش عوض می‌شن؛ مشتری باید اشتراک رو توی اپ آپدیت کنه. کانفیگ‌های قبلی تا وقتی 3x-ui روشنه کار می‌کنن.":"کاربرها و کانفیگ‌ها دوباره از 3x-ui خونده می‌شن.",want==="nx"?"برو روی NX":"برگرد",false);
+    if(ok)act(b,"backend_set",{backend:want})},
+  "nx-off":async()=>{if(await confirmSheet("جدا کردن NX","آدرس و توکن پنل NX از EZ پاک می‌شه و کاربرها از 3x-ui خونده می‌شن. به خود پنل NX دست نمی‌خوره.","جدا کن",true))act(null,"nx_disconnect",{})},
   "self-update":async b=>{
     if(!await confirmSheet("آپدیت پنل","آخرین نسخه از گیت‌هاب نصب می‌شه و پنل چند ثانیه ری‌استارت می‌شه.","آپدیت کن"))return;
     b.classList.add("busy");
@@ -6323,7 +6622,8 @@ class App:
         self.db_path = db_path
         self.reload()
         self.monitor = Monitor(self)
-        self.panel = PanelAPI(self)
+        self.xui_panel = PanelAPI(self)
+        self.nx_panel = NXPanel(self)
         self.auth = Auth()
         self.usage = UsageStore()
         self.net = Net(self)
@@ -6331,6 +6631,15 @@ class App:
     def reload(self):
         self.cfg = load_config()
         self.rt = resolve_runtime(self.cfg, self.db_path)
+
+    @property
+    def panel(self):
+        """The users' panel: NX when EZ sits on it, else 3x-ui."""
+        return self.nx_panel if self.rt.get("backend") == "nx" else self.xui_panel
+
+    @panel.setter
+    def panel(self, value):
+        self.xui_panel = value
 
 
 ADMIN_HEADERS = {
@@ -6595,7 +6904,7 @@ def usage_loop(app, every=600):
     time.sleep(20)
     while True:
         try:
-            clients = read_clients(app.db_path) or clients_from_panel(app.panel.overview()["inbounds"])
+            clients = clients_of(app, fallback=True)
             used = {}
             for c in clients:
                 if c["sub"]:
@@ -6618,9 +6927,11 @@ def user_info(app, sub):
     """Everything the user page shows. None when the subscription does not exist."""
     rt = app.rt
     ded = dedicated_sub(rt, sub)
+    if ded and on_nx(rt):
+        return None
     base = (ded.get("base") or first_enabled_sub(app)) if ded else sub
     try:
-        status, hdrs, body = http_get(rt["xui_sub_url"] + urllib.parse.quote(base), connect=rt.get("xui_connect", ""))
+        status, hdrs, body = http_get(panel_sub_url(rt, base), connect=rt.get("xui_connect", ""))
     except Exception:
         return None
     if status != 200:
@@ -6629,7 +6940,7 @@ def user_info(app, sub):
     if not own:
         return None
     info = parse_userinfo(hdrs.get("subscription-userinfo"))
-    clients = [c for c in read_clients(app.db_path) if c["sub"] == sub]
+    clients = [c for c in clients_of(app) if c["sub"] == sub]
     users = group_users(clients) if clients else []
     u = users[0] if users else {}
     expiry = u.get("expiry") if u else (info.get("expire", 0) * 1000)
