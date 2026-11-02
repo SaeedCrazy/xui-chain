@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.9.2"
+VERSION = "5.10.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -110,6 +110,12 @@ DEFAULTS = {
     "label_deco": "واسط",       # واسط ۱، واسط ۲ ... (the upstreams); a Latin label gives Deco1, Deco2
     "label_auto": "Auto",
     "monitor_minutes": 10,      # how often the Decos are tested
+    "bot_enable": False,        # EZ's own bot: admin alerts and commands, customer reminders
+    "bot_token": "",            # a Telegram bot made for EZ alone (another program reading it steals the updates)
+    "bot_bale": False,          # the same bot on Bale, with bale_token
+    "bot_days": "3,1",          # customer reminders this many days before expiry
+    "bot_pcts": "80,95",        # ... and at these percents of the volume
+    "bot_quiet": "0-8",         # no customer reminders in these Tehran hours
     "tg_enable": True,          # Telegram alerts
     "tg_token": "",             # empty = the 3x-ui panel's own Telegram bot
     "tg_chat": "",              # empty = the panel bot's admin chat ids
@@ -2361,9 +2367,12 @@ class Monitor:
             except Exception as e:
                 print("server check error: %s" % e, flush=True)
         if msgs:
-            err = tg_send(rt, "🔗 %s · %s\n\n%s" % (NAME, rt.get("public_host") or "server", "\n\n".join(msgs)))
-            if err:
-                print("telegram: %s" % err, flush=True)
+            text = "🔗 %s · %s\n\n%s" % (NAME, rt.get("public_host") or "server", "\n\n".join(msgs))
+            bot = getattr(self.app, "bot", None)
+            if not (bot and bot.nets() and bot.st["admins"] and bot.notify_admins("quota" if all("حجم" in m or "روز" in m for m in msgs) else "deco", text)):
+                err = tg_send(rt, text)
+                if err:
+                    print("telegram: %s" % err, flush=True)
         return items
 
     def alerts(self, items, rt):
@@ -4642,6 +4651,10 @@ def admin_state(app, host):
     rts = annotate_ports(routes_public(live, app.net.ping_by_key), nx_user_ports(app) if on_nx(app) else panel["inbounds"],
                          panel.get("nodes"))
     decos = deco_lines(app)
+    h = (host or "").rsplit(":", 1)[0].strip("[]")
+    if h and h not in ("localhost", "127.0.0.1", "::1") and app.bot.st.get("host") != host:
+        app.bot.st["host"] = host  # where the bot's links point when no public host is set
+        app.bot.save()
     clients = clients_of(app)
     source = "nx" if on_nx(app) else "db"
     if not clients and panel["ok"] and not on_nx(app):
@@ -4685,6 +4698,7 @@ def admin_state(app, host):
         },
         "decos": decos,
         "entries": entries_public(cfg, rts, decos),
+        "bot": app.bot.public(),
         "routes": rts,
         "cf": cf_public(cfg),
         "groups": deco_groups(cfg, ups),
@@ -4749,10 +4763,10 @@ def net_state(app):
 
 
 SETTING_BOOLS = ("bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
-                 "skip_exhausted", "info_config")
-SETTING_TEXTS = {"bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
+                 "skip_exhausted", "info_config", "bot_enable", "bot_bale")
+SETTING_TEXTS = {"bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
-SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass")
+SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
 
 
 def net_action(app, action, body, host, done, fail):
@@ -4924,6 +4938,9 @@ def do_action(app, action, body, host):
                 cfg["monitor_minutes"] = min(1440, max(2, _int(body["monitor_minutes"]) or 10))
             save_config(cfg)
             app.reload()
+            if any(k.startswith("bot_") or k == "bale_token" for k in body):
+                app.bot.me = {}
+                threading.Thread(target=app.bot.start, daemon=True).start()
             if any(k in body for k in ("panel_user", "panel_pass", "panel_token", "panel_url", "panel_auto")):
                 app.panel.cookies, app.panel.version = {}, None
                 app.panel.forget()
@@ -5240,6 +5257,50 @@ def do_action(app, action, body, host):
                 return fail("فایل خونده نشد")
             had_xui = restore_backup(app, data)
             return done("بکاپ برگردونده شد" + ("؛ دیتابیس 3x-ui داخل فایل هست ولی دست نخورد (اونو از خود 3x-ui برگردون)" if had_xui else ""))
+
+        if action == "bot_pair":
+            if not app.bot.nets():
+                return fail("اول ربات رو روشن کن و توکنش رو ذخیره کن")
+            code = app.bot.pair_code()
+            me = app.bot.me.get("tg") or {}
+            return done("", code=code, link="https://t.me/%s?start=%s" % (me["username"], code) if me.get("username") else "")
+
+        if action in ("bot_admin", "bot_unpair"):
+            cid = str(body.get("id") or "")
+            if cid not in app.bot.st["admins"]:
+                return fail("این چت پیدا نشد")
+            with app.bot.lock:
+                if action == "bot_unpair":
+                    app.bot.st["admins"].pop(cid)
+                else:
+                    a = app.bot.st["admins"][cid]
+                    if "paused" in body:
+                        a["paused"] = bool(body["paused"])
+                    if "events" in body:
+                        ev = body["events"]
+                        keys = {k for k, _ in BOT_EVENTS}
+                        a["events"] = "all" if ev == "all" else [e for e in ev or [] if e in keys]
+            app.bot.save()
+            return done("چت جدا شد" if action == "bot_unpair" else "ذخیره شد")
+
+        if action == "bot_test":
+            if not app.bot.st["admins"]:
+                return fail("هنوز هیچ چت مدیری وصل نیست")
+            n = sum(1 for cid, a in app.bot.st["admins"].items()
+                    if not app.bot.send(*cid.split(":", 1), "🔗 %s\n\n✅ پیام آزمایشی ربات." % NAME, kind="test", queue=False))
+            app.bot.save()
+            return done("به %s چت رسید" % str(n).translate(FA_DIGITS)) if n else fail("نرسید؛ لاگ ربات رو ببین")
+
+        if action == "bot_broadcast":
+            text = str(body.get("text") or "").strip()[:3500]
+            target = str(body.get("target") or "all")
+            n = app.bot.broadcast(text, target, dry=True)
+            if body.get("preview") or not text:
+                return done("", count=n)
+            if not n:
+                return fail("هیچ مشتری‌ای با این انتخاب به ربات وصل نیست")
+            threading.Thread(target=app.bot.broadcast, args=(text, target), daemon=True).start()
+            return done("در حال ارسال به %s چت" % str(n).translate(FA_DIGITS))
 
         if action == "bot_chat":
             which = body.get("bot")
@@ -6805,6 +6866,8 @@ VIEWS.settings=()=>{
    <label class="f"><span>پیام برای همه‌ی کاربرها</span><textarea class="in" name="announce" style="min-height:64px;direction:rtl;font-family:inherit" placeholder="مثلاً: سرورها امشب ساعت ۲ چند دقیقه قطع می‌شن.">${esc(s.announce)}</textarea></label>
    <button class="btn block">${ic("check")} ذخیره</button></form>
 
+  ${botCard()}
+
   <form class="card" data-sec="tg"><h2>هشدار تلگرام</h2>
    <p class="mut small">قطع و وصل شدن واسط‌ها و تانل‌ها، و تموم شدن حجم یا زمان. ${s.tg_source==="panel"?"الان از ربات خود پنل 3x-ui استفاده می‌شه.":""}</p>
    ${sw("tg_enable",s.tg_enable,"هشدار روشن باشد")}
@@ -6843,6 +6906,66 @@ VIEWS.settings=()=>{
    <div class="hint" style="margin:2px 2px 0">آخرین نسخه رو از گیت‌هاب نصب می‌کنه؛ دیگه لازم نیست توی سرور <span class="cmd">ez-xui update</span> بزنی.</div>
    <div class="kv" style="margin-top:8px"><span>رمز یادت رفت؟</span><span class="cmd">ez-xui password</span></div></div>`;
 };
+/* the bot: settings, admin chats, customers */
+function botCard(){
+  const b=S.state.bot||{},n=b.nets||{},tg=n.tg||{},bl=n.bale||{};
+  const netLine=(x,label)=>x.on?(x.error?`<span class="tag bad">${label}: خطا</span>`:x.username?`<span class="tag ok">${label}: <span class="ltr">@${esc(x.username)}</span></span>`:`<span class="tag">${label}: در حال اتصال</span>`):"";
+  const evLabel=a=>a.events==="all"?"همه‌ی هشدارها":(a.events||[]).length?(a.events||[]).map(k=>(b.events.find(e=>e.key===k)||{}).label||k).join("، "):"هیچ";
+  const admins=(b.admins||[]).map(a=>`<div class="row"><div class="t"><b>${esc(a.name)} <span class="tag">${a.net==="bale"?"بله":"تلگرام"}</span></b><small>${a.paused?'<span class="warn">مکث</span>، ':""}${esc(evLabel(a))}</small></div><div class="r"><button type="button" class="abtn" data-act="bot-admin" data-id="${esc(a.id)}">${ic("edit")}</button></div></div>`).join("");
+  return `<form class="card" data-sec="bot" id="bot-sec"><h2>🤖 ربات</h2>
+   <p class="mut small">مدیرها هشدارها رو می‌گیرن و با <span class="ltr">/status</span> و <span class="ltr">/user</span> وضعیت رو می‌پرسن. مشتری‌ها با فرستادن لینک اشتراکشون (یا یه دکمه توی صفحه‌ی اشتراک) وصل می‌شن؛ قبل از تموم شدن حجم و زمان یادآوری می‌گیرن و هر وقت بخوان مصرفشون رو می‌بینن.</p>
+   ${sw("bot_enable",b.enable,"ربات روشن باشد")}
+   <div style="display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 6px">${netLine(tg,"تلگرام")}${netLine(bl,"بله")}${b.enable?`<span class="tag">${fa(b.customers||0)} مشتری وصل</span>`:""}${b.queue?`<span class="tag warn">${fa(b.queue)} در صف ارسال</span>`:""}</div>
+   ${tg.error&&tg.on?`<div class="err">${esc(tg.error)}</div>`:""}
+   ${field("bot_token","توکن ربات تلگرام","",`class="in ltr" type="password" autocomplete="off" placeholder="${b.token_set?"ذخیره شده":"123456:ABC…"}"`,'از <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a> یه ربات <b>فقط برای EZ</b> بساز؛ ربات 3x-ui یا هر برنامه‌ی دیگه رو نذار.')}
+   ${sw("bot_bale",b.bale,"روی بله هم",b.bale_ready?"با همون ربات بله‌ی بخش بکاپ":"اول توی بخش بکاپ توکن بله رو بذار")}
+   <details><summary>یادآوری مشتری‌ها</summary>
+    <div class="cols2">${field("bot_days","روزهای قبل از انقضا",b.days,'class="in ltr" placeholder="3,1"')}${field("bot_pcts","درصد مصرف حجم",b.pcts,'class="in ltr" placeholder="80,95"')}</div>
+    ${field("bot_quiet","ساعت سکوت (تهران)",b.quiet,'class="in ltr" placeholder="0-8"',"توی این ساعت‌ها یادآوری نمی‌ره؛ بعدش می‌ره. خالی = همیشه")}
+   </details>
+   <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button></div>
+   ${b.enable&&(tg.on||bl.on)?`<div class="sec" style="margin:14px 2px 4px"><h3>چت‌های مدیر</h3><div class="acts"><button type="button" class="abtn" data-act="bot-pair">${ic("plus")} وصل کردن</button>${(b.admins||[]).length?`<button type="button" class="abtn" data-act="bot-test">${ic("bell")} آزمایشی</button>`:""}</div></div>
+   <div class="list">${admins||`<div class="note">هنوز چتی وصل نیست. «وصل کردن» رو بزن و کد رو به ربات بفرست.</div>`}</div>
+   <div class="bar-btns"><button type="button" class="btn ghost" data-act="bot-cast">${ic("bell")} پیام به مشتری‌ها</button></div>
+   ${(b.log||[]).length?`<details><summary>آخرین ارسال‌ها</summary>${b.log.slice(0,15).map(l=>`<div class="kv"><span class="ltr">${esc(l.kind||"")} · ${l.net==="bale"?"بله":"تلگرام"}</span><span>${l.ok?'<span class="ok">رسید</span>':`<span class="bad">${esc(l.err||"خطا")}</span>`} <span class="mut xs">${ago(l.t*1000)}</span></span></div>`).join("")}</details>`:""}`:""}
+  </form>`;
+}
+function botPairSheet(j){
+  sheet(`<h3>🤖 وصل کردن چت مدیر</h3>
+   <p class="mut small">این کد ۱۰ دقیقه اعتبار داره. ${j.link?"روی دکمه بزن، یا کد رو به ربات بفرست.":"کد رو به ربات بفرست."} برای گروه: ربات رو اضافه کن و بنویس <span class="ltr">/start@ربات کد</span>.</p>
+   <div class="linkbox" style="text-align:center;font-size:22px;letter-spacing:3px">${esc(j.code)}</div>
+   <div class="bar-btns">${j.link?`<a class="btn" href="${esc(j.link)}" target="_blank" rel="noopener">${ic("link")} باز کردن ربات</a>`:""}<button type="button" class="btn ghost" id="bpc">${ic("copy")} کپی کد</button></div>
+   ${j.link?'<div id="bpq" style="display:grid;place-items:center;margin-top:10px"></div>':""}
+   <div class="hint">بعد از وصل شدن، «تازه‌سازی» رو بزن تا چت توی لیست بیاد.</div>`,el=>{
+    $("#bpc",el).onclick=()=>copy(j.code);
+    const q=$("#bpq",el);if(q){const draw=()=>{if(window.QRCode)new QRCode(q,{text:j.link,width:180,height:180,correctLevel:QRCode.CorrectLevel.M})};window.QRCode?draw():setTimeout(draw,800)}});
+}
+function botAdminSheet(a){
+  const b=S.state.bot,all=a.events==="all",on=new Set(all?b.events.map(e=>e.key):a.events||[]);
+  sheet(`<h3>${esc(a.name)}</h3><form id="baf">
+   ${sw("paused",a.paused,"مکث","موقتاً هیچ هشداری نیاد")}
+   <div class="sec" style="margin:8px 2px 4px"><h3>هشدارها</h3></div>
+   ${b.events.map(e=>sw("ev_"+e.key,on.has(e.key),e.label)).join("")}
+   <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn danger" data-unpair>${ic("trash")} جدا کردن</button></div></form>`,el=>{
+    const f=$("#baf",el);
+    f.onsubmit=async e=>{e.preventDefault();const ev=b.events.filter(x=>f.elements["ev_"+x.key].checked).map(x=>x.key);
+      const j=await act($("button.btn",f),"bot_admin",{id:a.id,paused:f.paused.checked,events:ev.length===b.events.length?"all":ev});if(j.ok)closeSheet()};
+    $("[data-unpair]",el).onclick=async()=>{if(await confirmSheet("جدا کردن چت",`«${esc(a.name)}» دیگه هشدار نمی‌گیره.`,"جدا کن",true)){const j=await act(null,"bot_unpair",{id:a.id});if(j.ok)closeSheet()}};
+  });
+}
+function botCastSheet(){
+  const T=[["all","همه‌ی مشتری‌های وصل"],["active","فعال‌ها"],["expiring","رو به پایان"],["ended","تموم‌شده‌ها"]];
+  sheet(`<h3>پیام به مشتری‌ها</h3><form id="bcf">
+   <label class="f"><span>به</span><select class="in" name="target">${T.map(([v,l])=>`<option value="${v}">${l}</option>`).join("")}</select></label>
+   <label class="f"><span>متن</span><textarea class="in" name="text" style="min-height:96px;direction:rtl;font-family:inherit" maxlength="3500" placeholder="مثلاً: سرورها امشب ساعت ۲ چند دقیقه قطع می‌شن." required></textarea></label>
+   <div class="hint" id="bcn">…</div>
+   <div class="bar-btns"><button class="btn">${ic("bell")} ارسال</button></div></form>`,el=>{
+    const f=$("#bcf",el),cnt=async()=>{const j=await api("bot_broadcast",{target:f.target.value,preview:true});$("#bcn",el).textContent=j.ok?`به ${fa(j.count)} چت می‌رسه (فقط مشتری‌هایی که به ربات وصل شدن).`:""};
+    f.target.onchange=cnt;cnt();
+    f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"bot_broadcast",{target:f.target.value,text:f.text.value});if(j.ok)closeSheet()};
+  });
+}
+
 document.addEventListener("submit",async e=>{
   const f=e.target;
   if(f.id==="nxf"){e.preventDefault();await act($("button:not([type=button])",f),"nx_connect",{url:f.nx_url.value.trim(),token:f.nx_token.value.trim(),sub_base:f.nx_sub_base.value.trim()});return}
@@ -6860,6 +6983,10 @@ const ACTS={
   seg:b=>{S.seg=b.dataset.seg;S.tab="routes";try{localStorage.setItem("xc_seg",S.seg);localStorage.setItem("xc_tab","routes")}catch(e){}closeSheet();render()},
   theme:()=>{const dark=document.documentElement.dataset.theme==="dark";S.theme=dark?"light":"dark";try{localStorage.setItem("xc_theme",S.theme)}catch(e){}applyTheme();render()},
   refresh:b=>act(b,"state",{}),
+  "bot-pair":async b=>{b.classList.add("busy");try{const j=await api("bot_pair",{});if(j.ok)botPairSheet(j);else toast(j.msg||"نشد","bad")}finally{b.classList.remove("busy")}},
+  "bot-admin":b=>{const a=(S.state.bot.admins||[]).find(x=>x.id===b.dataset.id);if(a)botAdminSheet(a)},
+  "bot-test":b=>act(b,"bot_test",{}),
+  "bot-cast":()=>botCastSheet(),
   test:b=>act(b,"test",{}),
   filter:b=>{S.filter=b.dataset.f;render()},
   "add-user":()=>addUserSheet(),
@@ -6978,6 +7105,7 @@ class App:
         self.auth = Auth()
         self.usage = UsageStore()
         self.net = Net(self)
+        self.bot = Bot(self)
 
     def reload(self):
         self.cfg = load_config()
@@ -7240,13 +7368,466 @@ def bot_chat_ids(api, token):
     return ids
 
 
+# ---------------------------------------------------------------- the bot (Telegram and Bale)
+#
+# Admin chats pair with a one-time code from the admin page and get the alerts they choose, plus
+# /status and /user. Customers link their chat by sending their subscription link (or one tap from
+# their page) and get reminders before their time or volume runs out, and their usage on demand.
+
+BOT_EVENTS = (("deco", "قطع و وصل واسط‌ها و تانل‌ها"), ("quota", "حجم و زمان واسط‌ها"),
+              ("users", "خلاصه‌ی روزانه‌ی کاربرهای رو به پایان"), ("backup", "خطای بکاپ"))
+BOT_NETS = {"tg": "تلگرام", "bale": "بله"}
+SUB_RE = re.compile(r"(?:/[A-Za-z0-9_.-]+/|^s_?|^)([A-Za-z0-9_-]{8,64})/?$")
+BTN_ME, BTN_LINK, BTN_HELP = "📊 وضعیت من", "🔗 لینک اشتراک", "💬 پشتیبانی"
+
+
+def bot_state_path():
+    return conf_path("bot.json")
+
+
+class Bot:
+    """Long-polls each configured bot, answers chats and delivers notices with retries."""
+
+    LOCK_TRIES, LOCK_WINDOW, CODE_TTL = 5, 600, 600
+
+    def __init__(self, app):
+        self.app = app
+        self.lock = threading.RLock()
+        self.me = {}        # net -> {"username", "error"}
+        self.threads = {}
+        self.st = self._load()
+
+    # state ------------------------------------------------------------------
+    def _load(self):
+        try:
+            with open(bot_state_path(), encoding="utf-8") as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            st = {}
+        for k, v in (("offset", {}), ("admins", {}), ("customers", {}), ("codes", {}), ("tries", {}),
+                     ("sent", {}), ("queue", []), ("log", []), ("host", "")):
+            st.setdefault(k, v)
+        return st
+
+    def save(self):
+        with self.lock:
+            os.makedirs(CONF_DIR, exist_ok=True)
+            tmp = bot_state_path() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.st, f, ensure_ascii=False)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, bot_state_path())
+
+    def nets(self):
+        """{net: (api base, token)} of the bots that are on."""
+        cfg, out = self.app.cfg, {}
+        if not cfg.get("bot_enable"):
+            return out
+        if cfg.get("bot_token"):
+            out["tg"] = (TG_API, cfg["bot_token"])
+        if cfg.get("bot_bale") and cfg.get("bale_token"):
+            out["bale"] = (BALE_API, cfg["bale_token"])
+        return out
+
+    # Bot API ----------------------------------------------------------------
+    def call(self, net, method, payload=None, timeout=20):
+        base, token = self.nets().get(net, (None, None))
+        if not token:
+            raise ValueError("bot is off")
+        req = urllib.request.Request("%s/bot%s/%s" % (base, token, method), data=json.dumps(payload or {}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                j = json.loads(r.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            try:
+                j = json.loads(e.read().decode() or "{}")
+            except ValueError:
+                j = {}
+            raise ValueError(j.get("description") or "HTTP %d" % e.code)
+        if not j.get("ok"):
+            raise ValueError(j.get("description") or "error")
+        return j.get("result")
+
+    def send(self, net, chat, text, kind="", keyboard=None, queue=True):
+        """Send now; on failure keep it for a retry. -> "" or the error."""
+        payload = {"chat_id": chat, "text": text[:4000], "disable_web_page_preview": True}
+        if keyboard is not None:
+            payload["reply_markup"] = keyboard
+        try:
+            self.call(net, "sendMessage", payload)
+            err = ""
+        except (ValueError, OSError) as e:
+            err = str(e)[:160]
+            if "blocked" in err or "chat not found" in err or "deactivated" in err:
+                self.forget_chat(net, chat)  # the user blocked the bot: unlink, nothing to retry
+            elif queue:
+                with self.lock:
+                    self.st["queue"].append({"net": net, "chat": chat, "text": text, "kind": kind, "tries": 1,
+                                             "next": time.time() + 60})
+                    self.st["queue"] = self.st["queue"][-500:]
+        self.log(net, chat, kind, err)
+        return err
+
+    def log(self, net, chat, kind, err):
+        with self.lock:
+            self.st["log"].append({"t": int(time.time()), "net": net, "chat": str(chat), "kind": kind, "ok": not err, "err": err})
+            self.st["log"] = self.st["log"][-200:]
+
+    def retry(self):
+        now, due, keep = time.time(), [], []
+        with self.lock:
+            for q in self.st["queue"]:
+                (due if q["next"] <= now else keep).append(q)
+            self.st["queue"] = keep
+        for q in due:
+            try:
+                self.call(q["net"], "sendMessage", {"chat_id": q["chat"], "text": q["text"][:4000], "disable_web_page_preview": True})
+                self.log(q["net"], q["chat"], q["kind"], "")
+            except (ValueError, OSError) as e:
+                if q["tries"] < 5:
+                    q["tries"] += 1
+                    q["next"] = now + 60 * 5 ** (q["tries"] - 1)  # 1, 5, 25, 125 minutes
+                    with self.lock:
+                        self.st["queue"].append(q)
+                self.log(q["net"], q["chat"], q["kind"], str(e)[:160])
+
+    def forget_chat(self, net, chat):
+        cid = "%s:%s" % (net, chat)
+        with self.lock:
+            self.st["customers"].pop(cid, None)
+
+    # admins -----------------------------------------------------------------
+    def pair_code(self):
+        code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+        with self.lock:
+            now = time.time()
+            self.st["codes"] = {c: v for c, v in self.st["codes"].items() if v["exp"] > now}
+            self.st["codes"][code] = {"exp": now + self.CODE_TTL}
+        self.save()
+        return code
+
+    def notify_admins(self, event, text):
+        """Deliver an alert to every paired admin chat that wants it. -> number of chats."""
+        n = 0
+        nets = self.nets()
+        for cid, a in list(self.st["admins"].items()):
+            net, chat = cid.split(":", 1)
+            if net not in nets or a.get("paused"):
+                continue
+            ev = a.get("events") or "all"
+            if ev != "all" and event not in ev:
+                continue
+            self.send(net, chat, text, kind=event)
+            n += 1
+        if n:
+            self.save()
+        return n
+
+    # customers ----------------------------------------------------------------
+    def user_of(self, sub):
+        users = group_users(clients_of(self.app))
+        return next((u for u in users if u.get("sub") == sub), None)
+
+    def user_text(self, u, link=False):
+        now = time.time() * 1000
+        lines = ["👤 %s" % u["name"]]
+        if not u.get("enable", True):
+            lines.append("⛔ غیرفعال")
+        if u.get("total"):
+            left = max(0, u["total"] - u["used"])
+            lines.append("📊 %s GB از %s GB مانده" % (fmt_gb(left), fmt_gb(u["total"])))
+        else:
+            lines.append("📊 حجم نامحدود (%s GB مصرف)" % fmt_gb(u["used"]))
+        exp = u.get("expiry") or 0
+        if exp > 0:
+            days = math.ceil((exp - now) / 86400000)
+            lines.append("⏳ %s" % ("منقضی شده" if days <= 0 else "%d روز مانده" % days))
+        elif exp < 0:
+            lines.append("⏳ %d روز، از اولین اتصال" % round(-exp / 86400000))
+        else:
+            lines.append("⏳ بدون محدودیت زمان")
+        text = "\n".join(lines[:1] + [l.translate(FA_DIGITS) for l in lines[1:]])
+        return text + ("\n\n🔗 %s" % self.sub_link(u["sub"]) if link else "")
+
+    def sub_link(self, sub):
+        return link_base(self.app.rt, self.st.get("host") or "localhost") + sub
+
+    def customer_keyboard(self):
+        rows = [[{"text": BTN_ME}, {"text": BTN_LINK}]]
+        if self.app.cfg.get("support_url"):
+            rows.append([{"text": BTN_HELP}])
+        return {"keyboard": rows, "resize_keyboard": True}
+
+    def locked(self, cid):
+        now = time.time()
+        tries = [t for t in self.st["tries"].get(cid, []) if now - t < self.LOCK_WINDOW]
+        self.st["tries"][cid] = tries
+        return len(tries) >= self.LOCK_TRIES
+
+    # incoming -----------------------------------------------------------------
+    def handle(self, net, msg):
+        chat = (msg.get("chat") or {}).get("id")
+        text = (msg.get("text") or "").strip()
+        if chat is None or not text:
+            return
+        cid = "%s:%s" % (net, chat)
+        who = msg.get("from") or {}
+        name = " ".join(x for x in (who.get("first_name"), who.get("last_name")) if x) or who.get("username") or str(chat)
+        cmd, _, arg = text.partition(" ")
+        cmd = cmd.split("@", 1)[0].lower()
+        arg = arg.strip()
+        admin = self.st["admins"].get(cid)
+        reply = lambda t, kb=None: self.send(net, chat, t, kind="reply", keyboard=kb, queue=False)
+
+        code = (arg if cmd == "/start" else text).strip().upper()
+        if code in self.st["codes"] and self.st["codes"][code]["exp"] > time.time():
+            with self.lock:
+                self.st["codes"].pop(code)
+                self.st["admins"][cid] = {"name": name, "events": "all", "paused": False, "at": int(time.time())}
+            self.save()
+            return reply("✅ این چت به‌عنوان مدیر به %s وصل شد.\n\nدستورها:\n/status خلاصه\n/user اسم — وضعیت یه کاربر\n\nکدوم هشدارها بیاد رو از پنل انتخاب کن." % NAME,
+                         {"remove_keyboard": True})
+        if admin and cmd in ("/status", "/user"):
+            return reply(self.admin_status() if cmd == "/status" else self.admin_user(arg))
+        if cmd == "/stop":
+            with self.lock:
+                had = self.st["customers"].pop(cid, None) or self.st["admins"].pop(cid, None)
+            self.save()
+            return reply("قطع شد؛ دیگه پیامی نمیاد." if had else "این چت به جایی وصل نبود.", {"remove_keyboard": True})
+        cust = self.st["customers"].get(cid)
+        if cust and text in (BTN_ME, "/me", BTN_LINK, BTN_HELP):
+            u = self.user_of(cust["sub"])
+            if not u:
+                return reply("اشتراکت پیدا نشد. لینک جدیدت رو بفرست.")
+            if text == BTN_HELP:
+                return reply("💬 " + self.app.cfg.get("support_url", ""))
+            return reply(self.user_text(u, link=text == BTN_LINK), self.customer_keyboard())
+        m = SUB_RE.search(arg if cmd == "/start" else text)
+        if m and (cmd == "/start" or "/" in text or len(text) >= 8):
+            if self.locked(cid):
+                return reply("چند بار اشتباه فرستادی؛ ۱۰ دقیقه دیگه دوباره امتحان کن.")
+            u = self.user_of(m.group(1))
+            if not u:
+                self.st["tries"].setdefault(cid, []).append(time.time())
+                return reply("این لینک پیدا نشد. لینک اشتراکت رو کامل بفرست.")
+            with self.lock:
+                self.st["customers"][cid] = {"sub": u["sub"], "name": name, "at": int(time.time())}
+            self.save()
+            return reply("✅ وصل شد. قبل از تموم شدن حجم یا زمانت همین‌جا خبرت می‌کنم.\n\n" + self.user_text(u),
+                         self.customer_keyboard())
+        if admin:
+            return reply("دستورها:\n/status خلاصه\n/user اسم — وضعیت یه کاربر")
+        if cust:
+            return reply("از دکمه‌های پایین استفاده کن.", self.customer_keyboard())
+        return reply("سلام 👋\nلینک اشتراکت رو اینجا بفرست تا قبل از تموم شدن حجم یا زمانت خبرت کنم و هر وقت خواستی مصرفت رو ببینی.")
+
+    def admin_status(self):
+        users = group_users(clients_of(self.app))
+        now = time.time() * 1000
+        act = [u for u in users if u["enable"] and not (u["expiry"] > 0 and u["expiry"] < now) and not (u["total"] and u["used"] >= u["total"])]
+        soon = [u for u in act if (u["expiry"] > 0 and u["expiry"] - now < 3 * 86400000) or (u["total"] and u["used"] / u["total"] >= .9)]
+        rts = active_routes(live_routes(self.app, self.app.rt, UPSTREAMS.nodes()))
+        down = [r for r in rts if r.get("down")]
+        out = ("👥 %d کاربر فعال از %d\n⚠️ %d رو به پایان\n🛣 %d مسیر%s\n🔔 %d مشتری وصل به ربات" % (
+            len(act), len(users), len(soon), len(rts), "، %d قطع" % len(down) if down else "، همه سالم",
+            len(self.st["customers"]))).translate(FA_DIGITS)
+        if soon:
+            out += "\n\nرو به پایان: " + "، ".join(u["name"] for u in soon[:15])
+        return "📋 %s\n\n%s" % (NAME, out)
+
+    def admin_user(self, q):
+        if not q:
+            return "اسم کاربر رو بعد از /user بنویس."
+        users = group_users(clients_of(self.app))
+        hits = [u for u in users if q.lower() in u["name"].lower()]
+        if not hits:
+            return "کاربری با این اسم نیست."
+        exact = [u for u in hits if u["name"].lower() == q.lower()]
+        if len(exact) == 1 or len(hits) == 1:
+            return self.user_text((exact or hits)[0], link=True)
+        return "چند کاربر پیدا شد: " + "، ".join(u["name"] for u in hits[:20])
+
+    def poll(self, net):
+        """One long-poll round for one bot."""
+        try:
+            ups = self.call(net, "getUpdates", {"offset": self.st["offset"].get(net, 0), "timeout": 25,
+                                                "allowed_updates": ["message"]}, timeout=35)
+            self.me.setdefault(net, {})["error"] = ""
+        except (ValueError, OSError) as e:
+            self.me.setdefault(net, {})["error"] = str(e)[:160]
+            time.sleep(15)
+            return
+        for up in ups or []:
+            self.st["offset"][net] = up["update_id"] + 1
+            try:
+                if up.get("message"):
+                    self.handle(net, up["message"])
+            except Exception as e:  # one bad update must not stop the bot
+                print("bot %s: %s" % (net, e), flush=True)
+        if ups:
+            self.save()
+
+    def poll_loop(self, net):
+        while net in self.nets():
+            self.poll(net)
+        self.threads.pop(net, None)
+
+    def identify(self, net):
+        try:
+            me = self.call(net, "getMe", timeout=10)
+            self.me[net] = {"username": me.get("username", ""), "error": ""}
+        except (ValueError, OSError) as e:
+            self.me[net] = {"username": "", "error": str(e)[:160]}
+
+    def start(self):
+        """(Re)start polling for every bot that is on; called at start and after settings change."""
+        for net in self.nets():
+            if net not in self.threads:
+                self.identify(net)
+                t = threading.Thread(target=self.poll_loop, args=(net,), daemon=True)
+                self.threads[net] = t
+                t.start()
+
+    # reminders --------------------------------------------------------------
+    def reminders(self, now=None):
+        """Customer reminders: days before expiry and volume thresholds, once each per renewal."""
+        cfg = self.app.cfg
+        if not self.st["customers"] or not self.nets():
+            return 0
+        now = now or time.time()
+        hour = int((now + TEHRAN) % 86400 // 3600)
+        q = str(cfg.get("bot_quiet") or "").replace(" ", "")
+        if re.fullmatch(r"\d{1,2}-\d{1,2}", q):
+            a, b = (int(x) for x in q.split("-"))
+            if (a <= hour < b) if a <= b else (hour >= a or hour < b):
+                return 0  # quiet hours: the same notices go out once they end
+        days = sorted({_int(x) for x in str(cfg.get("bot_days") or "3,1").split(",") if _int(x) > 0}, reverse=True)
+        pcts = sorted({_int(x) for x in str(cfg.get("bot_pcts") or "80,95").split(",") if 0 < _int(x) < 100})
+        users = {u["sub"]: u for u in group_users(clients_of(self.app)) if u.get("sub")}
+        sent = 0
+        for cid, c in list(self.st["customers"].items()):
+            u = users.get(c["sub"])
+            if not u or not u.get("enable", True):
+                continue
+            net, chat = cid.split(":", 1)
+            msgs = []
+            exp = u.get("expiry") or 0
+            if exp > 0:
+                left = (exp / 1000 - now) / 86400
+                if left <= 0:
+                    msgs.append(("exp:%d" % exp, "⛔ اشتراکت تموم شد. برای تمدید پیام بده."))
+                else:
+                    for d in days:
+                        if left <= d:
+                            msgs.append(("day%d:%d" % (d, exp), "⏳ فقط %d روز از اشتراکت مونده." % max(1, math.ceil(left))))
+                            break
+            if u.get("total"):
+                p = u["used"] * 100 / u["total"]
+                if p >= 100:
+                    msgs.append(("full:%d" % u["total"], "⛔ حجم اشتراکت تموم شد. برای تمدید پیام بده."))
+                else:
+                    for t in reversed(pcts):
+                        if p >= t:
+                            msgs.append(("pct%d:%d" % (t, u["total"]), "📊 %d٪ از حجمت مصرف شده؛ %s GB مونده." % (int(p), fmt_gb(u["total"] - u["used"]))))
+                            break
+            for key, text in msgs:
+                k = "%s|%s" % (c["sub"], key)
+                if k in self.st["sent"]:
+                    continue
+                self.st["sent"][k] = int(now)
+                support = cfg.get("support_url")
+                self.send(net, chat, (text + ("\n💬 " + support if support and "تمدید" in text else "")).translate(FA_DIGITS), kind="reminder")
+                sent += 1
+        if sent:
+            cut = now - 120 * 86400
+            self.st["sent"] = {k: v for k, v in self.st["sent"].items() if v > cut}
+            self.save()
+        return sent
+
+    def daily_users(self, now=None):
+        """Once a day, the admin chats that want it get who is about to run out."""
+        now = now or time.time()
+        day = tehran_day(now)
+        if self.st.get("daily") == day or int((now + TEHRAN) % 86400 // 3600) < 10:
+            return 0
+        self.st["daily"] = day
+        users = group_users(clients_of(self.app))
+        ms = now * 1000
+        soon = [u for u in users if u["enable"] and ((u["expiry"] > 0 and 0 < u["expiry"] - ms < 3 * 86400000) or
+                                                    (u["total"] and .9 <= u["used"] / u["total"] < 1))]
+        if not soon:
+            self.save()
+            return 0
+        text = "⚠️ رو به پایان (۳ روز یا ۹۰٪ حجم):\n" + "\n".join("• %s" % u["name"] for u in soon[:40])
+        return self.notify_admins("users", text)
+
+    def broadcast(self, text, target="all", dry=False):
+        """A message from the admin to linked customers. -> number of chats."""
+        users = {u["sub"]: u for u in group_users(clients_of(self.app)) if u.get("sub")}
+        ms = time.time() * 1000
+        nets = self.nets()
+
+        def want(u):
+            if target == "all":
+                return True
+            if target.startswith("sub:"):
+                return u and u["sub"] == target[4:]
+            if not u:
+                return False
+            active = u["enable"] and not (u["expiry"] > 0 and u["expiry"] < ms) and not (u["total"] and u["used"] >= u["total"])
+            if target == "active":
+                return active
+            if target == "expiring":
+                return active and ((u["expiry"] > 0 and u["expiry"] - ms < 3 * 86400000) or (u["total"] and u["used"] / u["total"] >= .9))
+            if target == "ended":
+                return not active
+            return False
+        chats = [cid for cid, c in self.st["customers"].items() if cid.split(":", 1)[0] in nets and want(users.get(c["sub"]))]
+        if dry:
+            return len(chats)
+        for cid in chats:
+            net, chat = cid.split(":", 1)
+            self.send(net, chat, text, kind="broadcast")
+        self.save()
+        return len(chats)
+
+    def loop(self):
+        while True:
+            try:
+                self.start()
+                self.retry()
+                self.reminders()
+                self.daily_users()
+            except Exception as e:
+                print("bot loop: %s" % e, flush=True)
+            time.sleep(300)
+
+    def public(self):
+        """The bot's state for the admin page (no tokens)."""
+        cfg = self.app.cfg
+        admins = [{"id": cid, "net": cid.split(":", 1)[0], "name": a.get("name", ""), "events": a.get("events") or "all",
+                   "paused": bool(a.get("paused")), "at": a.get("at", 0)} for cid, a in self.st["admins"].items()]
+        nets = self.nets()
+        return {"enable": bool(cfg.get("bot_enable")), "token_set": bool(cfg.get("bot_token")), "bale": bool(cfg.get("bot_bale")),
+                "bale_ready": bool(cfg.get("bale_token")),
+                "nets": {n: dict(self.me.get(n, {}), on=n in nets) for n in BOT_NETS},
+                "admins": admins, "customers": len(self.st["customers"]),
+                "customers_by": {n: sum(1 for c in self.st["customers"] if c.startswith(n + ":")) for n in BOT_NETS},
+                "queue": len(self.st["queue"]), "log": self.st["log"][-30:][::-1],
+                "events": [{"key": k, "label": l} for k, l in BOT_EVENTS],
+                "days": cfg.get("bot_days") or "3,1", "pcts": cfg.get("bot_pcts") or "80,95", "quiet": cfg.get("bot_quiet") or ""}
+
+
 def backup_loop(app):
     time.sleep(60)
     while True:
         try:
             hours = int(app.cfg.get("bk_hours") or 0)
             if hours > 0 and time.time() - int(app.cfg.get("bk_last") or 0) >= hours * 3600 and backup_targets(app):
-                send_backup(app)
+                sent, errors = send_backup(app)
+                if errors and getattr(app, "bot", None):
+                    app.bot.notify_admins("backup", "💾 بکاپ خودکار: " + "؛ ".join(errors))
         except Exception as e:
             print("backup error: %s" % e, flush=True)
         time.sleep(600)
@@ -7322,6 +7903,7 @@ def user_info(app, sub):
         "history": [{"day": d, "bytes": b} for d, b in hist],
         "history_since": int(started * 1000),
         "support": cfg.get("support_url", ""),
+        "bot": (app.bot.me.get("tg") or {}).get("username", "") if "tg" in app.bot.nets() else "",
         "announce": cfg.get("announce", ""),
         "now": int(time.time() * 1000),
     }
@@ -7519,7 +8101,8 @@ function render(){
    <details open><summary>چطور وصل شم؟</summary><ol><li>اپ <b>Happ</b> (یا یکی دیگه از اپ‌های بالا) رو نصب کن.</li><li>دکمه‌ی «افزودن» رو بزن؛ اگه باز نشد، لینک رو کپی کن و در اپ به‌عنوان Subscription اضافه کن.</li><li>گزینه‌ی <b>⚡ Auto</b> رو انتخاب کن و وصل شو.</li></ol></details>
    <details><summary>وصل نمی‌شه؟</summary><ol><li>توی اپ، اشتراک رو آپدیت کن (Update subscription).</li><li>گزینه‌ی Auto یا یکی دیگه از کانفیگ‌ها رو امتحان کن.</li><li>اگه حجم یا زمانت تموم شده، برای تمدید پیام بده.</li></ol></details>
    <details><summary>تمدید کنم چی می‌شه؟</summary><p>لینکت عوض نمی‌شه. بعد از تمدید فقط اشتراک رو توی اپ آپدیت کن.</p></details>
-   ${D.support?`<a class="btn block" style="margin-top:10px" href="${esc(D.support)}" target="_blank" rel="noopener">${ic("chat")} پشتیبانی و تمدید</a>`:""}</div>
+   ${D.support?`<a class="btn block" style="margin-top:10px" href="${esc(D.support)}" target="_blank" rel="noopener">${ic("chat")} پشتیبانی و تمدید</a>`:""}
+   ${D.bot?`<a class="btn ghost block" style="margin-top:8px" href="https://t.me/${esc(D.bot)}?start=s_${esc(location.pathname.split("/").filter(Boolean).pop())}" target="_blank" rel="noopener">${ic("bell")} یادآوری تمدید توی تلگرام</a>`:""}</div>
   <div class="foot">آخرین به‌روزرسانی: ${jdate(D.now,{hour:"2-digit",minute:"2-digit"})}</div>`;
   requestAnimationFrame(()=>{const v=$("#ringv");if(v)v.style.strokeDashoffset=D.total?C*(1-Math.max(0,100-pct)/100):0});
   renderApps();renderChart();
@@ -7766,6 +8349,7 @@ def serve(app):
     threading.Thread(target=app.monitor.loop, daemon=True).start()
     threading.Thread(target=usage_loop, args=(app,), daemon=True).start()
     threading.Thread(target=backup_loop, args=(app,), daemon=True).start()
+    threading.Thread(target=app.bot.loop, daemon=True).start()
     threading.Thread(target=app.panel.overview, daemon=True).start()  # automatic panel connection
     httpd.serve_forever()
 

@@ -1509,6 +1509,148 @@ class Telegram(BaseHTTPRequestHandler):
         self.wfile.write(b'{"ok":true,"result":[{"update_id":1,"message":{"chat":{"id":555},"text":"hi"}}]}')
 
 
+class BotAPI(BaseHTTPRequestHandler):
+    """A stand-in Bot API: records what is sent, answers getMe and getUpdates."""
+    sent, updates, blocked = [], [], set()
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        method = self.path.rsplit("/", 1)[1]
+        if method == "getMe":
+            res = {"username": "ez_test_bot"}
+        elif method == "getUpdates":
+            res, BotAPI.updates = list(BotAPI.updates), []
+        elif method == "sendMessage":
+            if str(body.get("chat_id")) in BotAPI.blocked:
+                return self.answer(403, {"ok": False, "description": "Forbidden: bot was blocked by the user"})
+            BotAPI.sent.append(body)
+            res = {"message_id": len(BotAPI.sent)}
+        else:
+            res = True
+        self.answer(200, {"ok": True, "result": res})
+
+    def answer(self, code, j):
+        b = json.dumps(j).encode()
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+
+class BotTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.api = start(ThreadingHTTPServer(("127.0.0.1", 0), BotAPI))
+        d = tempfile.mkdtemp()
+        cls.db = os.path.join(d, "x-ui.db")
+        con = sqlite3.connect(cls.db)
+        con.execute("CREATE TABLE settings (id INTEGER PRIMARY KEY, key TEXT, value TEXT)")
+        con.execute("CREATE TABLE inbounds (id INTEGER PRIMARY KEY, settings TEXT)")
+        now = int(time.time() * 1000)
+        con.execute("INSERT INTO inbounds (settings) VALUES (?)", (json.dumps({"clients": [
+            {"email": "sara", "subId": "sarasub12345", "enable": True, "totalGB": 10 * GB, "expiryTime": now + int(2.5 * 86400000)},
+            {"email": "omid", "subId": "omidsub12345", "enable": True, "totalGB": 10 * GB, "expiryTime": now + 30 * 86400000},
+        ]}),))
+        con.execute("CREATE TABLE client_traffics (email TEXT, up INTEGER, down INTEGER, total INTEGER, expiry_time INTEGER)")
+        con.execute("INSERT INTO client_traffics VALUES ('omid', 0, ?, 0, 0)", (int(8.5 * GB),))
+        con.commit()
+        con.close()
+
+    def setUp(self):
+        xc.TG_API = "http://127.0.0.1:%d" % self.api.server_address[1]
+        BotAPI.sent, BotAPI.updates, BotAPI.blocked = [], [], set()
+        self.saved = xc.load_config()
+        xc.save_config(dict(self.saved, bot_enable=True, bot_token="1:test", bot_quiet="", public_host="sub.example.com"))
+        try:
+            os.remove(xc.bot_state_path())
+        except OSError:
+            pass
+        self.app = xc.App(db_path=self.db)
+        self.bot = self.app.bot
+
+    def tearDown(self):
+        xc.save_config(self.saved)
+        try:
+            os.remove(xc.bot_state_path())
+        except OSError:
+            pass
+
+    def say(self, chat, text, name="Ali"):
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": chat}, "from": {"first_name": name}, "text": text})
+        return BotAPI.sent[-1]["text"] if BotAPI.sent else ""
+
+    def test_admin_pairing_and_commands(self):
+        self.assertIn("/status", self.say(100, "/status") + "/status")  # a stranger gets the welcome, not the status
+        self.assertNotIn("کاربر فعال", self.say(100, "/status"))
+        code = self.bot.pair_code()
+        self.assertIn("مدیر", self.say(100, "/start " + code))
+        self.assertIn("100", " ".join(self.bot.st["admins"]))
+        self.assertNotIn(code, self.bot.st["codes"])  # one use only
+        out = self.say(100, "/status")
+        self.assertIn("کاربر فعال", out)
+        self.assertIn("sara", out)  # about to expire
+        out = self.say(100, "/user omi")
+        self.assertIn("omid", out)
+        self.assertIn("sub.example.com:", out)
+        self.assertEqual(self.bot.notify_admins("deco", "x"), 1)
+        self.bot.st["admins"]["tg:100"]["events"] = ["backup"]
+        self.assertEqual(self.bot.notify_admins("deco", "x"), 0)
+        self.bot.st["admins"]["tg:100"]["paused"] = True
+        self.assertEqual(self.bot.notify_admins("backup", "x"), 0)
+
+    def test_customer_link_reminders_and_stop(self):
+        self.assertIn("پیدا نشد", self.say(200, "https://sub.example.com/chain/nosuchsub999"))
+        out = self.say(200, "https://sub.example.com:2097/chain/sarasub12345")
+        self.assertIn("وصل شد", out)
+        self.assertEqual(self.bot.st["customers"]["tg:200"]["sub"], "sarasub12345")
+        self.assertIn("sara", self.say(200, xc.BTN_ME))
+        self.assertIn("sarasub12345", self.say(200, xc.BTN_LINK))
+        self.say(201, "/start s_omidsub12345")  # one tap from the user page
+        self.assertEqual(self.bot.st["customers"]["tg:201"]["sub"], "omidsub12345")
+        BotAPI.sent = []
+        self.assertEqual(self.bot.reminders(), 2)  # sara: 3 days left, omid: 85% used
+        texts = {m["chat_id"]: m["text"] for m in BotAPI.sent}
+        self.assertIn("روز", texts["200"])
+        self.assertIn("٪", texts["201"])
+        self.assertEqual(self.bot.reminders(), 0)  # once each
+        self.assertEqual(self.bot.broadcast("سلام", "expiring", dry=True), 1)  # sara; omid at 85% is not yet
+        self.assertEqual(self.bot.broadcast("سلام", "active", dry=True), 2)
+        self.assertEqual(self.bot.broadcast("سلام", "sub:omidsub12345", dry=True), 1)
+        self.assertIn("قطع", self.say(200, "/stop"))
+        self.assertNotIn("tg:200", self.bot.st["customers"])
+        BotAPI.blocked.add("201")
+        self.bot.send("tg", "201", "x")
+        self.assertNotIn("tg:201", self.bot.st["customers"])  # blocked the bot: unlinked, not retried
+        self.assertEqual(self.bot.st["queue"], [])
+
+    def test_wrong_links_lock_out_and_quiet_hours(self):
+        for i in range(5):
+            self.say(300, "https://x.example/chain/wrongsub%04d" % i)
+        self.assertIn("۱۰ دقیقه", self.say(300, "https://sub.example.com/chain/sarasub12345"))
+        self.say(301, "/start s_sarasub12345")
+        cfg = xc.load_config()
+        cfg["bot_quiet"] = "0-24"
+        xc.save_config(cfg)
+        self.app.reload()
+        self.assertEqual(self.bot.reminders(), 0)
+        self.assertEqual(self.bot.st["sent"], {})  # held back, not dropped
+
+    def test_failed_send_is_retried(self):
+        self.bot.st["admins"]["tg:400"] = {"name": "x", "events": "all"}
+        xc.TG_API = "http://127.0.0.1:9"  # nothing listens
+        self.bot.send("tg", "400", "hello", kind="deco")
+        self.assertEqual(len(self.bot.st["queue"]), 1)
+        xc.TG_API = "http://127.0.0.1:%d" % self.api.server_address[1]
+        self.bot.st["queue"][0]["next"] = 0
+        self.bot.retry()
+        self.assertEqual(self.bot.st["queue"], [])
+        self.assertEqual(BotAPI.sent[-1]["text"], "hello")
+
+
 class MonitorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
