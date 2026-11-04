@@ -41,6 +41,7 @@ curl -fsSL "$REPO_RAW/xui_chain.py" -o "$APP_DIR/xui_chain.py.new"
 python3 -m py_compile "$APP_DIR/xui_chain.py.new"
 mv "$APP_DIR/xui_chain.py.new" "$APP_DIR/xui_chain.py"
 curl -fsSL "$REPO_RAW/install.sh" -o "$APP_DIR/install.sh" || true
+curl -fsSL "$REPO_RAW/move.sh" -o "$APP_DIR/move.sh" || true
 
 port_used() { ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"; }
 if [ ! -f "$CONF_DIR/config.json" ]; then
@@ -73,8 +74,9 @@ case "\${1:-info}" in
   restart)   systemctl restart xui-chain && echo restarted ;;
   log)       journalctl -u xui-chain -n 50 --no-pager ;;
   update)    bash $APP_DIR/install.sh ;;
+  move)      bash $APP_DIR/move.sh "\${@:2}" ;;
   uninstall) systemctl disable --now xui-chain; rm -f /etc/systemd/system/xui-chain.service /usr/local/bin/xui-chain /usr/local/bin/ez-xui; rm -rf $APP_DIR; echo "removed (settings kept in $CONF_DIR)" ;;
-  *)         echo "usage: ez-xui [info|password [new]|restart|log|update|uninstall]" ;;
+  *)         echo "usage: ez-xui [info|password [new]|restart|log|update|move prepare|test|switch|back root@IP|uninstall]" ;;
 esac
 EOF
 chmod +x /usr/local/bin/xui-chain
