@@ -14,8 +14,9 @@ set -euo pipefail
 
 STEP="${1:-}"; TARGET="${2:-}"; KEY="${3:-}"
 [ -n "$STEP" ] && [ -n "$TARGET" ] || { sed -n '2,13p' "$0"; exit 1; }
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=15)
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=15 -p "${MOVE_PORT:-22}")
 [ -n "$KEY" ] && SSH_OPTS+=(-i "$KEY")
+[ -f /etc/xui-chain/known_hosts ] && SSH_OPTS+=(-o UserKnownHostsFile=/etc/xui-chain/known_hosts)
 NEW_IP="${TARGET#*@}"
 CONF=/etc/xui-chain
 APP=/opt/xui-chain
@@ -29,6 +30,17 @@ r() { ssh "${SSH_OPTS[@]}" "$TARGET" "$@"; }
 put() { # put LOCAL REMOTE_DIR : copy a file or directory, keeping modes
   tar -C "$(dirname "$1")" -cpzf - "$(basename "$1")" | r "mkdir -p '$2' && tar -C '$2' -xpzf -"
 }
+notify() { # a line to the owner through EZ's bot (the run may outlive the panel that started it)
+  python3 -I - "$1" <<'EOF' >/dev/null 2>&1 || true
+import json, sys, urllib.request
+c = json.load(open("/etc/xui-chain/config.json"))
+tok, owners = c.get("bot_token"), [x for x in str(c.get("bot_owner") or "").replace(",", " ").split() if x.isdigit()]
+for o in owners if tok else []:
+    urllib.request.urlopen(urllib.request.Request("https://api.telegram.org/bot%s/sendMessage" % tok,
+        data=json.dumps({"chat_id": o, "text": "🚚 " + sys.argv[1]}).encode(), headers={"Content-Type": "application/json"}), timeout=15)
+EOF
+}
+
 old_ip() { curl -fs4 --max-time 5 https://api.ipify.org || hostname -I | awk '{print $1}'; }
 
 snapshot_db() { # a consistent copy of the 3x-ui database while it runs
@@ -126,9 +138,12 @@ sync_data() {
   say "data: 3x-ui database and EZ settings"
   snapshot_db "$STATE/x-ui.db"
   r "mkdir -p /etc/x-ui"
+  local was; was=$(r "systemctl is-active x-ui 2>/dev/null" || true)
+  [ "$was" = active ] && r "systemctl stop x-ui"   # never swap a database under a running panel
   put "$STATE/x-ui.db" /etc/x-ui
   rm -f "$STATE/x-ui.db"
   r "chmod 600 /etc/x-ui/x-ui.db"
+  [ "$was" = active ] && r "systemctl start x-ui"
   put "$CONF" /etc
   r "chmod 700 /etc/xui-chain; chmod 600 /etc/xui-chain/*"
 }
@@ -213,14 +228,34 @@ switch() {
   say "tunnel exit: stop here, start there"
   for u in /etc/systemd/system/ez-*.service; do
     [ -e "$u" ] || continue
-    n=$(basename "$u")
+    n=$(basename "$u"); conf=$(grep -oE '/usr/local/ez-xui/conf/[^ ]+\.toml' "$u" | head -1)
+    remote=$(grep -oE 'remote_addr *= *"[^"]+"' "$conf" 2>/dev/null | sed 's/.*"\(.*\)"/\1/')
+    if [ -n "$remote" ] && ! r "timeout 8 bash -c 'echo > /dev/tcp/${remote%:*}/${remote##*:}'" 2>/dev/null; then
+      echo "   $n: the new server cannot reach $remote (Iran side down or firewalled); this tunnel stays here"
+      continue
+    fi
     systemctl disable --now "$n" >/dev/null 2>&1 || true
     r "systemctl enable --now $n >/dev/null 2>&1 && systemctl is-active $n"
   done
+  local pub; pub=$(python3 -I -c "import json;c=json.load(open('/etc/xui-chain/config.json'));print(c.get('public_host') or '')")
+  if [ -n "$pub" ]; then
+    sleep 8
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 -A Happ "https://$pub:$(python3 -I -c "import json;print(json.load(open('/etc/xui-chain/config.json')).get('port',2097))")/app/" || true)
+    echo "   subscription address $pub answers: HTTP $code"
+    if [ "$code" != 200 ]; then
+      echo "   not answering: the tunnel goes back here, and EZ's port is relayed to the new server meanwhile"
+      for u in /etc/systemd/system/ez-*.service; do [ -e "$u" ] || continue; n=$(basename "$u"); r "systemctl disable --now $n" >/dev/null 2>&1 || true; systemctl enable --now "$n"; done
+      local port; port=$(python3 -I -c "import json;print(json.load(open('/etc/xui-chain/config.json')).get('port',2097))")
+      command -v socat >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq socat >/dev/null 2>&1
+      systemd-run --unit=ez-relay-$port --property=Restart=always socat TCP-LISTEN:$port,fork,reuseaddr TCP:$NEW_IP:$port >/dev/null 2>&1 || true
+      echo "   run 'ez-xui move switch $TARGET' again once the Iran side is reachable"
+    fi
+  fi
   say "domains that point here"
   cf_point "$old" "$NEW_IP"
   echo switched > "$STATE/state"
   say "done. customers move over as their apps reconnect (a minute or two). keep this server running for a few days."
+  notify "انتقال به $NEW_IP انجام شد. اپ مشتری‌ها ظرف ۱-۲ دقیقه خودشون منتقل می‌شن. سرور قبلی رو چند روز روشن نگه دار."
   say "undo with: ez-xui move back $TARGET"
 }
 
@@ -238,6 +273,7 @@ back() {
   cf_point "$NEW_IP" "$old"
   echo back > "$STATE/state"
   say "back on $old"
+  notify "برگشت به سرور قبلی ($old) انجام شد."
 }
 
 case "$STEP" in

@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.15.0"
+VERSION = "5.16.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -4714,6 +4714,7 @@ def admin_state(app, host):
         "decos": decos,
         "entries": entries_public(cfg, rts, decos),
         "bot": app.bot.public(),
+        "move": move_state(),
         "shop": app.bot.shop.public(),
         "shop_cfg": {k[5:]: cfg.get(k, "") for k in ("shop_cards", "shop_trial", "shop_ref", "shop_topups", "shop_channel",
                                                      "shop_inbounds", "shop_prefix", "shop_welcome", "shop_help")},
@@ -4788,6 +4789,83 @@ SETTING_TEXTS = {"bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_
 SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
 
 
+MOVE_DIR = "/root/.ez-move"
+
+
+def move_state():
+    """Where a move to another server stands (for the admin page)."""
+    out = {"target": "", "state": "", "log": []}
+    try:
+        with open(os.path.join(MOVE_DIR, "panel.json")) as f:
+            out.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(os.path.join(MOVE_DIR, "state")) as f:
+            out["state"] = f.read().strip() or out.get("state", "")
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(MOVE_DIR, "run.log"), encoding="utf-8", errors="replace") as f:
+            out["log"] = [re.sub(r"\x1b\[[0-9;]*m", "", l.rstrip()) for l in f.readlines()[-40:]]
+    except OSError:
+        pass
+    return out
+
+
+def move_action(app, step, body, job, fail):
+    """Move everything to a new server from the admin page: its root password is used once to leave EZ's key
+    there, then move.sh runs detached (a switch stops this very process) and reports to the owner in the bot."""
+    script = os.path.join(os.path.dirname(APP_FILE), "move.sh")
+    if not os.path.isfile(script):
+        return fail("move.sh نیست؛ یه بار «آپدیت پنل» رو بزن")
+    st = move_state()
+    if step == "prepare":
+        host = str(body.get("host") or "").strip()
+        user = str(body.get("user") or "root").strip() or "root"
+        port = _int(body.get("port")) or 22
+        pw = str(body.get("password") or "")
+        if not re.fullmatch(r"[A-Za-z0-9.:-]{3,255}", host):
+            return fail("آدرس سرور جدید درست نیست")
+        if user != "root":
+            return fail("فعلاً فقط با کاربر root")
+    else:
+        if not st.get("target"):
+            return fail("اول «آماده‌سازی» رو بزن")
+        user, host, port, pw = "root", st["target"], st.get("port") or 22, ""
+
+    def run(log):
+        os.makedirs(MOVE_DIR, mode=0o700, exist_ok=True)
+        if pw:
+            log("نصب کلید EZ روی %s…" % host)
+            Remote({"host": host, "port": port, "user": user}).install_key(pw)
+        with open(os.path.join(MOVE_DIR, "panel.json"), "w") as f:
+            json.dump({"target": host, "port": port, "at": int(time.time())}, f)
+        steps = ["prepare", "test"] if step == "prepare" else [step]
+        cmd = " && ".join("bash %s %s %s@%s %s" % (shq(script), s_, user, host, shq(SSH_KEY)) for s_ in steps)
+        open(os.path.join(MOVE_DIR, "run.log"), "w").close()
+        subprocess.run(["systemctl", "reset-failed", "ez-move"], capture_output=True)
+        p = subprocess.run(["systemd-run", "--unit=ez-move", "--collect", "--setenv=MOVE_PORT=%d" % port,
+                            "bash", "-c", "(%s) >> %s 2>&1; echo \"__rc=$?\" >> %s" % (cmd, MOVE_DIR + "/run.log", MOVE_DIR + "/run.log")],
+                           capture_output=True, text=True)
+        if p.returncode:
+            raise SSHError("systemd-run: " + (p.stderr or p.stdout).strip()[:200])
+        seen = 0
+        for _ in range(1800):  # follow the log; a switch ends this process before the end
+            time.sleep(2)
+            lines = move_state()["log"]
+            for l in lines[seen:]:
+                if l.startswith("__rc="):
+                    if l != "__rc=0":
+                        raise SSHError("انجام نشد؛ لاگ رو ببین")
+                    return "ok"
+                log(l)
+            seen = len(lines)
+        return "ok"
+    titles = {"prepare": "آماده‌سازی و تست سرور جدید", "switch": "جابه‌جایی به سرور جدید", "back": "برگشت به این سرور"}
+    return job(titles[step], run)
+
+
 def net_action(app, action, body, host, done, fail):
     net = app.net
     jobs = net.jobs
@@ -4804,6 +4882,8 @@ def net_action(app, action, body, host, done, fail):
         if j["status"] != "running":
             out["state"] = admin_state(app, host)
         return 200, out
+    if action in ("move_prepare", "move_switch", "move_back"):
+        return move_action(app, action[5:], body, job, fail)
     if action == "server_add":
         name, hostname = str(body.get("name", "")), str(body.get("host", ""))
         port, user, pw, role = _int(body.get("port")) or 22, str(body.get("user") or "root"), str(body.get("password", "")), str(body.get("role", "foreign"))
@@ -6894,6 +6974,7 @@ VIEWS.settings=()=>{
    <button class="btn block">${ic("check")} ذخیره</button></form>
 
   ${botCard()}
+  ${moveCard()}
 
   ${s.tg_source==="bot"?"":`<form class="card" data-sec="tg"><h2>هشدار تلگرام</h2>
    <p class="mut small">قطع و وصل شدن واسط‌ها و تانل‌ها، و تموم شدن حجم یا زمان. ${s.tg_source==="panel"?"الان از ربات خود پنل 3x-ui استفاده می‌شه.":""}</p>
@@ -7050,6 +7131,18 @@ function ordSheet(o){const st=OST[o.status]||["",o.status];
 async function showReceipt(id,box,btn){if(btn)btn.classList.add("busy");try{const j=await api("shop_receipt",{id});if(j.ok&&box)box.innerHTML=`<img class="rcpt" src="data:image/jpeg;base64,${j.img}" alt="رسید">`}finally{if(btn)btn.classList.remove("busy")}}
 document.addEventListener("input",e=>{if(e.target.id==="cq"){S.cq=e.target.value;const pos=e.target.selectionStart;render();const x=$("#cq");if(x){x.focus();x.setSelectionRange(pos,pos)}}});
 
+/* moving everything to a new server */
+function moveCard(){const m=S.state.move||{};
+  return `<form class="card" id="mvf"><h2>🚚 انتقال به سرور جدید</h2>
+   <p class="mut small">همه‌چیز (3x-ui و کاربرها، EZ و ربات و فروشگاه و کیف پول‌ها، گواهی‌ها، تانل) بدون قطعی به یه سرور دیگه منتقل می‌شه. لینک و کانفیگ مشتری‌ها عوض نمی‌شه. رمز فقط یه بار برای گذاشتن کلید استفاده می‌شه و جایی ذخیره نمی‌شه.</p>
+   ${m.target?`<div class="kv"><span>سرور جدید</span><span class="ltr">${esc(m.target)}</span></div><div class="kv"><span>وضعیت</span><span>${m.state==="switched"?'<span class="ok">منتقل شده</span>':m.state==="back"?"برگشته":(m.log||[]).some(l=>l.includes("all good"))?'<span class="ok">آماده‌ی جابه‌جایی</span>':"در حال آماده‌سازی / ناتموم"}</span></div>`:""}
+   <div class="cols2">${field("mv_host","آی‌پی سرور جدید",m.target||"",'class="in ltr" placeholder="1.2.3.4"')}${field("mv_port","پورت SSH","22",'class="in ltr" inputmode="numeric"')}</div>
+   ${field("mv_pass","رمز root سرور جدید","",'class="in ltr" type="password" autocomplete="off" placeholder="فقط برای بار اول"')}
+   <div class="bar-btns"><button type="button" class="btn" data-act="mv-prep">${ic("server")} آماده‌سازی و تست</button>
+    ${m.target?`<button type="button" class="btn danger" data-act="mv-switch">${ic("power")} جابه‌جایی</button>`:""}${m.state==="switched"?`<button type="button" class="btn ghost" data-act="mv-back">برگشت</button>`:""}</div>
+   ${(m.log||[]).length?`<details><summary>لاگ</summary><div class="linkbox" style="white-space:pre-wrap;max-height:260px;overflow:auto">${esc(m.log.join("\n"))}</div></details>`:""}
+  </form>`}
+
 /* the bot: settings, admin chats, customers */
 function botCard(){
   const b=S.state.bot||{},n=b.nets||{},tg=n.tg||{},bl=n.bale||{};
@@ -7138,6 +7231,9 @@ const ACTS={
   "shop-ok":b=>act(b,"shop_order",{id:+b.dataset.id,act:"approve"}),
   "shop-no":async b=>{if(await confirmSheet("رد رسید","این رسید رد بشه؟ به مشتری خبر داده می‌شه.","رد کن",true))act(null,"shop_order",{id:+b.dataset.id,act:"reject"})},
   "shop-rcpt":b=>{const o=(S.state.shop.orders||[]).find(x=>x.id===+b.dataset.id);if(o)ordSheet(o);setTimeout(()=>{const r=document.querySelector("#ov [data-r]");r&&r.click()},120)},
+  "mv-prep":b=>{const f=$("#mvf");act(b,"net_move_prepare",{host:f.mv_host.value.trim(),port:f.mv_port.value.trim(),password:f.mv_pass.value})},
+  "mv-switch":async b=>{if(await confirmSheet("جابه‌جایی","EZ و ربات و تانل می‌رن روی سرور جدید و دامنه‌ها عوض می‌شن. مشتری‌ها ظرف ۱-۲ دقیقه خودشون منتقل می‌شن. بعدش این پنل از سرور جدید باز می‌شه و نتیجه توی ربات برات میاد.","جابه‌جا کن",true))act(b,"net_move_switch",{})},
+  "mv-back":async b=>{if(await confirmSheet("برگشت","همه‌چیز برگرده روی این سرور؟","برگردون",true))act(b,"net_move_back",{})},
   "bot-pair":async b=>{b.classList.add("busy");try{const j=await api("bot_pair",{});if(j.ok)botPairSheet(j);else toast(j.msg||"نشد","bad")}finally{b.classList.remove("busy")}},
   "bot-admin":b=>{const a=(S.state.bot.admins||[]).find(x=>x.id===b.dataset.id);if(a)botAdminSheet(a)},
   "bot-test":b=>act(b,"bot_test",{}),

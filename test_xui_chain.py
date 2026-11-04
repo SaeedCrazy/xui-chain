@@ -733,6 +733,16 @@ class EndToEnd(unittest.TestCase):
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 401)
 
+    def test_move_panel_guards(self):
+        self.login()
+        out = self.admin("net_move_switch", {})[1]
+        self.assertFalse(out["ok"])  # nothing prepared yet (or no move.sh): never a blind switch
+        out = self.admin("net_move_prepare", {"host": "bad host;rm", "password": "x"})[1]
+        self.assertFalse(out["ok"])
+        st = self.admin("state")[1]["state"]
+        self.assertIn("move", st)
+        self.assertNotIn("password", json.dumps(st["move"]))
+
     def test_unknown_user_and_paths(self):
         self.assertEqual(self.get("/chain/nope")[0], 404)
         self.assertEqual(self.get("/wrong/")[0], 404)
