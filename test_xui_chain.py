@@ -1861,6 +1861,64 @@ class ShopTests(BotBase):
         self.assertIn("a:home", json.dumps(m["reply_markup"]))
         self.assertIn("خوش اومدی", m["text"])
 
+    def test_tickets_both_ways(self):
+        cfg = xc.load_config()
+        cfg["bot_owner"] = "42"
+        xc.save_config(cfg)
+        self.app.reload()
+        self.tap(960, "tk:new")
+        self.bot.handle("tg", {"chat": {"id": 960, "type": "private"}, "from": {"id": 960, "first_name": "Nima"}, "text": "وصل نمی‌شم"})
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 960, "type": "private"}, "from": {"id": 960}, "text": "از دیشب قطعه <b>"})
+        t = self.shop.d["tickets"][-1]
+        self.assertEqual((t["subject"], t["status"], t["uid"]), ("وصل نمی‌شم", "open", "tg:960"))
+        to_owner = [m for m in BotAPI.sent if m["chat_id"] in ("42", 42)]
+        self.assertTrue(to_owner and "a:tr:%d" % t["id"] in json.dumps(to_owner[-1]["reply_markup"]))
+        self.assertIn("&lt;b&gt;", to_owner[-1]["text"])  # the customer's text is escaped
+        self.admin_tap(42, "a:tr:%d" % t["id"])
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "یه بار ساب رو آپدیت کن"})
+        self.assertEqual(t["status"], "answered")
+        self.assertTrue(any(m["chat_id"] in ("960", 960) and "جواب پشتیبانی" in m["text"] for m in BotAPI.sent))
+        self.assertIn("حل شد", self.tap(961, "tk:%d" % t["id"]) + "حل شد")  # someone else's ticket is not shown
+        self.assertNotIn("آپدیت کن", self.tap(961, "tk:%d" % t["id"]))
+        self.tap(960, "tk:c:%d" % t["id"])
+        self.assertEqual(t["status"], "closed")
+        for i in range(5):  # at most five open tickets
+            self.shop.d["tickets"].append({"id": 100 + i, "uid": "tg:962", "status": "open", "subject": "x", "msgs": [], "updated": 0})
+        self.assertIn("حداکثر", self.tap(962, "tk:new"))
+
+    def test_orders_duplicate_receipts_and_cleanup(self):
+        self.tap(970, "bp:p30")
+        a = self.shop.d["orders"][-1]
+        self.tap(970, "pc:%d" % a["id"])
+        self.bot.handle("tg", {"chat": {"id": 970, "type": "private"}, "from": {"id": 970}, "photo": [{"file_id": "F1", "file_unique_id": "U1"}]})
+        self.tap(971, "bp:p30")
+        b = self.shop.d["orders"][-1]
+        self.tap(971, "pc:%d" % b["id"])
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 971, "type": "private"}, "from": {"id": 971}, "photo": [{"file_id": "F2", "file_unique_id": "U1"}]})
+        cap = [m for m in BotAPI.sent if m["method"] == "sendPhoto"][0]["caption"]
+        self.assertIn("قبلاً برای سفارش #%s" % xc.fa_num(a["id"]), cap)
+        self.assertIn("بررسی", self.tap(970, "ord"))
+        self.tap(972, "bp:p30")
+        c = self.shop.d["orders"][-1]
+        self.assertEqual(self.shop.cleanup(now=time.time() + 49 * 3600), 1)
+        self.assertEqual(c["status"], "cancelled")
+        self.assertEqual(a["status"], "review")  # a receipt under review is never dropped
+
+    def test_flood_guard(self):
+        for i in range(30):
+            self.bot.handle("tg", {"chat": {"id": 980, "type": "private"}, "from": {"id": 980}, "text": "/start"})
+        self.assertLessEqual(sum(1 for m in BotAPI.sent if str(m.get("chat_id")) == "980"), 25)
+
+    def test_reminder_has_renew_button(self):
+        self.say(985, "/start s_sarasub12345")
+        BotAPI.sent = []
+        self.bot.reminders()
+        m = [m for m in BotAPI.sent if str(m["chat_id"]) == "985"][-1]
+        self.assertIn("rn:sarasub12345", json.dumps(m["reply_markup"]))
+
     def test_code_cannot_stretch_over_invoices(self):
         self.shop.d["codes"] = [{"code": "ONCE", "kind": "discount", "pct": 50, "amount": 0, "max": 0, "exp": 0}]
         u = self.shop.user("tg:950")

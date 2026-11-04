@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.13.1"
+VERSION = "5.14.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -6934,7 +6934,8 @@ VIEWS.settings=()=>{
    <div class="kv" style="margin-top:8px"><span>رمز یادت رفت؟</span><span class="cmd">ez-xui password</span></div></div>`;
 };
 /* shop tab: sales through the bot */
-const SSEGS=[["sum","خلاصه"],["plans","پلن‌ها"],["codes","کدها"],["cust","مشتری‌ها"],["set","تنظیمات"]];
+const SSEGS=[["sum","خلاصه"],["tk","تیکت‌ها"],["plans","پلن‌ها"],["codes","کدها"],["cust","مشتری‌ها"],["set","تنظیمات"]];
+const TKST={open:["acc","منتظر جواب"],answered:["ok","جواب داده شد"],closed:["","بسته"]};
 const OST={new:["","در انتظار پرداخت"],receipt:["warn","منتظر رسید"],review:["acc","در حال بررسی"],approving:["acc","در حال انجام"],done:["ok","انجام شد"],rejected:["bad","رد شد"],cancelled:["","لغو"],failed:["bad","ناموفق"],refunded:["warn","برگشت به کیف پول"]};
 const OKIND={buy:"خرید",renew:"تمدید",traffic:"حجم اضافه",topup:"شارژ کیف پول"};
 const tmn=v=>toman(v)+" ت";
@@ -6962,6 +6963,18 @@ SHOPV.sum=sh=>{const st=sh.stats||{},rev=(sh.orders||[]).filter(o=>o.status==="r
   <div class="list">${rev.map(o=>ordRow(o,true)).join("")||`<div class="note">رسیدی منتظر نیست ✨</div>`}</div>
   <div class="sec"><h3>آخرین سفارش‌ها</h3></div>
   <div class="list">${(sh.orders||[]).filter(o=>o.status!=="review"&&o.status!=="new").slice(0,25).map(o=>ordRow(o)).join("")||`<div class="note">هنوز سفارشی نیست.</div>`}</div>`};
+SHOPV.tk=sh=>{const ts=sh.tickets||[],open=ts.filter(t=>t.status==="open").length;
+  return `<div class="note">${ic("info")} مشتری‌ها از ربات تیکت می‌زنن؛ جواب از اینجا یا از ربات برای خودشون می‌ره.</div>
+  <div class="list">${ts.map(t=>{const st=TKST[t.status]||["",t.status],last=t.msgs[t.msgs.length-1]||{};return `<div class="row btn-row" data-act="shop-tk" data-id="${t.id}"><div class="t"><b>#${fa(t.id)} · ${esc(t.subject)}</b><small>${esc(t.name||t.uid)} · ${esc((last.text||"").slice(0,60))} · ${ago(t.updated*1000)}</small></div><div class="r"><span class="tag st ${st[0]}">${st[1]}</span></div></div>`}).join("")||`<div class="empty">${ic("chat")}<p>تیکتی نیست ✨</p></div>`}</div>`};
+function tkSheet(t){const st=TKST[t.status]||["",t.status];
+  sheet(`<h3>#${fa(t.id)} · ${esc(t.subject)} <span class="tag ${st[0]}">${st[1]}</span></h3><p class="mut small">${esc(t.name||t.uid)}${t.username?` <span class="ltr">@${esc(t.username)}</span>`:""}</p>
+   <div class="list">${t.msgs.map(m=>`<div class="row" style="${m.by==="admin"?"background:color-mix(in srgb,var(--acc) 8%,transparent);border-radius:10px;padding:8px":""}"><div class="t"><b class="small">${m.by==="admin"?"🧑‍💼 پشتیبانی":"👤 مشتری"} <span class="mut xs">${ago(m.at*1000)}</span></b><div style="white-space:pre-wrap">${esc(m.text)}</div></div></div>`).join("")}</div>
+   <form id="tkf"><label class="f"><span>جواب</span><textarea class="in" name="text" style="min-height:80px;font-family:inherit" required></textarea></label>
+   <div class="bar-btns"><button class="btn">${ic("check")} ارسال جواب</button><button type="button" class="btn ghost" data-tclose>${t.status==="closed"?"باز کردن":"بستن"}</button></div></form>`,el=>{
+    const f=$("#tkf",el);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"shop_ticket",{id:t.id,act:"reply",text:f.text.value});if(j.ok)closeSheet()};
+    $("[data-tclose]",el).onclick=async()=>{const j=await act(null,"shop_ticket",{id:t.id,act:t.status==="closed"?"reopen":"close"});if(j.ok)closeSheet()};
+  });
+}
 SHOPV.plans=sh=>{const ps=(sh.plans||[]).slice().sort((a,b)=>(a.kind==="traffic")-(b.kind==="traffic")||(a.order||0)-(b.order||0));
   return `<div class="toolbar"><button class="btn" data-act="shop-plan">${ic("plus")} پلن</button><button class="btn ghost" data-act="shop-plan" data-kind="traffic">${ic("plus")} حجم اضافه</button></div>
   <div class="list">${ps.map(p=>`<div class="row btn-row" data-act="shop-plan" data-id="${p.id}">${mono(p.kind==="traffic"?"+GB":"📦",p.active!==false?"ok":"")}<div class="t"><b>${esc(p.name)}</b><small>${planLine(p)}${p.desc?" · "+esc(p.desc):""}</small></div><div class="r" style="flex-direction:column;align-items:flex-end;gap:3px"><span class="amt">${tmn(p.price)}</span>${p.active===false?'<span class="tag">مخفی</span>':""}</div></div>`).join("")||`<div class="empty">${ic("cart")}<p>هنوز پلنی نساختی.<br>مثلاً «۳۰ گیگ یک‌ماهه».</p></div>`}</div>`};
@@ -7117,6 +7130,7 @@ const ACTS={
   theme:()=>{const dark=document.documentElement.dataset.theme==="dark";S.theme=dark?"light":"dark";try{localStorage.setItem("xc_theme",S.theme)}catch(e){}applyTheme();render()},
   refresh:b=>act(b,"state",{}),
   sseg:b=>{S.sseg=b.dataset.s;render()},
+  "shop-tk":b=>{const t=(S.state.shop.tickets||[]).find(x=>x.id===+b.dataset.id);if(t)tkSheet(t)},
   "shop-plan":b=>planSheet((S.state.shop.plans||[]).find(p=>p.id===b.dataset.id),b.dataset.kind),
   "shop-code":b=>codeSheet((S.state.shop.codes||[]).find(c=>c.code===b.dataset.code),b.dataset.kind),
   "shop-cust":b=>{const c=(S.state.shop.customers||[]).find(x=>x.id===b.dataset.id);if(c)custSheet(c)},
@@ -7519,7 +7533,7 @@ def bot_chat_ids(api, token):
 # /status and /user. Customers link their chat by sending their subscription link (or one tap from
 # their page) and get reminders before their time or volume runs out, and their usage on demand.
 
-BOT_EVENTS = (("shop", "فروش: رسیدها و سفارش‌ها"), ("deco", "قطع و وصل واسط‌ها و تانل‌ها"), ("quota", "حجم و زمان واسط‌ها"),
+BOT_EVENTS = (("shop", "فروش: رسیدها و سفارش‌ها"), ("tickets", "تیکت‌های پشتیبانی"), ("deco", "قطع و وصل واسط‌ها و تانل‌ها"), ("quota", "حجم و زمان واسط‌ها"),
               ("users", "خلاصه‌ی روزانه‌ی کاربرهای رو به پایان"), ("backup", "خطای بکاپ"))
 BOT_NETS = {"tg": "تلگرام", "bale": "بله"}
 SUB_RE = re.compile(r"(?:/[A-Za-z0-9_.-]+/|^s_?|^)([A-Za-z0-9_-]{8,64})/?$")
@@ -7550,6 +7564,7 @@ class Bot:
         self.lock = threading.RLock()
         self.me = {}        # net -> {"username", "error"}
         self.threads = {}
+        self.hits = {}  # chat -> recent update times (flood guard)
         self.st = self._load()
         self.shop = Shop(self)
         self.admin = AdminBot(self)
@@ -7664,11 +7679,18 @@ class Bot:
         self.save()
         return code
 
+    def admin_chats(self):
+        """Paired admin chats plus the owner's private chat, even before the owner has written."""
+        out = dict(self.st["admins"])
+        for oid in self.admin.owners():
+            out.setdefault("tg:%s" % oid, {"name": "owner", "events": "all"})
+        return out
+
     def notify_admins(self, event, text):
         """Deliver an alert to every paired admin chat that wants it. -> number of chats."""
         n = 0
         nets = self.nets()
-        for cid, a in list(self.st["admins"].items()):
+        for cid, a in list(self.admin_chats().items()):
             net, chat = cid.split(":", 1)
             if net not in nets or a.get("paused"):
                 continue
@@ -7726,7 +7748,7 @@ class Bot:
     def handle(self, net, msg):
         chat = (msg.get("chat") or {}).get("id")
         text = (msg.get("text") or "").strip()
-        if chat is None or not (text or msg.get("photo") or msg.get("document")):
+        if chat is None or not (text or msg.get("photo") or msg.get("document")) or self.flooded(net, chat):
             return
         cid = "%s:%s" % (net, chat)
         who = msg.get("from") or {}
@@ -7857,8 +7879,22 @@ class Bot:
         if ups:
             self.save()
 
+    FLOOD = (25, 10)  # at most this many updates per chat in this many seconds
+
+    def flooded(self, net, chat):
+        if chat is None:
+            return False
+        now, key = time.time(), "%s:%s" % (net, chat)
+        q = [t for t in self.hits.get(key, []) if now - t < self.FLOOD[1]]
+        q.append(now)
+        self.hits[key] = q[-self.FLOOD[0] - 1:]
+        return len(q) > self.FLOOD[0]
+
     def on_callback(self, net, cq):
         data = cq.get("data") or ""
+        chat = ((cq.get("message") or {}).get("chat") or {}).get("id")
+        if self.flooded(net, chat):
+            return
         if not data.startswith("a:"):
             return self.shop.on_callback(net, cq)
         msg = cq.get("message") or {}
@@ -7949,7 +7985,15 @@ class Bot:
                     continue
                 self.st["sent"][k] = int(now)
                 support = cfg.get("support_url")
-                self.send(net, chat, (text + ("\n💬 " + support if support and "تمدید" in text else "")).translate(FA_DIGITS), kind="reminder")
+                kb = None
+                if self.shop.on():  # renew or add traffic with one tap, right from the reminder
+                    row = [("🔄 تمدید", "rn:%s" % c["sub"])]
+                    if self.shop.plans("traffic") and key.startswith(("pct", "full")):
+                        row.append(("➕ حجم اضافه", "tf:%s" % c["sub"]))
+                    kb = self.shop.kb([row, [("💰 کیف پول", "wallet")]], net)
+                    text = text.replace("برای تمدید پیام بده.", "با یه لمس تمدید کن 👇")
+                self.send(net, chat, (text + ("\n💬 " + support if support and "تمدید" in text and not kb else "")).translate(FA_DIGITS),
+                          kind="reminder", keyboard=kb)
                 sent += 1
         if sent:
             cut = now - 120 * 86400
@@ -8027,6 +8071,7 @@ class Bot:
                 self.retry()
                 self.reminders()
                 self.daily_users()
+                self.shop.cleanup()
             except Exception as e:
                 print("bot loop: %s" % e, flush=True)
             time.sleep(300)
@@ -8091,7 +8136,7 @@ class Shop:
                 d = json.load(f)
         except (OSError, ValueError):
             d = {}
-        for k, v in (("plans", []), ("codes", []), ("users", {}), ("orders", []), ("seq", 0)):
+        for k, v in (("plans", []), ("codes", []), ("users", {}), ("orders", []), ("seq", 0), ("tickets", []), ("tseq", 0)):
             d.setdefault(k, v)
         return d
 
@@ -8262,9 +8307,8 @@ class Shop:
         row = []
         if _int(cfg.get("shop_ref")):
             row.append(("👥 دعوت دوستان", "ref"))
-        if cfg.get("support_url"):
-            row.append(("💬 پشتیبانی", cfg["support_url"] if cfg["support_url"].startswith("http") else "help"))
         rows.append(row)
+        rows.append([("🎫 پشتیبانی و تیکت", "tk"), ("📋 سفارش‌ها", "ord")])
         rows.append([("📚 راهنمای اتصال", "guide")])
         if self.bot.admin.is_owner(net, uid.split(":", 1)[1]):
             rows.append([("🛠 پنل مدیریت", "a:home", "danger")])
@@ -8437,6 +8481,8 @@ class Shop:
             return True
         if w and text and not text.startswith("/"):
             self.wait.pop(cid, None)
+            if w["what"] in ("tk_subject", "tk_body", "tk_msg"):
+                return self.ticket_text(net, chat, uid, w, text)
             if w["what"] == "code":
                 return self.apply_code(net, chat, uid, w["order"], text)
             if w["what"] == "gift":
@@ -8458,18 +8504,22 @@ class Shop:
         self.wait.pop("%s:%s" % (net, chat), None)
         if msg.get("photo"):
             media = ("sendPhoto", "photo", msg["photo"][-1]["file_id"])
+            fuid = msg["photo"][-1].get("file_unique_id", "")
         else:
             media = ("sendDocument", "document", msg["document"]["file_id"])
+            fuid = msg["document"].get("file_unique_id", "")
+        dup = next((x for x in self.d["orders"] if fuid and x.get("receipt_uid") == fuid and x["id"] != o["id"]), None)
+        o["receipt_uid"] = fuid
         code_err = self.take_code(o)
         with self.lock:
             o["status"], o["receipt"], o["receipt_at"] = "review", media[2], int(time.time())
             o["receipt_kind"] = media[1]
         u = self.user(uid)
-        cap = ("🧾 <b>رسید #%s</b>\n👤 %s%s\n🛍 %s%s\n💳 <b>%s</b>" % (
+        cap = ("⚠️ <b>این عکس قبلاً برای سفارش #%s فرستاده شده!</b>\n\n" % fa_num(dup["id"]) if dup else "") + ("🧾 <b>رسید #%s</b>\n👤 %s%s\n🛍 %s%s\n💳 <b>%s</b>" % (
             fa_num(o["id"]), self.esc(u.get("name") or uid), " (@%s)" % self.esc(u["username"]) if u.get("username") else "",
             self.KINDS[o["kind"]], " · " + self.esc(o["plan_name"]) if o["plan_name"] else "", toman(self.total(o))))
         sent = 0
-        for acid, a in list(self.bot.st["admins"].items()):
+        for acid, a in list(self.bot.admin_chats().items()):
             anet, achat = acid.split(":", 1)
             if anet != net or a.get("paused"):
                 continue  # a Bale file id means nothing on Telegram
@@ -8588,6 +8638,152 @@ class Shop:
         self.save()
         self.show(net, chat, "⏳ در حال آماده‌سازی…", None, msg)
         self.fulfil(o, by="کیف پول", msg=msg)
+
+    # orders the customer can follow -----------------------------------------------
+    HINT = {"new": "هنوز پرداخت نشده؛ از «🧾 فاکتور» پرداخت کن.", "receipt": "📸 منتظر عکس رسیدیم؛ همین‌جا بفرستش.",
+            "review": "⏳ رسیدت در حال بررسیه.", "done": "", "rejected": "اگه اشتباه شده تیکت بزن.",
+            "failed": "مبلغ به کیف پولت برگشت.", "refunded": "مبلغ به کیف پولت برگشت.", "cancelled": ""}
+
+    def orders_menu(self, net, chat, uid, msg):
+        mine = [o for o in self.d["orders"] if o["uid"] == uid and o["status"] != "cancelled"][-8:][::-1]
+        if not mine:
+            return self.show(net, chat, "📋 هنوز سفارشی نداری.", [[("🛒 خرید سرویس", "buy")], self.back()], msg)
+        lines, rows = ["📋 <b>سفارش‌های من</b>"], []
+        for o in mine:
+            st = {"done": "✅", "review": "⏳", "approving": "⏳", "receipt": "📸", "new": "🕓", "rejected": "❌", "failed": "⚠️", "refunded": "↩️"}.get(o["status"], "•")
+            late = o["status"] == "review" and time.time() - o.get("receipt_at", o["at"]) > 900
+            lines.append("\n%s <b>#%s</b> · %s%s · %s\n   %s%s" % (st, fa_num(o["id"]), self.KINDS.get(o["kind"], ""),
+                                                            " · " + self.esc(o["plan_name"]) if o["plan_name"] else "", toman(self.total(o)),
+                                                            self.STATUS.get(o["status"], o["status"]),
+                                                            ("؛ " + self.HINT[o["status"]] if self.HINT.get(o["status"]) else "") +
+                                                            ("\n   ⌛ بیشتر از ۱۵ دقیقه شده؛ اگه عجله داری تیکت بزن." if late else "")))
+            if o["status"] in ("new", "receipt"):
+                rows.append([("🧾 فاکتور #%s" % fa_num(o["id"]), "iv:%s" % o["id"]), ("✖️ لغو", "x:%s" % o["id"])])
+        rows.append([("🎫 تیکت بزن", "tk:new"), ("🏠 منو", "m")])
+        self.show(net, chat, "\n".join(lines), rows, msg)
+
+    def cleanup(self, now=None):
+        """Invoices nobody paid are dropped after 48 hours (72 when a receipt was asked for)."""
+        now, n = now or time.time(), 0
+        with self.lock:
+            for o in self.d["orders"]:
+                if o["status"] in ("new", "receipt") and now - o["at"] > (72 if o["status"] == "receipt" else 48) * 3600:
+                    o["status"] = "cancelled"
+                    n += 1
+        if n:
+            self.save()
+        return n
+
+    # tickets ------------------------------------------------------------------------
+    TK = {"open": "🟡 باز", "answered": "🟢 پاسخ داده شد", "closed": "⚪️ بسته"}
+    TK_OPEN_MAX, TK_SUBJECT, TK_BODY, TK_RATE = 5, 120, 2000, (10, 600)
+
+    def ticket(self, tid):
+        return next((t for t in self.d["tickets"] if t["id"] == tid), None)
+
+    def tickets_menu(self, net, chat, uid, rest, msg):
+        cid = "%s:%s" % (net, chat)
+        if rest == "new":
+            if sum(1 for t in self.d["tickets"] if t["uid"] == uid and t["status"] != "closed") >= self.TK_OPEN_MAX:
+                return self.show(net, chat, "حداکثر %s تیکت باز می‌تونی داشته باشی؛ اول یکی رو ببند." % fa_num(self.TK_OPEN_MAX), [[("🎫 تیکت‌ها", "tk")]], msg)
+            self.wait[cid] = {"what": "tk_subject"}
+            return self.show(net, chat, "🎫 <b>تیکت جدید</b>\nموضوع رو کوتاه بنویس (مثلاً «وصل نمی‌شم»):", [[("✖️ انصراف", "tk", "danger")]], msg)
+        if rest.startswith("c:"):
+            t = self.ticket(_int(rest[2:]))
+            if t and t["uid"] == uid:
+                t["status"] = "closed"
+                self.save()
+            return self.tickets_menu(net, chat, uid, "", msg)
+        if rest.startswith("r:"):
+            t = self.ticket(_int(rest[2:]))
+            if not t or t["uid"] != uid:
+                return
+            self.wait[cid] = {"what": "tk_msg", "id": t["id"]}
+            return self.show(net, chat, "✍️ پیامت رو بفرست:", [[("✖️ انصراف", "tk:%s" % t["id"], "danger")]], msg)
+        if rest.isdigit():
+            t = self.ticket(_int(rest))
+            if not t or t["uid"] != uid:
+                return self.show(net, chat, "این تیکت پیدا نشد.", [[("🎫 تیکت‌ها", "tk")]], msg)
+            return self.show(net, chat, self.ticket_view(t), [[("✍️ پیام جدید", "tk:r:%s" % t["id"], "primary")] +
+                                                              ([("✅ حل شد، ببند", "tk:c:%s" % t["id"], "success")] if t["status"] != "closed" else []),
+                                                              [("🎫 تیکت‌ها", "tk"), ("🏠 منو", "m")]], msg)
+        mine = [t for t in self.d["tickets"] if t["uid"] == uid][-10:][::-1]
+        rows = [[("➕ تیکت جدید", "tk:new", "success")]] + [[("%s #%s · %s" % (self.TK[t["status"]].split()[0], fa_num(t["id"]), t["subject"][:28]), "tk:%s" % t["id"])] for t in mine]
+        sup = self.app.cfg.get("support_url")
+        if sup and sup.startswith("http"):
+            rows.append([("💬 پیام مستقیم به پشتیبان", sup)])
+        rows.append(self.back())
+        self.show(net, chat, "🎫 <b>پشتیبانی</b>\nسؤال یا مشکلت رو با یه تیکت بفرست؛ جواب همین‌جا میاد." + ("" if mine else "\n\nهنوز تیکتی نداری."), rows, msg)
+
+    def ticket_view(self, t, admin=False):
+        lines = ["🎫 <b>#%s · %s</b>  %s" % (fa_num(t["id"]), self.esc(t["subject"]), self.TK[t["status"]])]
+        if admin:
+            u = self.d["users"].get(t["uid"]) or {}
+            lines.append("👤 %s%s" % (self.esc(u.get("name") or t["uid"]), " (@%s)" % self.esc(u["username"]) if u.get("username") else ""))
+        for m in t["msgs"][-8:]:
+            who = ("🧑‍💼 پشتیبانی" if m["by"] == "admin" else "👤 " + ("مشتری" if admin else "شما"))
+            lines.append("\n<b>%s</b> · <i>%s</i>\n%s" % (who, time.strftime("%m/%d %H:%M", time.gmtime(m["at"] + TEHRAN)), self.esc(m["text"])))
+        return "\n".join(lines)[:3900]
+
+    def ticket_text(self, net, chat, uid, w, text):
+        now = time.time()
+        u = self.user(uid)
+        recent = [x for x in u.get("tk_hits", []) if now - x < self.TK_RATE[1]]
+        if len(recent) >= self.TK_RATE[0]:
+            self.show(net, chat, "پیام زیادی فرستادی؛ چند دقیقه‌ی دیگه دوباره امتحان کن 🙏", [[("🎫 تیکت‌ها", "tk")]])
+            return True
+        u["tk_hits"] = recent + [now]
+        cid = "%s:%s" % (net, chat)
+        if w["what"] == "tk_subject":
+            self.wait[cid] = {"what": "tk_body", "subject": text[:self.TK_SUBJECT]}
+            self.show(net, chat, "حالا توضیح بده چی شده (هر چی دقیق‌تر، جواب سریع‌تر):", [[("✖️ انصراف", "tk", "danger")]])
+            return True
+        if w["what"] == "tk_body":
+            with self.lock:
+                self.d["tseq"] += 1
+                t = {"id": self.d["tseq"], "uid": uid, "net": net, "chat": str(chat), "subject": w["subject"], "status": "open",
+                     "at": int(now), "updated": int(now), "msgs": [{"by": "user", "text": text[:self.TK_BODY], "at": int(now)}]}
+                self.d["tickets"].append(t)
+                self.d["tickets"] = self.d["tickets"][-2000:]
+            self.save()
+            self.show(net, chat, "✅ تیکت #%s ثبت شد. جواب که بیاد همین‌جا خبرت می‌کنم." % fa_num(t["id"]), [[("🎫 تیکت‌ها", "tk"), ("🏠 منو", "m")]])
+            self.ticket_alert(t, "🎫 <b>تیکت جدید</b>\n")
+            return True
+        t = self.ticket(w.get("id"))
+        if not t or t["uid"] != uid:
+            return True
+        with self.lock:
+            t["msgs"].append({"by": "user", "text": text[:self.TK_BODY], "at": int(now)})
+            t["msgs"] = t["msgs"][-100:]
+            t["status"], t["updated"] = "open", int(now)
+        self.save()
+        self.show(net, chat, "✅ پیامت رسید.", [[("🎫 تیکت #%s" % fa_num(t["id"]), "tk:%s" % t["id"]), ("🏠 منو", "m")]])
+        self.ticket_alert(t, "💬 <b>پیام جدید در تیکت</b>\n")
+        return True
+
+    def ticket_alert(self, t, head):
+        """Tell the admin chats; the owner's copy has reply buttons."""
+        text = head + self.ticket_view(t, admin=True)
+        for acid, a in list(self.bot.admin_chats().items()):
+            anet, achat = acid.split(":", 1)
+            ev = a.get("events") or "all"
+            if a.get("paused") or anet not in self.bot.nets() or (ev != "all" and "tickets" not in ev):
+                continue
+            rows = [[("✍️ پاسخ", "a:tr:%s" % t["id"], "primary"), ("✅ بستن", "a:tc:%s" % t["id"])]] if self.bot.admin.is_owner(anet, achat) else None
+            self.show(anet, achat, text, rows)
+
+    def ticket_reply(self, tid, text, who=""):
+        """An answer from the admin (bot or web). -> "" or why not."""
+        t = self.ticket(tid)
+        if not t:
+            return "تیکت پیدا نشد"
+        with self.lock:
+            t["msgs"].append({"by": "admin", "text": text[:self.TK_BODY], "at": int(time.time()), "who": who})
+            t["status"], t["updated"] = "answered", int(time.time())
+        self.save()
+        self.show(t["net"], t["chat"], "💬 <b>جواب پشتیبانی</b> برای تیکت #%s:\n\n%s" % (fa_num(t["id"]), self.esc(text)),
+                  [[("✍️ جواب بده", "tk:r:%s" % t["id"], "primary"), ("✅ حل شد", "tk:c:%s" % t["id"], "success")]])
+        return ""
 
     def make_trial(self, uid, net, chat):
         """-> (error, sub)."""
@@ -8786,6 +8982,10 @@ class Shop:
         head, _, rest = data.partition(":")
         if head == "m":
             return self.main_menu(net, chat, uid, mid)
+        if head == "tk":
+            return self.tickets_menu(net, chat, uid, rest, mid)
+        if head == "ord":
+            return self.orders_menu(net, chat, uid, mid)
         if head == "buy":
             return self.buy_menu(net, chat, mid)
         if head == "renew":
@@ -8992,6 +9192,8 @@ class Shop:
                 "stats": {"today": sales(day0), "month": sales(now - 30 * 86400), "orders_today": sum(1 for o in done if o.get("done_at", o["at"]) >= day0),
                           "review": sum(1 for o in self.d["orders"] if o["status"] == "review"), "customers": len(users),
                           "buyers": len({o["uid"] for o in done}), "wallets": sum(u.get("wallet", 0) for u in users.values())},
+                "tickets": [dict(t, name=(users.get(t["uid"]) or {}).get("name", ""), username=(users.get(t["uid"]) or {}).get("username", ""))
+                            for t in sorted(self.d["tickets"], key=lambda t: (t["status"] == "closed", -t["updated"]))[:150]],
                 "customers": sorted([{"id": k, "name": u.get("name", ""), "username": u.get("username", ""), "wallet": u.get("wallet", 0),
                                       "subs": len(u.get("subs") or []), "joined": u.get("joined", 0),
                                       "spent": sum(self.total(o) for o in done if o["uid"] == k)} for k, u in users.items()],
@@ -9054,10 +9256,21 @@ class AdminBot:
         rows = [[("👥 کاربرها", "a:users:0"), ("➕ کاربر جدید", "a:new")],
                 [("🧾 رسیدها%s" % (" (%s)" % fa_num(rev) if rev else ""), "a:rcpt", "success" if rev else ""), ("🛍 فروشگاه", "a:shop")],
                 [("📊 وضعیت سرور", "a:dash"), ("🛣 مسیرها", "a:routes")],
-                [("📣 پیام همگانی", "a:cast"), ("💾 بکاپ", "a:bk")],
+                [("🎫 تیکت‌ها%s" % (" (%s)" % fa_num(self.open_tickets()) if self.open_tickets() else ""), "a:tks", "primary" if self.open_tickets() else ""),
+                 ("📣 پیام همگانی", "a:cast")],
+                [("💾 بکاپ", "a:bk")],
                 [("✨ اموجی متحرک", "a:emoji"), ("⚙️ تنظیمات", "a:set")],
                 [("👁 نمای مشتری", "a:cust")]]
         self.show(net, chat, text, rows, msg)
+
+    def open_tickets(self):
+        return sum(1 for t in self.sh.d["tickets"] if t["status"] == "open")
+
+    def tickets(self, net, chat, msg):
+        ts = sorted([t for t in self.sh.d["tickets"] if t["status"] != "closed"], key=lambda t: (t["status"] != "open", -t["updated"]))[:12]
+        users = self.sh.d["users"]
+        rows = [[("%s #%s · %s · %s" % (self.sh.TK[t["status"]].split()[0], fa_num(t["id"]), (users.get(t["uid"]) or {}).get("name", "?")[:14], t["subject"][:20]), "a:tk:%s" % t["id"])] for t in ts]
+        self.show(net, chat, "🎫 <b>تیکت‌ها</b>\n🟡 منتظر جواب · 🟢 جواب داده شده" + ("" if ts else "\n\nتیکت بازی نیست ✨"), rows + [[("⬅️ پنل", "a:home")]], msg)
 
     def dash(self, net, chat, msg):
         sv = server_stats()
@@ -9242,6 +9455,11 @@ class AdminBot:
         if not w or not text or text.startswith("/"):
             return False
         what = w["what"]
+        if what == "tk_reply":
+            self.wait.pop(cid)
+            err = self.sh.ticket_reply(w["id"], text, who="مدیر")
+            self.show(net, chat, "⚠️ " + err if err else "✅ جوابت برای مشتری رفت.", [[("🎫 تیکت‌ها", "a:tks"), ("🏠 پنل", "a:home")]])
+            return True
         if what == "find":
             self.wait.pop(cid)
             self.user_list(net, chat, 0, None, q=text)
@@ -9345,6 +9563,25 @@ class AdminBot:
                 return ""
             self.show(net, chat, "%s <b>%s</b> ساخته شد!\n\n🔗 <code>%s</code>" % (self.sh.em("party", "🎉"), self.sh.esc(w["name"]), self.sh.esc(self.bot.sub_link(sub))),
                       [[("👤 کارت کاربر", "a:u:%s" % sub), ("➕ یکی دیگه", "a:new")], [("🏠 پنل", "a:home")]], mid, effect="party")
+        elif head == "tks":
+            self.tickets(net, chat, mid)
+        elif head == "tk":
+            t = self.sh.ticket(_int(parts[2]))
+            if not t:
+                return "پیدا نشد"
+            self.show(net, chat, self.sh.ticket_view(t, admin=True), [[("✍️ پاسخ", "a:tr:%s" % t["id"], "primary")] +
+                      ([("✅ بستن", "a:tc:%s" % t["id"])] if t["status"] != "closed" else []), [("🎫 تیکت‌ها", "a:tks"), ("🏠 پنل", "a:home")]], mid)
+        elif head == "tr":
+            self.wait[cid] = {"what": "tk_reply", "id": _int(parts[2])}
+            self.show(net, chat, "✍️ جوابت به تیکت #%s رو بفرست:" % fa_num(_int(parts[2])), [[("✖️ انصراف", "a:tks", "danger")]], mid)
+        elif head == "tc":
+            t = self.sh.ticket(_int(parts[2]))
+            if t:
+                t["status"] = "closed"
+                self.sh.save()
+                self.sh.show(t["net"], t["chat"], "✅ تیکت #%s بسته شد. اگه باز مشکلی بود یه تیکت جدید بزن." % fa_num(t["id"]), [[("🎫 تیکت‌ها", "tk")]])
+            self.tickets(net, chat, mid)
+            return "بسته شد"
         elif head == "rcpt":
             self.receipts(net, chat, mid)
         elif head == "rv":
@@ -9492,6 +9729,24 @@ def shop_action(app, act, body, done, fail):
             net, chat = cid.split(":", 1)
             sh.show(net, chat, "💰 کیف پولت %s%s شد.\nموجودی: %s" % (toman(abs(delta)), " شارژ" if delta > 0 else " کم", toman(u["wallet"])), [[("🏠 منو", "m")]])
         return done("موجودی: %s" % toman(u["wallet"]))
+    if act == "ticket":
+        t = sh.ticket(_int(body.get("id")))
+        if not t:
+            return fail("تیکت پیدا نشد")
+        what = body.get("act")
+        if what == "reply":
+            text = str(body.get("text") or "").strip()
+            if not text:
+                return fail("متن جواب خالیه")
+            err = sh.ticket_reply(t["id"], text, who="پنل")
+            return fail(err) if err else done("جواب رفت")
+        if what in ("close", "reopen"):
+            t["status"] = "closed" if what == "close" else "open"
+            sh.save()
+            if what == "close":
+                sh.show(t["net"], t["chat"], "✅ تیکت #%s بسته شد." % fa_num(t["id"]), [[("🎫 تیکت‌ها", "tk")]])
+            return done("بسته شد" if what == "close" else "باز شد")
+        return fail("نامعتبر")
     if act == "receipt":
         data = sh.receipt_media(_int(body.get("id")))
         if not data:
