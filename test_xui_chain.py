@@ -1929,6 +1929,72 @@ class ShopTests(BotBase):
         m = [m for m in BotAPI.sent if str(m["chat_id"]) == "985"][-1]
         self.assertIn("rn:sarasub12345", json.dumps(m["reply_markup"]))
 
+    def test_custom_plan_builder_and_addon(self):
+        cfg = xc.load_config()
+        cfg.update(shop_gb_price=10000, shop_day_price=1000)
+        xc.save_config(cfg)
+        self.app.reload()
+        self.assertIn("cbo:buy:", json.dumps(BotAPI.sent and None) + json.dumps(self.shop.kb([[("x", "cbo:buy:")]])))
+        self.tap(990, "cbo:buy:")
+        text = self.tap(990, "cb:g:10")      # 30 -> 40 GB
+        self.tap(990, "cb:d:-1")             # 30 -> 29 days
+        self.assertIn("۴۰ گیگ", text)
+        self.tap(990, "cb:g:-1000")          # never below 1
+        self.assertEqual(self.shop.build["tg:990"]["gb"], 1)
+        self.tap(990, "cb:g:9")              # 10 GB
+        self.tap(990, "cb:go")
+        o = self.shop.d["orders"][-1]
+        self.assertEqual((o["kind"], o["gb"], o["days"], o["price"]), ("buy", 10, 29, 10 * 10000 + 29 * 1000))
+        # add volume and days to an existing service
+        u = self.shop.user("tg:991")
+        u["wallet"], u["subs"] = 1000000, ["sarasub12345"]
+        self.tap(991, "cbo:add:sarasub12345")
+        self.tap(991, "cb:g:5")
+        self.tap(991, "cb:d:10")
+        self.tap(991, "cb:go")
+        a = self.shop.d["orders"][-1]
+        self.assertEqual((a["kind"], a["gb"], a["days"], a["price"]), ("addon", 5, 10, 60000))
+        self.tap(991, "pw:%d" % a["id"])
+        self.assertEqual(a["status"], "done")
+        ch = self.panel.updated[-1][2]
+        self.assertEqual(ch["totalGB"], 15 * GB)  # 10 GB + 5, usage is not reset
+        self.assertGreater(ch["expiryTime"], (time.time() + 12 * 86400) * 1000)
+        self.assertEqual(self.panel.reset, [])
+        self.assertEqual(self.tap(992, "cbo:add:sarasub12345") and self.tap(992, "cb:go").count("مال تو نیست"), 1)
+        ok, inv = self.shop.app_api({"id": 993}, "order", {"kind": "buy", "plan": "custom", "gb": 10, "days": 30})
+        self.assertEqual((ok, inv["total"]), (True, 130000))
+        self.assertFalse(self.shop.app_api({"id": 993}, "order", {"kind": "buy", "plan": "custom", "gb": 9999, "days": 30})[0])
+
+    def test_phone_first_and_channel_switch(self):
+        cfg = xc.load_config()
+        cfg.update(shop_phone=True, shop_phone_ir=True, shop_channel="@chan", shop_channel_on=False)
+        xc.save_config(cfg)
+        self.app.reload()
+        BotAPI.outside = True
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 995, "type": "private"}, "from": {"id": 995}, "text": "/start"})
+        self.assertTrue(BotAPI.sent[-1]["reply_markup"]["keyboard"][0][0]["request_contact"])
+        self.assertIn("شماره", self.tap(995, "buy") + json.dumps(BotAPI.other, ensure_ascii=False))
+        self.bot.handle("tg", {"chat": {"id": 995, "type": "private"}, "from": {"id": 995},
+                               "contact": {"user_id": 111, "phone_number": "+989121234567"}})  # someone else's number
+        self.assertFalse(self.shop.user("tg:995").get("phone"))
+        self.bot.handle("tg", {"chat": {"id": 995, "type": "private"}, "from": {"id": 995},
+                               "contact": {"user_id": 995, "phone_number": "+447700900123"}})  # not Iranian
+        self.assertFalse(self.shop.user("tg:995").get("phone"))
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 995, "type": "private"}, "from": {"id": 995},
+                               "contact": {"user_id": 995, "phone_number": "989121234567"}})
+        self.assertEqual(self.shop.user("tg:995")["phone"], "+989121234567")
+        self.assertIn("خوش اومدی", BotAPI.sent[-1]["text"])  # channel switch is off: straight to the menu
+        self.assertFalse(self.shop.app_api({"id": 996}, "state", {})[0])  # the mini app asks for the phone too
+
+    def test_server_status_for_customers(self):
+        text = self.tap(997, "st")
+        self.assertIn("وضعیت سرورها", text)
+        ok, st = self.shop.app_api({"id": 997}, "status", {})
+        self.assertTrue(ok)
+        self.assertIn("routes", st)
+
     def test_code_cannot_stretch_over_invoices(self):
         self.shop.d["codes"] = [{"code": "ONCE", "kind": "discount", "pct": 50, "amount": 0, "max": 0, "exp": 0}]
         u = self.shop.user("tg:950")

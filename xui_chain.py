@@ -46,7 +46,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.16.0"
+VERSION = "5.17.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -128,6 +128,12 @@ DEFAULTS = {
     "shop_welcome": "",
     "shop_help": "",
     "shop_prefix": "tg",        # client names: <prefix><telegram id>
+    "shop_gb_price": 0,         # custom plans: Toman per GB (0 = no custom plans)
+    "shop_day_price": 0,        # ... and per day
+    "shop_custom_max": "500,365",  # largest custom plan "GB,days"
+    "shop_channel_on": True,    # make customers join shop_channel first
+    "shop_phone": False,        # ask customers for their phone number before anything else
+    "shop_phone_ir": False,     # ... and accept only Iranian numbers
     "tg_enable": True,          # Telegram alerts
     "tg_token": "",             # empty = the 3x-ui panel's own Telegram bot
     "tg_chat": "",              # empty = the panel bot's admin chat ids
@@ -4716,8 +4722,10 @@ def admin_state(app, host):
         "bot": app.bot.public(),
         "move": move_state(),
         "shop": app.bot.shop.public(),
-        "shop_cfg": {k[5:]: cfg.get(k, "") for k in ("shop_cards", "shop_trial", "shop_ref", "shop_topups", "shop_channel",
-                                                     "shop_inbounds", "shop_prefix", "shop_welcome", "shop_help")},
+        "shop_cfg": dict({k[5:]: cfg.get(k, "") for k in ("shop_cards", "shop_trial", "shop_ref", "shop_topups", "shop_channel",
+                                                          "shop_inbounds", "shop_prefix", "shop_welcome", "shop_help", "shop_gb_price",
+                                                          "shop_day_price", "shop_custom_max")},
+                         channel_on=bool(cfg.get("shop_channel_on", True)), phone=bool(cfg.get("shop_phone")), phone_ir=bool(cfg.get("shop_phone_ir"))),
         "routes": rts,
         "cf": cf_public(cfg),
         "groups": deco_groups(cfg, ups),
@@ -4782,8 +4790,8 @@ def net_state(app):
 
 
 SETTING_BOOLS = ("bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
-                 "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable")
-SETTING_TEXTS = {"bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
+                 "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable", "shop_channel_on", "shop_phone", "shop_phone_ir")
+SETTING_TEXTS = {"shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
                  "shop_welcome": 1000, "shop_help": 2000, "shop_prefix": 10, "bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
@@ -7070,7 +7078,14 @@ SHOPV.set=sh=>{const s=S.state.settings,c=S.state.shop_cfg||{};
    <label class="f"><span>کارت‌ها (کارت به کارت)</span><textarea class="in ltr" name="shop_cards" style="min-height:70px" placeholder="6037-xxxx-xxxx-xxxx | نام صاحب کارت | بانک">${esc(c.cards||"")}</textarea><div class="hint">هر کارت یه خط: شماره | اسم | بانک</div></label>
    <div class="cols2">${field("shop_trial","تست رایگان (گیگ,روز)",c.trial,'class="in ltr" placeholder="1,1"',"خالی = خاموش")}${field("shop_ref","پاداش دعوت (٪)",c.ref,'class="in ltr" inputmode="numeric" placeholder="10"',"از اولین خرید دوست")}</div>
    ${field("shop_topups","مبالغ شارژ کیف پول (تومان)",c.topups,'class="in ltr" placeholder="100000,200000,500000"')}
-   ${field("shop_channel","عضویت اجباری کانال",c.channel,'class="in ltr" placeholder="@mychannel"',"ربات باید ادمین کانال باشه. خالی = خاموش")}
+   <div class="sec" style="margin:10px 2px 4px"><h3>🎛 پلن دلخواه (مشتری خودش حجم و روز رو انتخاب می‌کنه)</h3></div>
+   <div class="cols2">${field("shop_gb_price","قیمت هر گیگ (تومان)",c.gb_price||"",'class="in ltr" inputmode="numeric" placeholder="10000"')}${field("shop_day_price","قیمت هر روز (تومان)",c.day_price||"",'class="in ltr" inputmode="numeric" placeholder="1000"')}</div>
+   ${field("shop_custom_max","سقف (گیگ,روز)",c.custom_max||"500,365",'class="in ltr" placeholder="500,365"',"هر دو قیمت صفر = پلن دلخواه خاموش. با روشن بودنش، مشتری روی هر سرویس «➕ حجم و زمان» هم داره.")}
+   <div class="sec" style="margin:10px 2px 4px"><h3>🔐 ورود مشتری</h3></div>
+   ${sw("shop_phone",c.phone,"اول شماره‌ی موبایل بده","با دکمه‌ی «ارسال شماره» خود تلگرام؛ شماره فقط برای تو دیده می‌شه")}
+   ${sw("shop_phone_ir",c.phone_ir,"فقط شماره‌ی ایران (۹۸+)")}
+   ${sw("shop_channel_on",c.channel_on,"عضویت اجباری کانال","ربات باید ادمین کانال باشه")}
+   ${field("shop_channel","آیدی کانال",c.channel,'class="in ltr" placeholder="@mychannel"')}
    <div class="cols2">${field("shop_inbounds","inboundهای سرویس جدید",c.inbounds,'class="in ltr" placeholder="1,11"',"خالی = همه")}${field("shop_prefix","پیشوند اسم کاربر",c.prefix,'class="in ltr" placeholder="tg"')}</div>
    <label class="f"><span>پیام خوش‌آمد</span><textarea class="in" name="shop_welcome" style="min-height:60px;font-family:inherit" placeholder="به فروشگاه ما خوش اومدی 🌟">${esc(c.welcome||"")}</textarea></label>
    <label class="f"><span>راهنمای اتصال</span><textarea class="in" name="shop_help" style="min-height:60px;font-family:inherit" placeholder="خالی = راهنمای پیش‌فرض (Happ و v2rayNG)">${esc(c.help||"")}</textarea></label>
@@ -7104,6 +7119,7 @@ function codeSheet(c,kind){c=c||{kind:kind||"discount"};const gift=c.kind==="gif
 }
 function custSheet(c){
   sheet(`<h3>${esc(c.name||c.id)}</h3>${c.username?`<p class="mut small ltr" style="text-align:right">@${esc(c.username)}</p>`:""}
+   ${c.phone?`<p class="mut small">📱 <span class="ltr">${esc(c.phone)}</span></p>`:""}
    <div class="tiles"><div class="tile2"><div class="k">کیف پول</div><div class="v">${tmn(c.wallet)}</div></div><div class="tile2"><div class="k">کل خرید</div><div class="v">${tmn(c.spent)}</div></div></div>
    <form id="swf"><label class="f"><span>تغییر کیف پول (تومان)</span><input class="in ltr" name="delta" inputmode="numeric" placeholder="50000 یا -20000" required></label>
    <div class="bar-btns"><button class="btn">${ic("check")} اعمال</button></div><div class="hint">به مشتری هم توی ربات خبر داده می‌شه.</div></form>
@@ -7844,7 +7860,7 @@ class Bot:
     def handle(self, net, msg):
         chat = (msg.get("chat") or {}).get("id")
         text = (msg.get("text") or "").strip()
-        if chat is None or not (text or msg.get("photo") or msg.get("document")) or self.flooded(net, chat):
+        if chat is None or not (text or msg.get("photo") or msg.get("document") or msg.get("contact")) or self.flooded(net, chat):
             return
         cid = "%s:%s" % (net, chat)
         who = msg.get("from") or {}
@@ -8216,13 +8232,14 @@ def shop_path():
 class Shop:
     STATUS = {"new": "در انتظار پرداخت", "receipt": "منتظر رسید", "review": "در حال بررسی", "done": "انجام شد",
               "rejected": "رد شد", "cancelled": "لغو شد", "failed": "ناموفق (برگشت به کیف پول)", "refunded": "برگشت به کیف پول"}
-    KINDS = {"buy": "خرید", "renew": "تمدید", "traffic": "حجم اضافه", "topup": "شارژ کیف پول"}
+    KINDS = {"buy": "خرید", "renew": "تمدید", "traffic": "حجم اضافه", "topup": "شارژ کیف پول", "addon": "افزایش حجم و زمان"}
 
     def __init__(self, bot):
         self.bot = bot
         self.app = bot.app
         self.lock = threading.RLock()
         self.wait = {}  # chat id -> {"what": "receipt"|"code"|"gift"|"amount", "order": id}
+        self.build = {}  # chat id -> the custom plan being set up
         self.d = self._load()
 
     # data -----------------------------------------------------------------------
@@ -8404,7 +8421,8 @@ class Shop:
         if _int(cfg.get("shop_ref")):
             row.append(("👥 دعوت دوستان", "ref"))
         rows.append(row)
-        rows.append([("🎫 پشتیبانی و تیکت", "tk"), ("📋 سفارش‌ها", "ord")])
+        rows.append([("📡 وضعیت سرورها", "st"), ("🎫 پشتیبانی", "tk")])
+        rows.append([("📋 سفارش‌ها", "ord")])
         rows.append([("📚 راهنمای اتصال", "guide")])
         if self.bot.admin.is_owner(net, uid.split(":", 1)[1]):
             rows.append([("🛠 پنل مدیریت", "a:home", "danger")])
@@ -8427,6 +8445,8 @@ class Shop:
 
     def buy_menu(self, net, chat, msg, sub=""):
         ps = self.plans()
+        if not ps and self.custom_on():
+            return self.builder(net, chat, msg, "renew" if sub else "buy", sub)
         if not ps:
             return self.show(net, chat, "فعلاً پلنی برای فروش نیست 🙏", [self.back()], msg)
         title = "🔄 <b>تمدید سرویس</b>\nپلن جدید رو انتخاب کن؛ حجم از نو شروع می‌شه و روزها به باقی‌مونده اضافه می‌شن." if sub else \
@@ -8434,7 +8454,100 @@ class Shop:
         lines = ["\n• <b>%s</b>\n  %s%s" % (self.esc(p["name"]), self.plan_line(p),
                                             "\n  " + self.esc(p["desc"]) if p.get("desc") else "") for p in ps]
         rows = [[("%s · %s" % (p["name"], toman(p["price"])), ("rp:%s:%s" % (sub, p["id"])) if sub else "bp:%s" % p["id"])] for p in ps]
+        if self.custom_on():
+            rows.insert(0, [("🎛 خودت حجم و روز رو انتخاب کن", "cbo:%s:%s" % ("renew" if sub else "buy", sub), "primary")])
         self.show(net, chat, title + "\n" + "".join(lines), rows + [self.back("svc" if sub else "m")], msg)
+
+    # custom plans: the customer sets GB and days with + and - --------------------------
+    def unit_prices(self):
+        return max(0, _int(self.app.cfg.get("shop_gb_price"))), max(0, _int(self.app.cfg.get("shop_day_price")))
+
+    def custom_on(self):
+        g, d = self.unit_prices()
+        return g > 0 or d > 0
+
+    def custom_max(self):
+        parts = [_int(x) for x in str(self.app.cfg.get("shop_custom_max") or "500,365").split(",")]
+        return (parts[0] if parts and parts[0] > 0 else 500), (parts[1] if len(parts) > 1 and parts[1] > 0 else 365)
+
+    def custom_price(self, gb, days):
+        g, d = self.unit_prices()
+        return int(gb * g + days * d)
+
+    def builder(self, net, chat, msg, mode="buy", sub="", gb=None, days=None):
+        """mode: buy (new service), renew (fresh period), add (on top of the current one)."""
+        cid = "%s:%s" % (net, chat)
+        b = self.build.get(cid) or {}
+        if b.get("mode") != mode or b.get("sub") != sub:
+            b = {"mode": mode, "sub": sub, "gb": 0 if mode == "add" else 30, "days": 0 if mode == "add" else 30}
+        if gb is not None:
+            b["gb"] = gb
+        if days is not None:
+            b["days"] = days
+        mg, md = self.custom_max()
+        lo = 0 if mode == "add" else 1
+        b["gb"], b["days"] = min(mg, max(lo, b["gb"])), min(md, max(lo if mode != "add" else 0, b["days"]))
+        self.build[cid] = b
+        g, d = self.unit_prices()
+        price = self.custom_price(b["gb"], b["days"])
+        title = {"buy": "🎛 <b>پلن دلخواه</b>\nحجم و روز رو با دکمه‌ها تنظیم کن 👇",
+                 "renew": "🔄 <b>تمدید دلخواه</b>\nحجم از نو شروع می‌شه و روزها به باقی‌مونده اضافه می‌شن.",
+                 "add": "➕ <b>افزایش حجم و زمان</b>\nبه همین سرویس اضافه می‌شه؛ هر کدوم رو که لازم داری بالا ببر."}[mode]
+        text = "%s\n\n📦 حجم: <b>%s گیگ</b>%s\n📅 زمان: <b>%s روز</b>%s\n\n💳 مبلغ: <b>%s</b>" % (
+            title, fa_num(b["gb"]), "  <i>(هر گیگ %s)</i>" % toman(g) if g else "", fa_num(b["days"]),
+            "  <i>(هر روز %s)</i>" % toman(d) if d else "", toman(price))
+        rows = [[("➖۱۰", "cb:g:-10"), ("➖", "cb:g:-1"), ("📦 %s گیگ" % fa_num(b["gb"]), "noop"), ("➕", "cb:g:1"), ("➕۱۰", "cb:g:10")],
+                [("➖۱۰", "cb:d:-10"), ("➖", "cb:d:-1"), ("📅 %s روز" % fa_num(b["days"]), "noop"), ("➕", "cb:d:1"), ("➕۱۰", "cb:d:10")]]
+        ok = price > 0 and (b["gb"] or b["days"])
+        rows.append([("✅ ادامه · %s" % toman(price), "cb:go", "success")] if ok else [("بیشتر از صفر انتخاب کن", "noop")])
+        rows.append(self.back("sv:%s" % sub if sub else "buy"))
+        self.show(net, chat, text, rows, msg)
+
+    def builder_tap(self, net, chat, uid, rest, msg):
+        cid = "%s:%s" % (net, chat)
+        b = self.build.get(cid)
+        if not b:
+            return self.buy_menu(net, chat, msg)
+        if rest == "go":
+            if not self.custom_on():
+                return self.buy_menu(net, chat, msg)
+            sub, mode = b["sub"], b["mode"]
+            if sub and sub not in [s for s, _ in self.services(uid, cid)]:
+                return self.show(net, chat, "این سرویس مال تو نیست.", [self.back()], msg)
+            price = self.custom_price(b["gb"], b["days"])
+            if price <= 0 or not (b["gb"] or b["days"]):
+                return self.builder(net, chat, msg, mode, sub)
+            name = "%s گیگ · %s روز" % (fa_num(b["gb"]), fa_num(b["days"]))
+            plan = {"id": "custom", "name": name, "gb": b["gb"], "days": b["days"], "price": price}
+            o = self.new_order(uid, net, chat, {"buy": "buy", "renew": "renew", "add": "addon"}[mode], price, plan, sub)
+            self.build.pop(cid, None)
+            return self.invoice(net, chat, o, msg)
+        what, _, step = rest.partition(":")
+        if what == "g":
+            return self.builder(net, chat, msg, b["mode"], b["sub"], gb=b["gb"] + _int(step))
+        if what == "d":
+            return self.builder(net, chat, msg, b["mode"], b["sub"], days=b["days"] + _int(step))
+
+    # how the servers are doing, for customers ---------------------------------------------
+    def status_view(self, net, chat, msg):
+        rts = [r for r in active_routes(live_routes(self.app, self.app.rt, UPSTREAMS.nodes())) if r.get("show")]
+        up = [r for r in rts if not r.get("down") and not r.get("exhausted")]
+        last = getattr(self.app.monitor, "last_run", 0)
+        if not rts:
+            head = "⚪️ <b>اطلاعاتی نیست</b>"
+        elif len(up) == len(rts):
+            head = "🟢 <b>همه‌ی سرورها آنلاین‌ان</b>"
+        elif up:
+            head = "🟡 <b>%s از %s سرور آنلاین</b>\nاپ (با ⚡ Auto) خودش می‌ره روی سالم‌ها." % (fa_num(len(up)), fa_num(len(rts)))
+        else:
+            head = "🔴 <b>فعلاً اختلال داریم</b>\nداریم درستش می‌کنیم 🙏"
+        lines = [("📡 <b>وضعیت سرورها</b>\n\n" + head), ""]
+        for r in rts[:20]:
+            lines.append("%s %s" % ("🔴" if r.get("down") or r.get("exhausted") else "🟢", self.esc(r["name"])))
+        if last:
+            lines.append("\n<i>آخرین بررسی: %s دقیقه پیش</i>" % fa_num(max(0, int((time.time() - last) // 60))))
+        lines.append("\n💡 اگه وصل نمی‌شی: توی اپ اشتراک رو Update کن و ⚡ Auto رو انتخاب کن.")
+        self.show(net, chat, "\n".join(lines), [[("🔄 تازه‌سازی", "st"), ("🎫 گزارش مشکل", "tk:new")], self.back()], msg)
 
     def services(self, uid, cid=None):
         u = self.user(uid)
@@ -8475,7 +8588,9 @@ class Shop:
             lines.append("⏳ %s روز، از اولین اتصال" % fa_num(round(-x["expiry"] / 86400000)))
         lines.append("\n🔗 لینک اشتراک (کپی کن و توی اپ اضافه کن):\n<code>%s</code>" % self.esc(self.bot.sub_link(sub)))
         rows = [[("🔄 تمدید", "rn:%s" % sub)]]
-        if self.plans("traffic"):
+        if self.custom_on():
+            rows[0].append(("➕ حجم و زمان", "cbo:add:%s" % sub, "success"))
+        elif self.plans("traffic"):
             rows[0].append(("➕ حجم اضافه", "tf:%s" % sub))
         rows.append([("📱 صفحه‌ی اشتراک و آموزش", self.bot.sub_link(sub))])
         rows.append(self.back("svc"))
@@ -8500,7 +8615,7 @@ class Shop:
         u = self.user(o["uid"])
         total = self.total(o)
         lines = ["🧾 <b>فاکتور #%s</b>" % fa_num(o["id"]), "\n%s: <b>%s</b>" % (self.KINDS[o["kind"]], self.esc(o["plan_name"]) if o["plan_name"] else toman(o["price"]))]
-        if o["kind"] != "topup" and o["plan_name"]:
+        if o["kind"] != "topup" and o["plan_name"] and o.get("plan") != "custom":
             p = {"gb": o["gb"], "days": o["days"], "price": o["price"]}
             lines.append(self.plan_line(p) if o["kind"] != "traffic" else "%s گیگ" % fa_num(_fmt_num(o["gb"])))
         if o.get("discount"):
@@ -8536,7 +8651,7 @@ class Shop:
     # actions ----------------------------------------------------------------------
     def joined(self, net, uid_num):
         ch = str(self.app.cfg.get("shop_channel") or "").strip()
-        if not ch:
+        if not ch or not self.app.cfg.get("shop_channel_on", True):
             return True
         try:
             m = self.bot.call(net, "getChatMember", {"chat_id": ch, "user_id": uid_num}, timeout=10)
@@ -8557,9 +8672,47 @@ class Shop:
         if new and arg.startswith("r_") and arg[2:] != str(who.get("id")) and ("%s:%s" % (net, arg[2:])) in self.d["users"]:
             u["ref"] = "%s:%s" % (net, arg[2:])
         self.save()
+        if self.need_phone(uid):
+            return self.phone_prompt(net, chat, first=True)
         if not self.joined(net, who.get("id")):
             return self.join_prompt(net, chat)
         self.main_menu(net, chat, uid)
+
+    # phone number ---------------------------------------------------------------------
+    def need_phone(self, uid):
+        return bool(self.app.cfg.get("shop_phone")) and not self.user(uid).get("phone")
+
+    def phone_prompt(self, net, chat, first=False):
+        title = self.esc(self.app.cfg.get("title") or NAME)
+        text = ("%s سلام! به <b>%s</b> خوش اومدی.\n\n" % (self.em("hello", "👋"), title) if first else "") + \
+            "📱 برای شروع، با دکمه‌ی پایین <b>شماره‌ت رو تأیید کن</b>.\nشماره فقط برای پشتیبانی و امنیت حسابته و جایی نمایش داده نمی‌شه."
+        try:
+            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML", "reply_markup": {
+                "keyboard": [[{"text": "📱 ارسال شماره‌ی من", "request_contact": True}]], "resize_keyboard": True, "one_time_keyboard": True}})
+        except (ValueError, OSError) as e:
+            self.bot.log(net, chat, "shop", str(e)[:160])
+
+    def got_contact(self, net, chat, who, contact):
+        uid = "%s:%s" % (net, who.get("id", chat))
+        if str(contact.get("user_id")) != str(who.get("id")):
+            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "⚠️ فقط شماره‌ی خودت رو با همون دکمه بفرست."})
+            return True
+        num = re.sub(r"\D", "", str(contact.get("phone_number") or ""))
+        if self.app.cfg.get("shop_phone_ir") and not (num.startswith("98") and len(num) == 12):
+            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "⚠️ فقط شماره‌ی ایران (۹۸+) قبوله."})
+            return True
+        with self.lock:
+            self.user(uid, who)["phone"] = "+" + num
+        self.save()
+        try:
+            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "✅ شماره‌ت ثبت شد. خوش اومدی!", "reply_markup": {"remove_keyboard": True}})
+        except (ValueError, OSError):
+            pass
+        if not self.joined(net, who.get("id")):
+            self.join_prompt(net, chat)
+        else:
+            self.main_menu(net, chat, uid)
+        return True
 
     def on_message(self, net, msg):
         """A customer's message while the shop is on. -> True when handled."""
@@ -8568,6 +8721,8 @@ class Shop:
         if (msg.get("chat") or {}).get("type", "private") != "private":
             return False
         cid, uid = "%s:%s" % (net, chat), "%s:%s" % (net, who.get("id", chat))
+        if msg.get("contact"):
+            return self.got_contact(net, chat, who, msg["contact"])
         w = self.wait.get(cid)
         if w and w["what"] == "receipt" and (msg.get("photo") or msg.get("document")):
             return self.got_receipt(net, chat, uid, w["order"], msg)
@@ -8965,6 +9120,19 @@ class Shop:
                         ch["expiryTime"] = int(start + o["days"] * 86400000)
                     self.app.panel.update_user(o["sub"], x["emails"], ch)
                     head = "✅ <b>سرویس %s تمدید شد</b>\n%s" % (self.esc(x["name"]), self.esc(o["plan_name"]))
+                elif o["kind"] == "addon":
+                    ms = time.time() * 1000
+                    ch = {"enable": True}
+                    if o["gb"] and x["total"]:  # an unlimited volume stays unlimited
+                        ch["totalGB"] = int(x["total"] + float(o["gb"]) * GB_BYTES)
+                    if o["days"]:
+                        if x["expiry"] > 0:
+                            ch["expiryTime"] = int(max(x["expiry"], ms) + o["days"] * 86400000)
+                        elif x["expiry"] < 0:  # starts at first use: more days to come
+                            ch["expiryTime"] = int(x["expiry"] - o["days"] * 86400000)
+                    self.app.panel.update_user(o["sub"], x["emails"], ch)
+                    head = "✅ به سرویس %s اضافه شد: %s" % (self.esc(x["name"]), " و ".join(
+                        p for p in ("%s گیگ" % fa_num(_fmt_num(o["gb"])) if o["gb"] else "", "%s روز" % fa_num(o["days"]) if o["days"] else "") if p))
                 else:
                     self.app.panel.update_user(o["sub"], x["emails"], {"totalGB": int(x["total"] + float(o["gb"]) * GB_BYTES), "enable": True})
                     head = "✅ <b>%s گیگ</b> به سرویس %s اضافه شد" % (fa_num(_fmt_num(o["gb"])), self.esc(x["name"]))
@@ -9058,6 +9226,9 @@ class Shop:
                                        who=" ".join(x for x in (who.get("first_name"), who.get("username") and "@" + who["username"]) if x))
             elif not self.on():
                 note = "فروشگاه فعلاً بسته‌ست"
+            elif self.need_phone(uid):
+                self.phone_prompt(net, chat)
+                note = "اول شماره‌ت رو تأیید کن"
             elif not self.joined(net, who.get("id")):
                 self.join_prompt(net, chat, mid)
                 note = "اول عضو کانال شو"
@@ -9080,6 +9251,15 @@ class Shop:
             return self.main_menu(net, chat, uid, mid)
         if head == "tk":
             return self.tickets_menu(net, chat, uid, rest, mid)
+        if head == "st":
+            return self.status_view(net, chat, mid)
+        if head == "cbo":
+            mode, _, sub = rest.partition(":")
+            if mode not in ("buy", "renew", "add") or not self.custom_on():
+                return self.buy_menu(net, chat, mid)
+            return self.builder(net, chat, mid, mode, sub)
+        if head == "cb":
+            return self.builder_tap(net, chat, uid, rest, mid)
         if head == "ord":
             return self.orders_menu(net, chat, uid, mid)
         if head == "buy":
@@ -9190,6 +9370,7 @@ class Shop:
                 "plans": [pub(p) for p in self.plans()], "traffic": [pub(p) for p in self.plans("traffic")],
                 "topups": [_int(a) for a in str(cfg.get("shop_topups") or "100000,200000,500000").split(",") if _int(a) > 0][:6],
                 "trial": bool(self.trial_cfg() and not u.get("trial")), "trial_cfg": self.trial_cfg(),
+                "custom": {"gb": self.unit_prices()[0], "day": self.unit_prices()[1], "max": self.custom_max()} if self.custom_on() else None,
                 "codes": any(c.get("kind") == "discount" for c in self.d["codes"]), "cards": bool(self.cards()),
                 "ref": {"pct": _int(cfg.get("shop_ref")), "link": "https://t.me/%s?start=r_%s" % (me, uid.split(":", 1)[1]) if me else "",
                         "invited": sum(1 for x in self.d["users"].values() if x.get("ref") == uid), "earned": u.get("ref_earned", 0)},
@@ -9213,7 +9394,28 @@ class Shop:
             ch = str(self.app.cfg.get("shop_channel") or "")
             return False, {"error": "اول عضو کانال شو", "join": "https://t.me/" + ch.lstrip("@") if ch.startswith("@") else ch}
         if action == "state":
+            if self.need_phone(uid):
+                return False, {"error": "اول توی چت ربات شماره‌ت رو تأیید کن", "phone": True}
             return True, self.app_state(uid, chat)
+        if self.need_phone(uid):
+            return False, {"error": "اول توی چت ربات شماره‌ت رو تأیید کن", "phone": True}
+        if action == "status":
+            rts = [r for r in active_routes(live_routes(self.app, self.app.rt, UPSTREAMS.nodes())) if r.get("show")]
+            return True, {"routes": [{"name": r["name"], "up": not (r.get("down") or r.get("exhausted"))} for r in rts[:20]],
+                          "last": int(getattr(self.app.monitor, "last_run", 0) or 0)}
+        if action == "order" and body.get("plan") == "custom":
+            kind = body.get("kind")
+            gb, days = _int(body.get("gb")), _int(body.get("days"))
+            mg, md = self.custom_max()
+            sub = str(body.get("sub") or "")
+            if not self.custom_on() or kind not in ("buy", "renew", "addon") or gb < 0 or days < 0 or gb > mg or days > md or not (gb or days) \
+                    or (kind != "addon" and (gb < 1 or days < 1)):
+                return False, {"error": "حجم یا روز نامعتبره"}
+            if kind != "buy" and sub not in [s for s, _ in self.services(uid, "tg:%s" % chat)]:
+                return False, {"error": "این سرویس مال تو نیست"}
+            price = self.custom_price(gb, days)
+            plan = {"id": "custom", "name": "%s گیگ · %s روز" % (fa_num(gb), fa_num(days)), "gb": gb, "days": days, "price": price}
+            return True, self.app_invoice(self.new_order(uid, net, chat, kind, price, plan, sub if kind != "buy" else ""))
         if action == "order":
             kind = body.get("kind")
             if kind == "topup":
@@ -9290,7 +9492,7 @@ class Shop:
                           "buyers": len({o["uid"] for o in done}), "wallets": sum(u.get("wallet", 0) for u in users.values())},
                 "tickets": [dict(t, name=(users.get(t["uid"]) or {}).get("name", ""), username=(users.get(t["uid"]) or {}).get("username", ""))
                             for t in sorted(self.d["tickets"], key=lambda t: (t["status"] == "closed", -t["updated"]))[:150]],
-                "customers": sorted([{"id": k, "name": u.get("name", ""), "username": u.get("username", ""), "wallet": u.get("wallet", 0),
+                "customers": sorted([{"id": k, "name": u.get("name", ""), "username": u.get("username", ""), "wallet": u.get("wallet", 0), "phone": u.get("phone", ""),
                                       "subs": len(u.get("subs") or []), "joined": u.get("joined", 0),
                                       "spent": sum(self.total(o) for o in done if o["uid"] == k)} for k, u in users.items()],
                                     key=lambda c: -c["joined"])[:300]}
@@ -9524,7 +9726,8 @@ class AdminBot:
         def t(key, label):
             on = bool(cfg.get(key))
             return ("%s %s" % ("🟢" if on else "⚪️", label), "a:tg:%s" % key)
-        rows = [[t("shop_enable", "فروشگاه")], [t("user_page", "صفحه‌ی اشتراک مشتری")], [t("skip_down", "حذف موقت مسیر قطع از ساب")],
+        rows = [[t("shop_enable", "فروشگاه")], [t("shop_channel_on", "عضویت اجباری کانال")], [t("shop_phone", "گرفتن شماره در شروع")],
+                [t("user_page", "صفحه‌ی اشتراک مشتری")], [t("skip_down", "حذف موقت مسیر قطع از ساب")],
                 [("⬅️ پنل", "a:home")]]
         self.show(net, chat, "⚙️ <b>تنظیمات سریع</b>\nلمس کن تا روشن یا خاموش بشه. بقیه‌ی تنظیمات توی پنل وب.", rows, msg)
 
@@ -9693,10 +9896,10 @@ class AdminBot:
             self.shop_menu(net, chat, mid)
         elif head == "tg":
             key = parts[2]
-            if key not in ("shop_enable", "user_page", "skip_down"):
+            if key not in ("shop_enable", "user_page", "skip_down", "shop_channel_on", "shop_phone"):
                 return ""
             cfg = load_config()
-            cfg[key] = not cfg.get(key, key != "shop_enable")
+            cfg[key] = not cfg.get(key, key in ("user_page", "skip_down", "shop_channel_on"))
             save_config(cfg)
             self.app.reload()
             threading.Thread(target=self.bot.menu_button, daemon=True).start()
@@ -9921,6 +10124,10 @@ h2 small{color:var(--mut);font-weight:500;font-size:12.5px}
 .total{display:flex;justify-content:space-between;align-items:center;margin:14px 0;font-size:16px}.total b{font-size:22px;color:var(--acc)}
 .in input{width:100%;background:var(--sec);border:1px solid var(--line);border-radius:12px;padding:11px 12px;color:var(--fg);font:inherit;outline:none}
 .in input:focus{border-color:var(--acc)}
+.stepper{display:flex;align-items:center;gap:6px;background:var(--card);border-radius:16px;padding:10px;margin-bottom:10px}
+.stepper .lb{flex:0 0 64px;font-size:13px;color:var(--mut)}.stepper b{flex:1;text-align:center;font-size:22px}.stepper b small{font-size:12px;color:var(--mut);font-weight:500}
+.stepper button{width:38px;height:38px;border-radius:12px;background:color-mix(in srgb,var(--acc) 15%,transparent);color:var(--acc);font-weight:800;font-size:15px}
+.stepper button:active{transform:scale(.92)}
 .cardbox{background:linear-gradient(135deg,#1e293b,#334155);color:#fff;border-radius:18px;padding:16px;margin:10px 0;direction:ltr;text-align:left;box-shadow:0 10px 24px rgba(0,0,0,.25)}
 .cardbox .n{font-size:19px;letter-spacing:1.5px;font-weight:700;margin:14px 0 8px;font-family:ui-monospace,Menlo,monospace}
 .cardbox .h{direction:rtl;text-align:right;font-size:13px;opacity:.85}
@@ -9955,7 +10162,7 @@ async function api(action,body={}){
   if(!j.ok&&j.join){sheet(`<h3>📢 عضویت در کانال</h3><p class="mut">برای خرید، اول عضو کانال ما شو.</p><button class="btn block" onclick="tg.openTelegramLink(${q(j.join)})">عضویت در کانال</button><div style="height:8px"></div><button class="btn ghost block" onclick="closeSheet();load()">✅ عضو شدم</button>`)}
   return j;
 }
-async function load(){const j=await api("state");if(!j.ok){$("#app").innerHTML=`<div class="empty"><span class="e">🔒</span>${esc(j.error||"خطا")}</div>`;return}D=j;render()}
+async function load(){const j=await api("state");if(!j.ok){$("#app").innerHTML=`<div class="empty"><span class="e">${j.phone?"📱":"🔒"}</span>${esc(j.error||"خطا")}${j.phone?`<div style="height:12px"></div><button class="btn" onclick="tg.close()">رفتن به چت ربات</button>`:""}</div>`;return}D=j;render()}
 const TABS=[["home","🏠","خانه"],["buy","🛍","خرید"],["wallet","💳","کیف پول"],["more","✨","بیشتر"]];
 function render(){
   $("#tabs").innerHTML=TABS.map(([k,i,l])=>`<button class="${tab===k?"on":""}" onclick="go('${k}')"><span class="ic">${i}</span>${l}</button>`).join("");
@@ -9969,21 +10176,35 @@ function svcCard(x,i){const d=days(x),p=x.total?Math.max(0,1-x.used/x.total):1;
   return `<div class="card svc" style="animation-delay:${i*40}ms"><div class="top"><b>${esc(x.name)}</b><span class="pill ${x.active?"on":"off"}">${x.active?"فعال":"غیرفعال"}</span></div>
    <div class="bar"><i data-w="${(p*100).toFixed(1)}%" style="width:0"></i></div>
    <div class="meta"><span>${x.total?`${gb(x.total-x.used)} از ${gb(x.total)} گیگ`:"حجم نامحدود"}</span><span>${d===null?(x.expiry<0?"از اولین اتصال":"بدون محدودیت"):d?fa(d)+" روز مانده":"منقضی"}</span></div>
-   <div class="row2"><button class="btn" onclick="renew(${q(x.sub)})">🔄 تمدید</button>${D.traffic.length?`<button class="btn ghost" onclick="traffic(${q(x.sub)})">➕ حجم</button>`:""}<button class="btn ghost" onclick="linkSheet(${i})">🔗</button></div></div>`}
+   <div class="row2"><button class="btn" onclick="renew(${q(x.sub)})">🔄 تمدید</button>${D.custom?`<button class="btn ghost" onclick="builderSheet('addon',${q(x.sub)})">➕ حجم و زمان</button>`:D.traffic.length?`<button class="btn ghost" onclick="traffic(${q(x.sub)})">➕ حجم</button>`:""}<button class="btn ghost" onclick="linkSheet(${i})">🔗</button></div></div>`}
 V.home=()=>{const n=(D.name||"").split(" ")[0];
   return `<div class="hero"><div class="hi">سلام ${esc(n)} 👋</div><div class="w">${tm(D.wallet)} <span style="font-size:14px;font-weight:600">تومان</span></div><div class="k">موجودی کیف پول</div>
-   <div class="acts"><button onclick="go('buy')">🛍 خرید</button><button onclick="go('wallet')">➕ شارژ</button>${D.trial?`<button onclick="trial()">🎁 تست</button>`:""}</div></div>
+   <div class="acts"><button onclick="go('buy')">🛍 خرید</button><button onclick="showStatus()">📡 سرورها</button><button onclick="go('wallet')">➕ شارژ</button>${D.trial?`<button onclick="trial()">🎁 تست</button>`:""}</div></div>
    <h2>سرویس‌های من <small>${fa(D.services.length)}</small></h2>
    ${D.services.length?D.services.map(svcCard).join(""):`<div class="card empty"><span class="e">📦</span>هنوز سرویسی نداری<div style="height:10px"></div><button class="btn" onclick="go('buy')">🛍 خرید اولین سرویس</button></div>`}`};
 function planCard(p,i,act){return `<button class="plan" style="animation-delay:${i*35}ms" onclick="${act}"><div class="gb">${p.gb?fa(+p.gb)+' <small>گیگ</small>':"∞"}</div>
   <div class="nm">${esc(p.name)}</div><div class="d">${p.kind==="traffic"?"به حجم فعلی اضافه می‌شه":p.days?fa(p.days)+" روزه":"بدون محدودیت زمان"}${p.devices?" · "+fa(p.devices)+" دستگاه":""}</div><div class="pr">${tm(p.price)} <small style="font-weight:500">تومان</small></div></button>`}
-V.buy=()=>`<h2>پلن‌ها</h2>${D.plans.length?`<div class="plans">${D.plans.map((p,i)=>planCard(p,i,`order('buy','${p.id}')`)).join("")}</div>`:`<div class="card empty"><span class="e">🛍</span>فعلاً پلنی برای فروش نیست</div>`}
+function builderSheet(mode,sub){const C=D.custom;if(!C)return;const lo=mode==="addon"?0:1;let gb=mode==="addon"?0:30,dy=mode==="addon"?0:30;
+  const draw=()=>{const price=gb*C.gb+dy*C.day,ok=price>0&&(gb||dy);
+   $("#bld").innerHTML=`<div class="stepper"><span class="lb">📦 حجم</span><button onclick="bs('g',-10)">−۱۰</button><button onclick="bs('g',-1)">−</button><b>${fa(gb)}<small> گیگ</small></b><button onclick="bs('g',1)">+</button><button onclick="bs('g',10)">+۱۰</button></div>
+    <div class="stepper"><span class="lb">📅 زمان</span><button onclick="bs('d',-10)">−۱۰</button><button onclick="bs('d',-1)">−</button><b>${fa(dy)}<small> روز</small></b><button onclick="bs('d',1)">+</button><button onclick="bs('d',10)">+۱۰</button></div>
+    <div class="total"><span>مبلغ</span><b>${tm(price)} <small style="font-size:13px">تومان</small></b></div>
+    <button class="btn block" ${ok?"":"disabled"} onclick="order('${mode==="addon"?"addon":mode}','custom',0,${q(sub||"")},${gb},${dy})">✅ ادامه</button>`};
+  window.bs=(w,n)=>{hap();if(w==="g")gb=Math.min(C.max[0],Math.max(lo,gb+n));else dy=Math.min(C.max[1],Math.max(mode==="addon"?0:lo,dy+n));draw()};
+  sheet(`<h3>${mode==="addon"?"➕ افزایش حجم و زمان":mode==="renew"?"🔄 تمدید دلخواه":"🎛 پلن دلخواه"}</h3><p class="mut" style="margin-top:-6px;font-size:13px">${mode==="addon"?"به همین سرویس اضافه می‌شه.":"هر گیگ "+tm(C.gb)+" و هر روز "+tm(C.day)+" تومان"}</p><div id="bld"></div>`);draw()}
+async function showStatus(){hap();sheet(`<h3>📡 وضعیت سرورها</h3><div id="sts" class="empty"><span class="e">⏳</span></div>`);const j=await api("status");if(!j.ok)return;
+  const up=j.routes.filter(r=>r.up).length,all=j.routes.length;
+  $("#sts").outerHTML=`<div class="card" style="text-align:center"><div style="font-size:40px">${!all?"⚪️":up===all?"🟢":up?"🟡":"🔴"}</div><b>${!all?"اطلاعاتی نیست":up===all?"همه‌ی سرورها آنلاین‌ان":fa(up)+" از "+fa(all)+" آنلاین"}</b>${j.last?`<div class="mut" style="font-size:12px">آخرین بررسی ${fa(Math.max(0,Math.round((Date.now()/1000-j.last)/60)))} دقیقه پیش</div>`:""}</div>
+   <div class="card list">${j.routes.map(r=>`<div class="it"><div>${esc(r.name)}</div><b>${r.up?"🟢":"🔴"}</b></div>`).join("")}</div><div class="note">💡 وصل نمی‌شی؟ توی اپ اشتراک رو Update کن و ⚡ Auto رو بزن.</div>`}
+V.buy=()=>`${D.custom?`<button class="plan" style="width:100%;margin-top:12px;display:flex;align-items:center;gap:12px" onclick="builderSheet('buy','')"><div style="font-size:30px">🎛</div><div><div class="gb" style="font-size:18px">پلن دلخواه</div><div class="d">خودت حجم و روز رو انتخاب کن · هر گیگ ${tm(D.custom.gb)} تومان</div></div></button>`:""}
+  <h2>پلن‌ها</h2>${D.plans.length?`<div class="plans">${D.plans.map((p,i)=>planCard(p,i,`order('buy','${p.id}')`)).join("")}</div>`:`<div class="card empty"><span class="e">🛍</span>فعلاً پلنی برای فروش نیست</div>`}
   ${D.plans.some(p=>p.desc)?`<div class="card" style="margin-top:10px">${D.plans.filter(p=>p.desc).map(p=>`<div class="kv"><span>${esc(p.name)}</span><span>${esc(p.desc)}</span></div>`).join("")}</div>`:""}`;
 V.wallet=()=>`<div class="hero"><div class="hi">موجودی</div><div class="w">${tm(D.wallet)} <span style="font-size:14px;font-weight:600">تومان</span></div><div class="k">خرید و تمدید با یه لمس</div></div>
   <h2>شارژ کیف پول</h2><div class="chips">${D.topups.map(a=>`<button class="chip" onclick="order('topup','',${a})">${tm(a)}<div class="mut" style="font-size:11.5px;font-weight:500">تومان</div></button>`).join("")}</div>
   <h2>آخرین سفارش‌ها</h2><div class="card list">${D.orders.length?D.orders.map(o=>`<div class="it"><div>${({buy:"خرید",renew:"تمدید",traffic:"حجم اضافه",topup:"شارژ"})[o.kind]}${o.plan?" · "+esc(o.plan):""}<br><span>${({done:"✅ انجام شد",review:"⏳ در حال بررسی",receipt:"📸 منتظر رسید",new:"در انتظار پرداخت",rejected:"❌ رد شد",cancelled:"لغو",failed:"⚠️ ناموفق",refunded:"↩️ برگشت به کیف پول",approving:"⏳"})[o.status]||o.status}</span></div><b>${tm(o.total)}</b></div>`).join(""):`<div class="empty">هنوز سفارشی نیست</div>`}</div>`;
 V.more=()=>`<h2>بیشتر</h2>
   <div class="card list">
+   <div class="it" onclick="showStatus()" style="cursor:pointer"><div>📡 وضعیت سرورها<br><span>کدوم سرورها الان آنلاین‌ان</span></div><b>‹</b></div>
    <div class="it" onclick="giftSheet()" style="cursor:pointer"><div>🎁 کد هدیه<br><span>شارژ رایگان کیف پول</span></div><b>‹</b></div>
    ${D.ref.pct&&D.ref.link?`<div class="it" onclick="refSheet()" style="cursor:pointer"><div>👥 دعوت دوستان<br><span>${fa(D.ref.pct)}٪ از اولین خرید هر دوست</span></div><b>‹</b></div>`:""}
    ${D.trial?`<div class="it" onclick="trial()" style="cursor:pointer"><div>🆓 تست رایگان<br><span>${D.trial_cfg?fa(D.trial_cfg[0])+" گیگ · "+fa(D.trial_cfg[1])+" روز":""}</span></div><b>‹</b></div>`:""}
@@ -9995,7 +10216,7 @@ function sheet(html){closeSheet();const s=document.createElement("div");s.classN
 function closeSheet(){const s=$("#sheet");if(s)s.remove();tg&&tg.BackButton.hide()}
 tg&&tg.BackButton.onClick(closeSheet);
 function invoice(o){
-  const kind={buy:"خرید",renew:"تمدید",traffic:"حجم اضافه",topup:"شارژ کیف پول"}[o.kind];
+  const kind={buy:"خرید",renew:"تمدید",traffic:"حجم اضافه",topup:"شارژ کیف پول",addon:"افزایش حجم و زمان"}[o.kind];
   sheet(`<h3>🧾 فاکتور #${fa(o.id)}</h3>
    <div class="kv"><span>${kind}</span><span>${o.plan?esc(o.plan):tm(o.price)+" تومان"}</span></div>
    ${o.kind!=="topup"&&o.plan?`<div class="kv"><span>جزئیات</span><span>${o.gb?fa(+o.gb)+" گیگ":"نامحدود"}${o.days?" · "+fa(o.days)+" روز":""}</span></div>`:""}
@@ -10006,9 +10227,9 @@ function invoice(o){
    ${D.cards?`<button class="btn ${o.kind==="topup"?"":"ghost"} block" onclick="payCard(${o.id})">💳 کارت به کارت</button>`:""}
    ${!D.cards&&(o.kind==="topup"||o.wallet<o.total)?`<div class="note">روش پرداختی تنظیم نشده؛ با پشتیبانی در تماس باش.</div>`:""}
    <div style="height:8px"></div><button class="btn ghost block" style="color:var(--mut);background:transparent" onclick="cancel(${o.id})">انصراف</button>`)}
-async function order(kind,plan,amount,sub){if(busy)return;busy=true;hap();try{const j=await api("order",{kind,plan,amount,sub});if(j.ok)invoice(j);else toast(j.error)}finally{busy=false}}
-function renew(sub){hap();if(!D.plans.length)return toast("پلنی برای تمدید نیست");
-  sheet(`<h3>🔄 تمدید</h3><p class="mut" style="margin-top:-6px;font-size:13px">حجم از نو شروع می‌شه و روزها به باقی‌مونده اضافه می‌شن.</p><div class="plans">${D.plans.map((p,i)=>planCard(p,i,`order('renew','${p.id}',0,${q(sub)})`)).join("")}</div>`)}
+async function order(kind,plan,amount,sub,gb,days){if(busy)return;busy=true;hap();try{const j=await api("order",{kind,plan,amount,sub,gb,days});if(j.ok)invoice(j);else toast(j.error)}finally{busy=false}}
+function renew(sub){hap();if(!D.plans.length&&D.custom)return builderSheet('renew',sub);if(!D.plans.length)return toast("پلنی برای تمدید نیست");
+  sheet(`<h3>🔄 تمدید</h3><p class="mut" style="margin-top:-6px;font-size:13px">حجم از نو شروع می‌شه و روزها به باقی‌مونده اضافه می‌شن.</p>${D.custom?`<button class="btn ghost block" style="margin-bottom:10px" onclick="builderSheet('renew',${q(sub)})">🎛 تمدید دلخواه</button>`:""}<div class="plans">${D.plans.map((p,i)=>planCard(p,i,`order('renew','${p.id}',0,${q(sub)})`)).join("")}</div>`)}
 function traffic(sub){hap();sheet(`<h3>➕ حجم اضافه</h3><div class="plans">${D.traffic.map((p,i)=>planCard(p,i,`order('traffic','${p.id}',0,${q(sub)})`)).join("")}</div>`)}
 async function code(id){const v=$("#cc").value.trim();if(!v)return;const j=await api("code",{id,code:v});if(j.ok){okHap("success");invoice(j);toast("تخفیف اعمال شد 🎉")}else{okHap("error");toast(j.error)}}
 async function cancel(id){await api("cancel",{id});closeSheet()}
