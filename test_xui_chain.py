@@ -1574,25 +1574,40 @@ class Telegram(BaseHTTPRequestHandler):
 
 class BotAPI(BaseHTTPRequestHandler):
     """A stand-in Bot API: records what is sent, answers getMe and getUpdates."""
-    sent, updates, blocked, other, outside, no_icons = [], [], set(), [], False, False
+    sent, updates, blocked, other, outside, no_icons, photos = [], [], set(), [], False, False, set()
 
     def log_message(self, *a):
         pass
 
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         method = self.path.rsplit("/", 1)[1]
+        if "multipart" in (self.headers.get("Content-Type") or ""):  # an upload: keep the fields, mark the file
+            body = {}
+            for part in raw.split(b"--" + self.headers["Content-Type"].split("boundary=")[1].encode())[1:-1]:
+                head, _, val = part.partition(b"\r\n\r\n")
+                name = re.search(rb'name="([^"]+)"', head).group(1).decode()
+                body[name] = "<upload>" if b"filename=" in head else val[:-2].decode()
+            body["multipart"] = True
+        else:
+            body = json.loads(raw or b"{}")
+        if method == "editMessageText" and body.get("message_id") in BotAPI.photos:
+            return self.answer(400, {"ok": False, "description": "Bad Request: there is no text in the message to edit"})
+        if method == "editMessageCaption" and body.get("message_id") not in BotAPI.photos:
+            return self.answer(400, {"ok": False, "description": "Bad Request: there is no caption in the message to edit"})
         if method == "getMe":
             res = {"username": "ez_test_bot"}
         elif method == "getUpdates":
             res, BotAPI.updates = list(BotAPI.updates), []
-        elif method in ("sendMessage", "editMessageText", "sendPhoto", "sendDocument"):
+        elif method in ("sendMessage", "editMessageText", "editMessageCaption", "sendPhoto", "sendDocument"):
             if BotAPI.no_icons and "icon_custom_emoji_id" in json.dumps(body):
                 return self.answer(400, {"ok": False, "description": "Bad Request: custom emoji can't be used"})
             if str(body.get("chat_id")) in BotAPI.blocked:
                 return self.answer(403, {"ok": False, "description": "Forbidden: bot was blocked by the user"})
             BotAPI.sent.append(dict(body, method=method))
             res = {"message_id": len(BotAPI.sent)}
+            if method == "sendPhoto":
+                res["photo"] = [{"file_id": "small"}, {"file_id": "BANNER_FID"}]
         elif method == "getChatMember":
             res = {"status": "left" if BotAPI.outside else "member"}
         else:
@@ -1629,7 +1644,7 @@ class BotBase(unittest.TestCase):
 
     def setUp(self):
         xc.TG_API = "http://127.0.0.1:%d" % self.api.server_address[1]
-        BotAPI.sent, BotAPI.updates, BotAPI.blocked = [], [], set()
+        BotAPI.sent, BotAPI.updates, BotAPI.blocked, BotAPI.photos = [], [], set(), set()
         self.saved = xc.load_config()
         xc.save_config(dict(self.saved, bot_enable=True, bot_token="1:test", bot_quiet="", public_host="sub.example.com"))
         try:
@@ -1649,7 +1664,7 @@ class BotBase(unittest.TestCase):
     def say(self, chat, text, name="Ali"):
         BotAPI.sent = []
         self.bot.handle("tg", {"chat": {"id": chat}, "from": {"id": chat, "first_name": name}, "text": text})
-        return BotAPI.sent[-1]["text"] if BotAPI.sent else ""
+        return (BotAPI.sent[-1].get("text") or BotAPI.sent[-1].get("caption", "")) if BotAPI.sent else ""
 
 
 class BotTests(BotBase):
@@ -1826,7 +1841,7 @@ class ShopTests(BotBase):
         BotAPI.sent = []
         self.shop.on_callback("tg", {"id": "q", "data": data, "from": {"id": user, "first_name": "U%d" % user},
                                      "message": {"chat": {"id": chat or user}, "message_id": 7}})
-        return BotAPI.sent[-1]["text"] if BotAPI.sent else ""
+        return (BotAPI.sent[-1].get("text") or BotAPI.sent[-1].get("caption", "")) if BotAPI.sent else ""
 
     def photo(self, user):
         BotAPI.sent = []
@@ -2002,6 +2017,32 @@ class ShopTests(BotBase):
         self.bot.reminders()
         m = [m for m in BotAPI.sent if str(m["chat_id"]) == "985"][-1]
         self.assertIn("rn:sarasub12345", json.dumps(m["reply_markup"]))
+
+    def test_menu_banner_is_a_photo_not_a_link(self):
+        d = xc.conf_path("brand")
+        os.makedirs(d, exist_ok=True)
+        png = os.path.join(d, "banner.png")
+        with open(png, "wb") as f:
+            f.write(b"\x89PNG fake")
+        try:
+            self.say(987, "/start")
+            first = BotAPI.sent[-1]
+            self.assertEqual((first["method"], first["photo"]), ("sendPhoto", "<upload>"))  # uploaded once
+            self.assertIn("خوش اومدی", first["caption"])
+            self.assertNotIn("link_preview_options", json.dumps(BotAPI.sent))
+            self.say(987, "/start")
+            self.assertEqual(BotAPI.sent[-1]["photo"], "BANNER_FID")  # then sent by its file id
+            BotAPI.photos = {7}
+            self.tap(987, "tk")  # a plain menu from the photo menu: the banner stays, the caption changes
+            self.assertEqual(BotAPI.sent[-1]["method"], "editMessageCaption")
+            self.assertIn("پشتیبانی", BotAPI.sent[-1]["caption"])
+            BotAPI.photos = set()
+            BotAPI.sent = []
+            self.shop.main_menu("tg", 987, "tg:987", 7)  # back home from a text menu: swapped for the photo
+            self.assertIn(("deleteMessage", {"chat_id": 987, "message_id": 7}), BotAPI.other)
+            self.assertEqual(BotAPI.sent[-1]["method"], "sendPhoto")
+        finally:
+            os.remove(png)
 
     def test_support_button_links_sub_and_opens_tickets(self):
         out = self.say(986, "/start t_sarasub12345")  # "support" on the user page

@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.19.3"
+VERSION = "5.20.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -130,7 +130,7 @@ DEFAULTS = {
     "shop_help": "",
     "shop_prefix": "tg",        # client names: <prefix><telegram id>
     "brand_color": "",          # brand colours for the customer pages and the mini app (#rrggbb)
-    "brand_banner_url": "",     # banner above the bot's menu when the panel is not on port 443 (an https link)
+    "brand_banner_url": "",     # banner above the bot's menu when there is no banner.png in the brand folder (an https link)
     "brand_font_licensed": False,  # serve <conf>/brand/display.ttf to customers (only with a web licence for the font)
     "brand_accent": "",
     "shop_gb_price": 0,         # custom plans: Toman per GB (0 = no custom plans)
@@ -7757,6 +7757,31 @@ class Bot:
             raise ValueError(j.get("description") or "error")
         return j.get("result")
 
+    def upload(self, net, method, fields, field, filename, data, mime, timeout=60):
+        """A Bot API call with one file (multipart). Raises ValueError like call()."""
+        base, token = self.nets().get(net, (None, None))
+        if not token:
+            raise ValueError("bot is off")
+        boundary = "ezxui" + secrets.token_hex(12)
+        parts = [('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (
+            boundary, k, json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v)).encode() for k, v in fields.items()]
+        parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"; filename="%s"\r\nContent-Type: %s\r\n\r\n' % (
+            boundary, field, filename, mime)).encode() + data + b"\r\n")
+        req = urllib.request.Request("%s/bot%s/%s" % (base, token, method), data=b"".join(parts) + ("--%s--\r\n" % boundary).encode(),
+                                     headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                j = json.loads(r.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            try:
+                j = json.loads(e.read().decode() or "{}")
+            except ValueError:
+                j = {}
+            raise ValueError(j.get("description") or "HTTP %d" % e.code)
+        if not j.get("ok"):
+            raise ValueError(j.get("description") or "error")
+        return j.get("result")
+
     def send(self, net, chat, text, kind="", keyboard=None, queue=True):
         """Send now; on failure keep it for a retry. -> "" or the error."""
         payload = {"chat_id": chat, "text": text[:4000], "disable_web_page_preview": True}
@@ -8236,6 +8261,7 @@ class Bot:
                     self.st["offset"].pop(net, None)
                     if net == "tg":
                         self.st.pop("menu_url", None)
+                    (self.st.get("banner") or {}).pop(net, None)  # file ids belong to one bot
                     self.gen[net] = self.gen.get(net, 0) + 1  # the old reader stops; the watchdog starts a new one
                     self.threads.pop(net, None)
                 self.save()
@@ -8512,27 +8538,71 @@ class Shop:
             return ""
         return base[:-len(self.app.rt["sub_path"]) - 1] + "app/"
 
-    def banner_url(self):
-        """The brand banner as a link Telegram can preview above a message; "" when there is none.
-        Telegram previews only links on the standard port, so a panel on another port needs brand_banner_url."""
-        url = str(self.app.cfg.get("brand_banner_url") or "").strip()
-        if url.startswith("https://"):
-            return url
+    def banner_photo(self, net):
+        """The banner for sendPhoto: (photo, cache key). The local file is uploaded once and then sent by
+        its file id; without one, an https brand_banner_url is handed to Telegram. None when there is none."""
         p = brand_file("banner.png")
-        base = self.app_url()
-        if not (p and base) or not re.match(r"https://[^/:]+/", base):
-            return ""
-        return base[:-len("app/")] + "brand/banner.png?v=%d" % int(os.path.getmtime(p))
+        if p:
+            key = "%d:%d" % (int(os.path.getmtime(p)), os.path.getsize(p))
+            fid = (self.bot.st.get("banner") or {}).get(net) or []
+            return (fid[1] if len(fid) == 2 and fid[0] == key else ("file", p)), key
+        url = str(self.app.cfg.get("brand_banner_url") or "").strip()
+        return (url, "") if url.startswith("https://") else None
+
+    def send_banner(self, net, chat, caption, markup, effect=None):
+        photo, key = self.banner_photo(net)
+        payload = {"chat_id": chat, "caption": caption, "parse_mode": "HTML"}
+        if markup is not None:
+            payload["reply_markup"] = markup
+        if effect and str(chat).lstrip("-").isdigit() and not str(chat).startswith("-"):
+            payload["message_effect_id"] = self.EFFECT.get(effect, effect)
+        if isinstance(photo, tuple):
+            with open(photo[1], "rb") as f:
+                res = self.bot.upload(net, "sendPhoto", payload, "photo", "banner.png", f.read(), "image/png")
+            sizes = (res or {}).get("photo") or []
+            if sizes:
+                with self.bot.lock:
+                    self.bot.st.setdefault("banner", {})[net] = [key, sizes[-1]["file_id"]]
+                self.bot.save()
+            return res
+        return self.bot.call(net, "sendPhoto", dict(payload, photo=photo))
+
+    def show_banner(self, net, chat, text, rows, msg, effect):
+        """A menu under the brand banner, sent as a photo (no link to tap, never a stale preview).
+        A photo menu is edited in place; a text message is swapped for one."""
+        for attempt in (0, 1):
+            markup = self.kb(rows, net) if rows is not None else None
+            try:
+                if msg and not effect:
+                    try:
+                        return self.bot.call(net, "editMessageCaption", {"chat_id": chat, "message_id": msg, "caption": text,
+                                                                         "parse_mode": "HTML", "reply_markup": markup})
+                    except ValueError as e:
+                        if "not modified" in str(e):
+                            return None
+                        if re.search(r"emoji|style|button|entit", str(e), re.I):
+                            raise
+                    try:
+                        self.bot.call(net, "deleteMessage", {"chat_id": chat, "message_id": msg})
+                    except (ValueError, OSError):
+                        pass
+                return self.send_banner(net, chat, text, markup, effect)
+            except (ValueError, OSError) as e:
+                if attempt == 0 and re.search(r"emoji|style|button|entit", str(e), re.I) and not getattr(self, "plain", False):
+                    self.plain = True
+                    text = re.sub(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>', r"\1", text)
+                    continue
+                self.bot.log(net, chat, "shop", str(e)[:160])
+                return None
 
     def show(self, net, chat, text, rows=None, msg=None, effect=None, banner=False):
         """Edit the message in place when there is one (smooth menus), else send a new one. A message with
-        an effect (confetti, fire) is always a new one, since an edit cannot carry it."""
+        an effect (confetti, fire) is always a new one, since an edit cannot carry it. Menus under the banner
+        are photo messages; a plain menu opened from one keeps the banner as its header (caption edit)."""
+        if banner and net == "tg" and len(text) <= 1024 and self.banner_photo(net):
+            return self.show_banner(net, chat, text, rows, msg, effect)
         for attempt in (0, 1):
             payload = {"chat_id": chat, "text": text[:4000], "disable_web_page_preview": True, "parse_mode": "HTML"}
-            url = self.banner_url() if banner and net == "tg" else ""
-            if url:
-                payload.pop("disable_web_page_preview")
-                payload["link_preview_options"] = {"url": url, "prefer_large_media": True, "show_above_text": True}
             if rows is not None:
                 payload["reply_markup"] = self.kb(rows, net)
             try:
@@ -8542,6 +8612,21 @@ class Shop:
                     except (ValueError, OSError) as e:
                         if "not modified" in str(e):
                             return None
+                        if re.search(r"no text in the message", str(e), re.I):  # a photo menu (banner)
+                            if len(text) <= 1024:
+                                try:
+                                    return self.bot.call(net, "editMessageCaption", {"chat_id": chat, "message_id": msg, "caption": text,
+                                                                                     "parse_mode": "HTML", "reply_markup": payload.get("reply_markup")})
+                                except ValueError as e2:
+                                    if "not modified" in str(e2):
+                                        return None
+                                    if re.search(r"emoji|style|button|entit", str(e2), re.I):
+                                        raise
+                            try:
+                                self.bot.call(net, "deleteMessage", {"chat_id": chat, "message_id": msg})
+                            except (ValueError, OSError):
+                                pass
+                            raise ValueError("send")
                         if not re.search(r"emoji|style|button", str(e), re.I):
                             raise ValueError("send")
                         raise
@@ -8549,7 +8634,10 @@ class Shop:
                     try:
                         self.bot.call(net, "editMessageText", {"chat_id": chat, "message_id": msg, "text": "✅"})
                     except (ValueError, OSError):
-                        pass
+                        try:  # a photo menu
+                            self.bot.call(net, "editMessageCaption", {"chat_id": chat, "message_id": msg, "caption": "✅"})
+                        except (ValueError, OSError):
+                            pass
                 if effect and net == "tg" and str(chat).lstrip("-").isdigit() and not str(chat).startswith("-"):
                     try:
                         return self.bot.call(net, "sendMessage", dict(payload, message_effect_id=self.EFFECT.get(effect, effect)))
