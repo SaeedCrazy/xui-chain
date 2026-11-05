@@ -1855,9 +1855,12 @@ class ShopTests(BotBase):
         datas = [b["callback_data"] for row in menu["reply_markup"]["inline_keyboard"] for b in row if "callback_data" in b]
         self.assertIn("buy", datas)
         self.assertIn("trial", datas)
-        self.assertIn("30GB", self.tap(500, "buy"))
-        inv = self.tap(500, "bp:p30")
+        self.tap(500, "buy")
+        labels = [b["text"] for row in BotAPI.sent[-1]["reply_markup"]["inline_keyboard"] for b in row]
+        self.assertIn("۳۰ گیگ · ۱ ماهه · ۱۵۰٬۰۰۰ تومان", labels)  # one style for every plan
+        inv = self.tap(500, "bp:p30")  # card is the only way to pay: straight to it
         self.assertIn("۱۵۰٬۰۰۰ تومان", inv)
+        self.assertIn("<code>6037111122223333</code>", inv)
         oid = self.shop.d["orders"][-1]["id"]
         self.assertIn("<code>6037111122223333</code>", self.tap(500, "pc:%d" % oid))
         kb = json.dumps(BotAPI.sent[-1]["reply_markup"])
@@ -2004,7 +2007,7 @@ class ShopTests(BotBase):
         self.assertIn("بررسی", self.tap(970, "ord"))
         self.tap(972, "bp:p30")
         c = self.shop.d["orders"][-1]
-        self.assertEqual(self.shop.cleanup(now=time.time() + 49 * 3600), 1)
+        self.assertEqual(self.shop.cleanup(now=time.time() + 73 * 3600), 1)
         self.assertEqual(c["status"], "cancelled")
         self.assertEqual(a["status"], "review")  # a receipt under review is never dropped
 
@@ -2170,7 +2173,7 @@ class ShopTests(BotBase):
         self.bot.handle("tg", {"chat": {"id": 510, "type": "private"}, "from": {"id": 510}, "text": "/start"})
         btns = {b.get("callback_data"): b for row in BotAPI.sent[-1]["reply_markup"]["inline_keyboard"] for b in row}
         self.assertEqual(btns["buy"]["style"], "success")
-        self.assertEqual(btns["renew"]["style"], "primary")
+        self.assertEqual(self.shop.kb([[("x", "renew")]])["inline_keyboard"][0][0]["style"], "primary")
         cfg = xc.load_config()
         cfg["bot_owner"] = "42"
         xc.save_config(cfg)
@@ -2181,6 +2184,7 @@ class ShopTests(BotBase):
             {"type": "custom_emoji", "offset": 4, "length": 2, "custom_emoji_id": "111"},
             {"type": "custom_emoji", "offset": 14, "length": 2, "custom_emoji_id": "222"}]})
         self.assertEqual(self.shop.emoji_map(), {"buy": "111", "wallet": "222"})
+        self.shop.user("tg:511")["wallet"] = 50000  # the wallet line shows once there is money in it
         BotAPI.sent = []
         self.bot.handle("tg", {"chat": {"id": 511, "type": "private"}, "from": {"id": 511}, "text": "/start"})
         m = BotAPI.sent[-1]
