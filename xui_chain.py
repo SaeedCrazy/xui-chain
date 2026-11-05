@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.19.0"
+VERSION = "5.19.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -5033,6 +5033,7 @@ def do_action(app, action, body, host):
 
         if action == "settings":
             cfg = load_config()
+            old_tokens = {"tg": cfg.get("bot_token", ""), "bale": cfg.get("bale_token", "")}
             was_auto = cfg.get("panel_auto", True)
             for k in SETTING_BOOLS:
                 if k in body:
@@ -5052,6 +5053,7 @@ def do_action(app, action, body, host):
             save_config(cfg)
             app.reload()
             if any(k.startswith(("bot_", "shop_")) or k == "bale_token" for k in body):
+                app.bot.token_changed(old_tokens)
                 app.bot.me = {}
                 threading.Thread(target=lambda: (app.bot.start(), app.bot.menu_button()), daemon=True).start()
             if any(k in body for k in ("panel_user", "panel_pass", "panel_token", "panel_url", "panel_auto")):
@@ -8205,6 +8207,19 @@ class Bot:
             self.send(net, chat, text, kind="broadcast")
         self.save()
         return len(chats)
+
+    def token_changed(self, old):
+        """A different bot: its update numbers start over and its menu button is unset, so forget both."""
+        cfg = self.app.cfg
+        for net, key in (("tg", "bot_token"), ("bale", "bale_token")):
+            if (cfg.get(key) or "") != (old.get(net) or ""):
+                with self.lock:
+                    self.st["offset"].pop(net, None)
+                    if net == "tg":
+                        self.st.pop("menu_url", None)
+                    self.gen[net] = self.gen.get(net, 0) + 1  # the old reader stops; the watchdog starts a new one
+                    self.threads.pop(net, None)
+                self.save()
 
     def menu_button(self):
         """The chat's menu button opens the mini app while the shop is on (set again when that changes)."""

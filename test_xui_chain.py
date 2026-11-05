@@ -1740,6 +1740,16 @@ class BotTests(BotBase):
         self.assertEqual(started, [("tg", 2)])
         self.assertEqual(self.bot.gen["tg"], 2)  # the old reader sees a new generation and stops itself
 
+    def test_new_bot_token_starts_fresh(self):
+        self.bot.st["offset"]["tg"], self.bot.st["menu_url"] = 999999, "x"
+        cfg = xc.load_config()
+        cfg["bot_token"] = "2:other"
+        xc.save_config(cfg)
+        self.app.reload()
+        self.bot.token_changed({"tg": "1:test"})
+        self.assertNotIn("tg", self.bot.st["offset"])  # the new bot's updates are not skipped
+        self.assertNotIn("menu_url", self.bot.st)
+
     def test_failed_send_is_retried(self):
         self.bot.st["admins"]["tg:400"] = {"name": "x", "events": "all"}
         xc.TG_API = "http://127.0.0.1:9"  # nothing listens
