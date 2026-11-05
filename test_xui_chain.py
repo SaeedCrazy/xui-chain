@@ -2003,6 +2003,16 @@ class ShopTests(BotBase):
         m = [m for m in BotAPI.sent if str(m["chat_id"]) == "985"][-1]
         self.assertIn("rn:sarasub12345", json.dumps(m["reply_markup"]))
 
+    def test_support_button_links_sub_and_opens_tickets(self):
+        out = self.say(986, "/start t_sarasub12345")  # "support" on the user page
+        self.assertIn("پشتیبانی", out)
+        self.assertIn("tk:new", json.dumps(BotAPI.sent[-1].get("reply_markup")))
+        self.assertIn("sarasub12345", self.bot.shop.user("tg:986").get("subs", []))
+        self.assertEqual(self.bot.st["customers"]["tg:986"]["sub"], "sarasub12345")
+        for v, want in (("t.me/pingo", "https://t.me/pingo"), ("@pingo", "https://t.me/pingo"),
+                        ("https://t.me/x", "https://t.me/x"), ("tg://resolve?domain=x", "tg://resolve?domain=x"), ("", "")):
+            self.assertEqual(xc.support_link({"support_url": v}), want)
+
     def test_custom_plan_builder_and_addon(self):
         cfg = xc.load_config()
         cfg.update(shop_gb_price=10000, shop_day_price=1000)

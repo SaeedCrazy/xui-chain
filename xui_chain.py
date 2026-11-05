@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.19.2"
+VERSION = "5.19.3"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -7657,6 +7657,16 @@ def bot_chat_ids(api, token):
 BOT_EVENTS = (("shop", "فروش: رسیدها و سفارش‌ها"), ("tickets", "تیکت‌های پشتیبانی"), ("deco", "قطع و وصل واسط‌ها و تانل‌ها"), ("quota", "حجم و زمان واسط‌ها"),
               ("users", "خلاصه‌ی روزانه‌ی کاربرهای رو به پایان"), ("backup", "خطای بکاپ"))
 BOT_NETS = {"tg": "تلگرام", "bale": "بله"}
+def support_link(cfg):
+    """The support link as a real URL: "t.me/x" and "@x" become https://t.me/x."""
+    v = str(cfg.get("support_url") or "").strip()
+    if v.startswith("@"):
+        return "https://t.me/" + v[1:]
+    if v and not re.match(r"^[a-z][a-z0-9+.-]*:", v, re.I):
+        return "https://" + v.lstrip("/")
+    return v
+
+
 SUB_RE = re.compile(r"(?:/[A-Za-z0-9_.-]+/|^s_?|^)([A-Za-z0-9_-]{8,64})/?$")
 BTN_ME, BTN_LINK, BTN_HELP = "📊 وضعیت من", "🔗 لینک اشتراک", "💬 پشتیبانی"
 
@@ -7882,6 +7892,10 @@ class Bot:
         cmd, _, arg = text.partition(" ")
         cmd = cmd.split("@", 1)[0].lower()
         arg = arg.strip()
+        support = cmd == "/start" and arg.startswith("t_")
+        if support:  # "support" button on the user page: link the sub, then open support
+            arg = "s_" + arg[2:]
+            text = "/start " + arg
         admin = self.st["admins"].get(cid)
         reply = lambda t, kb=None: self.send(net, chat, t, kind="reply", keyboard=kb, queue=False)
         private = (msg.get("chat") or {}).get("type", "private") == "private"
@@ -7929,7 +7943,7 @@ class Bot:
             if not u:
                 return reply("اشتراکت پیدا نشد. لینک جدیدت رو بفرست.")
             if text == BTN_HELP:
-                return reply("💬 " + self.app.cfg.get("support_url", ""))
+                return reply("💬 " + support_link(self.app.cfg))
             return reply(self.user_text(u, link=text == BTN_LINK), self.customer_keyboard())
         m = SUB_RE.search(arg if cmd == "/start" else text)
         if m and (cmd == "/start" or "/" in text or len(text) >= 8):
@@ -7947,6 +7961,11 @@ class Bot:
                 if self.shop.on() and u["sub"] not in su.setdefault("subs", []):
                     su["subs"].append(u["sub"])
             self.shop.save()
+            if support and private and self.shop.on():
+                return self.shop.open_support(net, chat, who)
+            if support:
+                sup = support_link(self.app.cfg)
+                return reply("✅ اشتراکت وصل شد.\n\n💬 پشتیبانی: %s" % sup if sup else "✅ اشتراکت وصل شد. سؤالت رو همین‌جا بنویس.", self.customer_keyboard())
             return reply("✅ وصل شد. قبل از تموم شدن حجم یا زمانت همین‌جا خبرت می‌کنم.\n\n" + self.user_text(u),
                          self.customer_keyboard())
         if admin:
@@ -8144,7 +8163,7 @@ class Bot:
                 if k in self.st["sent"]:
                     continue
                 self.st["sent"][k] = int(now)
-                support = cfg.get("support_url")
+                support = support_link(cfg)
                 kb = None
                 if self.shop.on():  # renew or add traffic with one tap, right from the reminder
                     row = [("🔄 تمدید", "rn:%s" % c["sub"])]
@@ -8834,6 +8853,16 @@ class Shop:
             return self.join_prompt(net, chat)
         self.main_menu(net, chat, uid)
 
+    def open_support(self, net, chat, who):
+        uid = "%s:%s" % (net, who.get("id", chat))
+        self.user(uid, who)
+        self.save()
+        if self.need_phone(uid):
+            return self.phone_prompt(net, chat, first=True)
+        if not self.joined(net, who.get("id")):
+            return self.join_prompt(net, chat)
+        self.tickets_menu(net, chat, uid, "", None)
+
     # phone number ---------------------------------------------------------------------
     def need_phone(self, uid):
         return bool(self.app.cfg.get("shop_phone")) and not self.user(uid).get("phone")
@@ -8897,7 +8926,7 @@ class Shop:
         cmd, _, arg = text.partition(" ")
         if cmd.split("@")[0].lower() in ("/start", "/menu", "/shop"):
             self.wait.pop(cid, None)
-            if SUB_RE.search(arg.strip()) and arg.strip().startswith("s_"):
+            if SUB_RE.search(arg.strip()) and arg.strip().startswith(("s_", "t_")):
                 return False  # one-tap link from the user page: the bot links it
             self.on_start(net, chat, who, arg.strip())
             return True
@@ -9116,8 +9145,8 @@ class Shop:
                                                               [("🎫 تیکت‌ها", "tk"), ("🏠 منو", "m")]], msg)
         mine = [t for t in self.d["tickets"] if t["uid"] == uid][-10:][::-1]
         rows = [[("➕ تیکت جدید", "tk:new", "success")]] + [[("%s #%s · %s" % (self.TK[t["status"]].split()[0], fa_num(t["id"]), t["subject"][:28]), "tk:%s" % t["id"])] for t in mine]
-        sup = self.app.cfg.get("support_url")
-        if sup and sup.startswith("http"):
+        sup = support_link(self.app.cfg)
+        if sup.startswith("http"):
             rows.append([("💬 پیام مستقیم به پشتیبان", sup)])
         rows.append(self.back())
         self.show(net, chat, "🎫 <b>پشتیبانی</b>\nسؤال یا مشکلت رو با یه تیکت بفرست؛ جواب همین‌جا میاد." + ("" if mine else "\n\nهنوز تیکتی نداری."), rows, msg)
@@ -9351,7 +9380,7 @@ class Shop:
             o["reason"] = reason
             self.give_code_back(o)
             self.save()
-            sup = self.app.cfg.get("support_url")
+            sup = support_link(self.app.cfg)
             self.show(o["net"], o["chat"], "❌ رسید سفارش #%s تأیید نشد.%s\n\nاگه فکر می‌کنی اشتباه شده با پشتیبانی در تماس باش%s" % (
                 fa_num(o["id"]), "\nدلیل: " + self.esc(reason) if reason else "", ":\n" + self.esc(sup) if sup else "."), [[("🏠 منو", "m")]])
             res = "❌ رد شد"
@@ -9485,7 +9514,7 @@ class Shop:
             return self.show(net, chat, "👥 <b>دعوت دوستان</b>\n\nدوستت با لینک زیر وارد ربات بشه، از اولین خریدش <b>%s٪</b> به کیف پولت اضافه می‌شه.\n\n<code>%s</code>\n\n👤 دعوت‌شده‌ها: %s\n💰 درآمد تا الان: %s" % (
                 fa_num(_int(self.app.cfg.get("shop_ref"))), self.esc(link), fa_num(invited), toman(u.get("ref_earned", 0))), [self.back()], mid)
         if head == "help":
-            return self.show(net, chat, "💬 پشتیبانی: %s" % self.esc(self.app.cfg.get("support_url", "")), [self.back()], mid)
+            return self.show(net, chat, "💬 پشتیبانی: %s" % self.esc(support_link(self.app.cfg)), [self.back()], mid)
         if head == "guide":
             g = self.app.cfg.get("shop_help") or ("📚 <b>راهنمای اتصال</b>\n\n1️⃣ اپ <b>Happ</b> (اندروید و آیفون) یا v2rayNG رو نصب کن.\n"
                                                   "2️⃣ از «📦 سرویس‌های من» لینک اشتراک رو کپی کن.\n3️⃣ توی اپ «+» بزن و «از کلیپ‌بورد» رو انتخاب کن.\n"
@@ -9532,7 +9561,7 @@ class Shop:
                 "codes": any(c.get("kind") == "discount" for c in self.d["codes"]), "cards": bool(self.cards()),
                 "ref": {"pct": _int(cfg.get("shop_ref")), "link": "https://t.me/%s?start=r_%s" % (me, uid.split(":", 1)[1]) if me else "",
                         "invited": sum(1 for x in self.d["users"].values() if x.get("ref") == uid), "earned": u.get("ref_earned", 0)},
-                "support": cfg.get("support_url", ""), "guide": cfg.get("shop_help") or "",
+                "support": support_link(cfg), "guide": cfg.get("shop_help") or "",
                 "orders": [{"id": o["id"], "kind": o["kind"], "plan": o["plan_name"], "total": self.total(o), "status": o["status"], "at": o["at"]}
                            for o in self.d["orders"] if o["uid"] == uid][-10:][::-1]}
 
@@ -10507,7 +10536,7 @@ def user_info(app, sub):
         "decos": max(0, len(active_routes(apply_view(routes(rt, UPSTREAMS.nodes()), view))) - 1),
         "history": [{"day": d, "bytes": b} for d, b in hist],
         "history_since": int(started * 1000),
-        "support": cfg.get("support_url", ""),
+        "support": support_link(cfg),
         "bot": (app.bot.me.get("tg") or {}).get("username", "") if "tg" in app.bot.nets() else "",
         "announce": cfg.get("announce", ""),
         "now": int(time.time() * 1000),
@@ -10708,7 +10737,7 @@ function render(){
    <details open><summary>چطور وصل شم؟</summary><ol><li>اپ <b>Happ</b> (یا یکی دیگه از اپ‌های بالا) رو نصب کن.</li><li>دکمه‌ی «افزودن» رو بزن؛ اگه باز نشد، لینک رو کپی کن و در اپ به‌عنوان Subscription اضافه کن.</li><li>گزینه‌ی <b>⚡ Auto</b> رو انتخاب کن و وصل شو.</li></ol></details>
    <details><summary>وصل نمی‌شه؟</summary><ol><li>توی اپ، اشتراک رو آپدیت کن (Update subscription).</li><li>گزینه‌ی Auto یا یکی دیگه از کانفیگ‌ها رو امتحان کن.</li><li>اگه حجم یا زمانت تموم شده، برای تمدید پیام بده.</li></ol></details>
    <details><summary>تمدید کنم چی می‌شه؟</summary><p>لینکت عوض نمی‌شه. بعد از تمدید فقط اشتراک رو توی اپ آپدیت کن.</p></details>
-   ${D.support?`<a class="btn block" style="margin-top:10px" href="${esc(D.support)}" target="_blank" rel="noopener">${ic("chat")} پشتیبانی و تمدید</a>`:""}
+   ${D.bot||D.support?`<a class="btn block" style="margin-top:10px" href="${D.bot?`https://t.me/${esc(D.bot)}?start=t_${esc(location.pathname.split("/").filter(Boolean).pop())}`:esc(D.support)}" target="_blank" rel="noopener">${ic("chat")} پشتیبانی و تمدید</a>`:""}
    ${D.bot?`<a class="btn ghost block" style="margin-top:8px" href="https://t.me/${esc(D.bot)}?start=s_${esc(location.pathname.split("/").filter(Boolean).pop())}" target="_blank" rel="noopener">${ic("bell")} یادآوری تمدید توی تلگرام</a>`:""}</div>
   <div class="foot">آخرین به‌روزرسانی: ${jdate(D.now,{hour:"2-digit",minute:"2-digit"})}</div>`;
   requestAnimationFrame(()=>{const v=$("#ringv");if(v)v.style.strokeDashoffset=D.total?C*(1-Math.max(0,100-pct)/100):0});
