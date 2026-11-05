@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.22.0"
+VERSION = "5.23.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -138,6 +138,9 @@ DEFAULTS = {
     "shop_custom_max": "500,365",  # largest custom plan "GB,days"
     "shop_channel_on": True,    # make customers join shop_channel first
     "shop_phone": False,        # ask customers for their phone number before anything else
+    "sms_on": False,            # approve card payments from the bank's deposit SMS (forwarded to /sms/<sms_token>)
+    "sms_token": "",            # secret part of that address (made when sms_on is turned on)
+    "sms_senders": "",          # only SMS from these numbers (comma separated); empty = any
     "shop_phone_ir": False,     # ... and accept only Iranian numbers
     "tg_enable": True,          # Telegram alerts
     "tg_token": "",             # empty = the 3x-ui panel's own Telegram bot
@@ -4731,7 +4734,8 @@ def admin_state(app, host):
         "shop_cfg": dict({k[5:]: cfg.get(k, "") for k in ("shop_cards", "shop_trial", "shop_ref", "shop_topups", "shop_channel",
                                                           "shop_inbounds", "shop_prefix", "shop_welcome", "shop_help", "shop_gb_price",
                                                           "shop_day_price", "shop_custom_max")},
-                         channel_on=bool(cfg.get("shop_channel_on", True)), phone=bool(cfg.get("shop_phone")), phone_ir=bool(cfg.get("shop_phone_ir"))),
+                         channel_on=bool(cfg.get("shop_channel_on", True)), phone=bool(cfg.get("shop_phone")), phone_ir=bool(cfg.get("shop_phone_ir")),
+                         sms_on=bool(cfg.get("sms_on")), sms_senders=cfg.get("sms_senders", ""), sms_url=sms_url(app)),
         "routes": rts,
         "cf": cf_public(cfg),
         "groups": deco_groups(cfg, ups),
@@ -4795,10 +4799,10 @@ def net_state(app):
             "iran": [s["id"] for s in net.servers() if s.get("role") == "iran"]}
 
 
-SETTING_BOOLS = ("bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
+SETTING_BOOLS = ("sms_on", "bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
                  "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable", "shop_channel_on", "shop_phone", "shop_phone_ir",
                  "brand_font_licensed")
-SETTING_TEXTS = {"brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
+SETTING_TEXTS = {"sms_senders": 200, "brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
                  "shop_welcome": 1000, "shop_help": 2000, "shop_prefix": 10, "bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
@@ -5047,6 +5051,8 @@ def do_action(app, action, body, host):
             for k in SETTING_SECRETS:
                 if k in body:
                     cfg[k] = "" if body[k] is None else (str(body[k]).strip() or cfg.get(k, ""))
+            if cfg.get("sms_on") and not cfg.get("sms_token"):
+                cfg["sms_token"] = secrets.token_urlsafe(18)
             if "bk_hours" in body:
                 cfg["bk_hours"] = min(168, max(0, _int(body["bk_hours"])))
             if "monitor_minutes" in body:
@@ -5065,6 +5071,19 @@ def do_action(app, action, body, host):
                 ok, note = app.panel.auto_connect()
                 return done(note) if ok else fail(note)
             return done("ذخیره شد")
+
+        if action == "sms_reset":
+            cfg = load_config()
+            cfg["sms_token"] = secrets.token_urlsafe(18)
+            save_config(cfg)
+            app.reload()
+            return done("آدرس جدید ساخته شد؛ توی اپ گوشی هم عوضش کن")
+
+        if action == "sms_test":
+            sh = app.bot.shop
+            amounts = sh.sms_amounts(str(body.get("text") or "")[:2000])
+            found = [{"amount": a, "orders": [o["id"] for o in sh.sms_match(a)]} for a in amounts]
+            return done("", found=found)
 
         if action == "panel_auto":
             cfg = load_config()
@@ -7090,6 +7109,22 @@ SHOPV.set=sh=>{const s=S.state.settings,c=S.state.shop_cfg||{};
    <div class="sec" style="margin:10px 2px 4px"><h3>🎛 پلن دلخواه (مشتری خودش حجم و روز رو انتخاب می‌کنه)</h3></div>
    <div class="cols2">${field("shop_gb_price","قیمت هر گیگ (تومان)",c.gb_price||"",'class="in ltr" inputmode="numeric" placeholder="10000"')}${field("shop_day_price","قیمت هر روز (تومان)",c.day_price||"",'class="in ltr" inputmode="numeric" placeholder="1000"')}</div>
    ${field("shop_custom_max","سقف (گیگ,روز)",c.custom_max||"500,365",'class="in ltr" placeholder="500,365"',"هر دو قیمت صفر = پلن دلخواه خاموش. با روشن بودنش، مشتری روی هر سرویس «➕ حجم و زمان» هم داره.")}
+   <div class="sec" style="margin:10px 2px 4px"><h3>🤖 تأیید خودکار با پیامک بانک</h3></div>
+   ${sw("sms_on",c.sms_on,"تأیید خودکار کارت به کارت","هر فاکتور یه مبلغ یکتا می‌گیره (تا ۹۹۹ تومان کمتر). پیامک واریز همون مبلغ که برسه، سفارش خودکار تأیید می‌شه.")}
+   ${c.sms_on&&c.sms_url?`<div class="f"><span>آدرس برای اپ گوشی</span><div class="in ltr" style="word-break:break-all;font-size:12px">${esc(c.sms_url)}</div>
+     <div class="bar-btns" style="margin-top:6px"><button type="button" class="btn ghost sm" data-act="sms-copy">${ic("copy")} کپی آدرس</button><button type="button" class="btn ghost sm" data-act="sms-reset">${ic("refresh")} آدرس جدید</button></div>
+     <div class="hint">این آدرس رمز داره؛ به کسی نده.</div></div>
+     <details class="note" style="margin:8px 0"><summary><b>راه‌اندازی روی گوشی (۵ دقیقه)</b></summary><ol style="margin:6px 18px 0;padding:0;line-height:2">
+       <li>روی گوشی اندرویدی که پیامک‌های بانک رو می‌گیره، اپ <b>SMS Forwarder</b> (یا هر اپ «SMS to URL / Webhook») رو نصب کن.</li>
+       <li>یه قانون جدید بساز: فرستنده = شماره‌ی بانک، روش <b>POST</b>، آدرس = آدرس بالا.</li>
+       <li>بدنه رو JSON بذار: <span class="ltr">{"from":"%from%","text":"%text%"}</span> (اسم متغیرها توی هر اپ فرق داره).</li>
+       <li>بهینه‌سازی باتری رو برای اپ خاموش کن تا همیشه کار کنه.</li>
+       <li>یه پیامک واریز قبلی رو پایین «آزمایش» کن تا مطمئن بشی مبلغ درست خونده می‌شه.</li></ol>
+       <div class="hint" style="margin-top:6px">گوشی برای فرستادن پیامک‌ها VPN نمی‌خواد (آدرس از سرور ایران رد می‌شه).</div></details>`:""}
+   ${c.sms_on?field("sms_senders","شماره‌ی فرستنده‌ی بانک (اختیاری)",c.sms_senders,'class="in ltr" placeholder="9830006060, +98999..."',"فقط پیامک این شماره‌ها قبول می‌شه؛ خالی = هر چی اپ بفرسته"):""}
+   ${c.sms_on?`<label class="f"><span>آزمایش متن پیامک</span><textarea class="in" id="smstxt" style="min-height:70px;font-family:inherit" placeholder="متن یه پیامک واریز رو اینجا بچسبون"></textarea></label>
+     <button type="button" class="btn ghost block" data-act="sms-test">${ic("check")} آزمایش (چیزی تأیید نمی‌شه)</button><div id="smsres" class="hint" style="margin-top:6px"></div>
+     ${(sh.sms_log||[]).length?`<div class="list" style="margin-top:8px">${sh.sms_log.map(l=>`<div class="row"><div class="t"><b>${l.amounts.length?l.amounts.map(a=>tmn(a)).join("، "):"—"}</b><small>${esc(l.note)} · ${new Intl.DateTimeFormat("fa-IR",{hour:"2-digit",minute:"2-digit",month:"short",day:"numeric"}).format(new Date(l.at*1000))}</small></div><div class="r">${l.orders.length?'<span class="tag">✅ '+l.orders.map(x=>"#"+fa(x)).join(" ")+'</span>':""}</div></div>`).join("")}</div>`:""}`:""}
    <div class="sec" style="margin:10px 2px 4px"><h3>🔐 ورود مشتری</h3></div>
    ${sw("shop_phone",c.phone,"اول شماره‌ی موبایل بده","با دکمه‌ی «ارسال شماره» خود تلگرام؛ شماره فقط برای تو دیده می‌شه")}
    ${sw("shop_phone_ir",c.phone_ir,"فقط شماره‌ی ایران (۹۸+)")}
@@ -7245,6 +7280,10 @@ document.addEventListener("submit",async e=>{
 
 /* actions */
 const ACTS={
+  "sms-copy":()=>copy((S.state.shop_cfg||{}).sms_url||""),
+  "sms-reset":async b=>{if(await confirmSheet("آدرس جدید","آدرس قبلی دیگه کار نمی‌کنه و باید توی اپ گوشی عوضش کنی.","بساز"))act(b,"sms_reset",{})},
+  "sms-test":async b=>{const t=($("#smstxt")||{}).value||"";const box=$("#smsres");const j=await api("sms_test",{text:t});if(!box)return;
+    box.innerHTML=!j.ok?"خطا":!j.found.length?"⚠️ مبلغ واریزی توی این متن پیدا نشد. متن رو برای پشتیبانی EZ بفرست.":j.found.map(f=>`✅ واریز <b>${tmn(f.amount)}</b>${f.orders.length?" ← سفارش "+f.orders.map(x=>"#"+fa(x)).join(" "):" (الان سفارش بازی با این مبلغ نیست)"}`).join("<br>")},
   tab:b=>{const t=b.dataset.tab;if(S.tab===t&&!$("#ov")){scrollTo({top:0,behavior:"smooth"});return}S.tab=t;S.fade=true;try{localStorage.setItem("xc_tab",S.tab)}catch(e){}closeSheet();render();scrollTo(0,0)},
   seg:b=>{S.seg=b.dataset.seg;S.tab="routes";try{localStorage.setItem("xc_seg",S.seg);localStorage.setItem("xc_tab","routes")}catch(e){}closeSheet();render()},
   theme:()=>{const dark=document.documentElement.dataset.theme==="dark";S.theme=dark?"light":"dark";try{localStorage.setItem("xc_theme",S.theme)}catch(e){}applyTheme();render()},
@@ -7659,6 +7698,13 @@ def bot_chat_ids(api, token):
 BOT_EVENTS = (("shop", "فروش: رسیدها و سفارش‌ها"), ("tickets", "تیکت‌های پشتیبانی"), ("deco", "قطع و وصل واسط‌ها و تانل‌ها"), ("quota", "حجم و زمان واسط‌ها"),
               ("users", "خلاصه‌ی روزانه‌ی کاربرهای رو به پایان"), ("backup", "خطای بکاپ"))
 BOT_NETS = {"tg": "تلگرام", "bale": "بله"}
+def sms_url(app):
+    """Where the owner's phone forwards bank SMS: the customer-facing address (reachable from Iran)."""
+    tok = app.cfg.get("sms_token")
+    base = app.bot.shop.app_url() if tok else ""
+    return base[:-len("app/")] + "sms/" + tok if base else ""
+
+
 def support_link(cfg):
     """The support link as a real URL: "t.me/x" and "@x" become https://t.me/x."""
     v = str(cfg.get("support_url") or "").strip()
@@ -8492,7 +8538,8 @@ class Shop:
                 d = json.load(f)
         except (OSError, ValueError):
             d = {}
-        for k, v in (("plans", []), ("codes", []), ("users", {}), ("orders", []), ("seq", 0), ("tickets", []), ("tseq", 0)):
+        for k, v in (("plans", []), ("codes", []), ("users", {}), ("orders", []), ("seq", 0), ("tickets", []), ("tseq", 0),
+                     ("sms_seen", {}), ("sms_log", [])):
             d.setdefault(k, v)
         return d
 
@@ -8539,7 +8586,110 @@ class Shop:
         return o
 
     def total(self, o):
-        return max(0, o["price"] - o.get("discount", 0))
+        return max(0, o["price"] - o.get("discount", 0) - o.get("cents", 0))
+
+    # automatic approval from the bank's SMS ------------------------------------------
+    # A phone forwards the bank's deposit SMS to /sms/<token>. Each card invoice gets its own amount
+    # (a few toman off), so a deposit of exactly that amount names one order, which is then approved.
+    SMS_DEPOSIT = re.compile(r"واریز|بستانکار|دریافت|افزایش|deposit|credit", re.I)
+    SMS_OUT = re.compile(r"برداشت|بدهکار|withdraw|debit", re.I)
+    SMS_NOT = re.compile(r"مانده|موجودی|کارمزد|balance|fee", re.I)
+    SMS_ID = re.compile(r"(?:حساب|کارت|شماره|پیگیری|مرجع|سند|کد|ref|acc)\W*$", re.I)
+    SMS_NUM = re.compile(r"(?<![\d,٬،/.\-])(?<!\d:)(\d{1,3}(?:[,٬،]\d{3})+|\d{4,12})(?![\d/]|:\d|[,٬،]\d)")
+
+    def sms_on(self):
+        return bool(self.app.cfg.get("sms_on") and self.app.cfg.get("sms_token"))
+
+    def sms_amounts(self, text):
+        """Deposit amounts in a bank SMS, in toman (banks write rial unless they say تومان).
+        An amount is a number on a deposit SMS (or with a +), not a balance, fee, account or card number."""
+        t = str(text or "").translate(EN_DIGITS).replace("\u200f", "").replace("\u200e", "")
+        deposit_sms = bool(self.SMS_DEPOSIT.search(t)) and not self.SMS_OUT.search(t)
+        toman_unit = "تومان" in t and "ریال" not in t
+        out = []
+        for m in self.SMS_NUM.finditer(t):
+            before, after = t[max(0, m.start() - 30):m.start()], t[m.end():m.end() + 12]
+            line = before.split("\n")[-1] + " " + after.split("\n")[0]
+            plus = before.rstrip().endswith("+") or after.lstrip().startswith("+")
+            minus = before.rstrip().endswith("-") or after.lstrip().startswith("-")
+            if minus or self.SMS_NOT.search(line) or self.SMS_ID.search(before.split("\n")[-1][-16:]):
+                continue
+            if not (plus or deposit_sms):
+                continue
+            grouped = not m.group(1).isdigit()
+            if not (grouped or plus or re.search(r"(?:واریز|مبلغ|بستانکار|افزایش)\W{0,4}$", before)):
+                continue  # a bare number is an amount only right after a deposit word
+            n = int(re.sub(r"\D", "", m.group(1)))
+            if not toman_unit:
+                if n % 10:
+                    continue
+                n //= 10
+            if n >= 1000 and n not in out:
+                out.append(n)
+        return out
+
+    def sms_match(self, amount):
+        """Open card orders waiting for exactly this amount (last 72 hours)."""
+        now = time.time()
+        return [o for o in self.d["orders"] if o.get("method") == "card" and o["status"] in ("receipt", "review")
+                and now - o["at"] < 72 * 3600 and self.total(o) == amount]
+
+    def give_cents(self, o):
+        """A few toman off, so this invoice's amount is not shared with another open one."""
+        if not self.sms_on() or o.get("cents") or o["kind"] == "topup" and o["price"] < 2000:
+            return
+        taken = {self.total(x) for x in self.d["orders"] if x is not o and x["status"] in ("new", "receipt", "review")
+                 and time.time() - x["at"] < 72 * 3600}
+        base = max(0, o["price"] - o.get("discount", 0))
+        for _ in range(200):
+            c = random.randint(1, 999)
+            if base - c > 0 and base - c not in taken:
+                o["cents"] = c
+                return
+
+    def got_sms(self, text, sender=""):
+        """One forwarded SMS. -> dict for the caller (matched order ids or why not)."""
+        text = str(text or "")[:2000]
+        senders = [x.strip().lstrip("+") for x in re.split(r"[,\s]+", str(self.app.cfg.get("sms_senders") or "")) if x.strip()]
+        if senders and str(sender).strip().lstrip("+") not in senders:
+            return {"matched": [], "note": "فرستنده توی لیست مجاز نیست"}
+        key = hashlib.sha256(text.encode()).hexdigest()[:20]
+        now = time.time()
+        with self.lock:
+            self.d["sms_seen"] = {k: t for k, t in self.d["sms_seen"].items() if now - t < 3 * 86400}
+            if key in self.d["sms_seen"]:
+                return {"matched": [], "note": "تکراری"}
+            self.d["sms_seen"][key] = now
+        amounts = self.sms_amounts(text)
+        matched, notes = [], []
+        for a in amounts:
+            os_ = self.sms_match(a)
+            if len(os_) == 1:
+                o = os_[0]
+                with self.lock:
+                    if o["status"] == "receipt":
+                        o["status"], o["receipt_kind"], o["receipt_at"] = "review", "sms", int(now)
+                    o["sms_at"] = int(now)
+                self.wait.pop("%s:%s" % (o["net"], o["chat"]), None)
+                self.review(o["id"], True, who="🤖 پیامک بانک")
+                matched.append(o["id"])
+                notes.append("سفارش #%s" % o["id"])
+                self.bot.notify_admins("shop", "🤖 واریز %s → سفارش #%s خودکار تأیید شد." % (toman(a), o["id"]))
+            elif os_:
+                notes.append("چند سفارش با یه مبلغ")
+                self.bot.notify_admins("shop", "💸 واریز %s با چند سفارش جور شد (%s)؛ خودت بررسی کن." % (
+                    toman(a), "، ".join("#%s" % o["id"] for o in os_)))
+            elif any(o.get("method") == "card" and o["status"] in ("done", "approving") and now - o["at"] < 72 * 3600
+                     and self.total(o) == a for o in self.d["orders"]):
+                notes.append("قبلاً دستی تأیید شده بود")
+            else:
+                notes.append("سفارشی با این مبلغ نیست")
+                self.bot.notify_admins("shop", "💸 واریز %s رسید ولی سفارشی با این مبلغ پیدا نشد." % toman(a))
+        with self.lock:
+            self.d["sms_log"] = (self.d["sms_log"] + [{"at": int(now), "amounts": amounts, "orders": matched,
+                                                         "note": "؛ ".join(notes) or "مبلغ واریزی پیدا نشد"}])[-30:]
+        self.save()
+        return {"matched": matched, "amounts": amounts, "note": "؛ ".join(notes) or "مبلغ واریزی پیدا نشد"}
 
     # Telegram helpers -------------------------------------------------------------
     # colour of a button from what it does: green = buy / confirm, blue = the next step, red = cancel / delete
@@ -9076,6 +9226,7 @@ class Shop:
         if o["status"] not in ("new", "receipt"):
             return self.show(net, chat, "این سفارش %s." % self.STATUS.get(o["status"]), [self.back()], msg)
         with self.lock:
+            self.give_cents(o)
             o["status"], o["method"] = "receipt", "card"
         self.save()
         self.wait["%s:%s" % (net, chat)] = {"what": "receipt", "order": o["id"]}
@@ -9092,6 +9243,12 @@ class Shop:
     def card_text(self, o):
         cards = "\n".join("💳 <code>%s</code>%s" % (re.sub(r"\D", "", c[0]), "\n👤 " + " · ".join(self.esc(x) for x in c[1:3] if x) if c[1] or c[2] else "")
                           for c in self.cards())
+        if o.get("cents"):
+            return ("%s\n\n💳 <b>کارت به کارت</b>\nدقیقاً <b>%s</b> رو به این کارت واریز کن:\n\n%s\n"
+                    "👆 روی شماره بزن تا کپی بشه.\n\n"
+                    "⚡️ با واریز <b>همین مبلغ دقیق</b>، سرویست <b>خودکار</b> فعال می‌شه (%s تومان هم تخفیف گرفتی 🎁).\n"
+                    "اگه مبلغ دیگه‌ای زدی، عکس رسید یا کد رهگیری رو همین‌جا بفرست.") % (
+                self.order_head(o), toman(self.total(o)), cards, fa_num(o["cents"]))
         return ("%s\n\n💳 <b>کارت به کارت</b>\nمبلغ <b>%s</b> رو به این کارت واریز کن:\n\n%s\n"
                 "👆 روی شماره بزن تا کپی بشه.\n\n"
                 "📸 بعد از واریز، <b>عکس رسید</b> یا <b>کد رهگیری</b> رو همین‌جا بفرست؛ بعد از تأیید، خودکار فعال می‌شه.") % (
@@ -9104,7 +9261,7 @@ class Shop:
             for c in cards[:3]:
                 num = re.sub(r"\D", "", c[0])
                 rows.append([("📋 کپی شماره کارت" + (" …%s" % num[-4:] if len(cards) > 1 else ""), "copy:" + num, "primary")])
-            rows.append([("📋 کپی مبلغ (تومان)", "copy:%d" % self.total(o))])
+            rows.append([("📋 کپی مبلغ: %s تومان" % fa_num("{:,}".format(self.total(o))).replace(",", "٬"), "copy:%d" % self.total(o))])
         return rows + [[("✖️ انصراف", "x:%s" % o["id"])]]
 
     # actions ----------------------------------------------------------------------
@@ -9969,10 +10126,12 @@ class Shop:
         if action == "card":
             if o["status"] not in ("new", "receipt") or not self.cards():
                 return False, {"error": "این فاکتور دیگه قابل پرداخت نیست"}
-            o["status"], o["method"] = "receipt", "card"
+            with self.lock:
+                self.give_cents(o)
+                o["status"], o["method"] = "receipt", "card"
             self.save()
             self.wait["tg:%s" % chat] = {"what": "receipt", "order": o["id"]}
-            self.show(net, chat, self.card_text(o), [[("✖️ انصراف", "x:%s" % o["id"])]])
+            self.show(net, chat, self.card_text(o), self.card_rows(o, net))
             return True, {"cards": [{"number": c[0], "holder": c[1], "bank": c[2]} for c in self.cards()], "total": self.total(o)}
         if action == "trial":
             err, sub = self.make_trial(uid, net, chat)
@@ -9992,7 +10151,7 @@ class Shop:
         done = [o for o in self.d["orders"] if o["status"] == "done" and o["kind"] != "topup"]
         sales = lambda since: sum(self.total(o) for o in done if o.get("done_at", o["at"]) >= since)
         users = self.d["users"]
-        return {"enable": self.on(), "plans": self.d["plans"], "codes": [dict(c, used=len(c.get("used_by") or []), used_by=None) for c in self.d["codes"]],
+        return {"enable": self.on(), "sms_log": self.d["sms_log"][::-1][:15], "plans": self.d["plans"], "codes": [dict(c, used=len(c.get("used_by") or []), used_by=None) for c in self.d["codes"]],
                 "orders": [dict(o, admin_msgs=None, receipt=None, total=self.total(o), name=(users.get(o["uid"]) or {}).get("name", ""),
                                 username=(users.get(o["uid"]) or {}).get("username", "")) for o in self.d["orders"][-150:]][::-1],
                 "stats": {"today": sales(day0), "month": sales(now - 30 * 86400), "orders_today": sum(1 for o in done if o.get("done_at", o["at"]) >= day0),
@@ -11176,6 +11335,8 @@ def make_handler(app):
             u, parts = self.route()
             if parts == ["app"]:
                 return self.send(200, branded(APP_HTML, app.cfg, "app"), APP_HEADERS)
+            if len(parts) == 2 and parts[0] == "sms":
+                return self.sms(parts, u)
             if len(parts) == 2 and parts[0] == "brand" and brand_file(parts[1]):
                 return self.brand(parts[1])
             if len(parts) == 2 and parts[0] == app.cfg["sub_path"]:
@@ -11233,8 +11394,41 @@ def make_handler(app):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        def sms(self, parts, u, raw=b""):
+            """A bank SMS forwarded by the shop owner's phone (POST JSON/form/plain text, or GET ?text=)."""
+            tok = str(app.cfg.get("sms_token") or "")
+            if not (app.cfg.get("sms_on") and tok and hmac.compare_digest(parts[1].encode(), tok.encode())):
+                time.sleep(0.5)
+                return self.send(404, "404 page not found\n")
+            fields = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+            ctype = (self.headers.get("Content-Type") or "").lower()
+            if raw:
+                try:
+                    if "json" in ctype or raw.lstrip().startswith(b"{"):
+                        j = json.loads(raw.decode("utf-8", "replace"))
+                        if isinstance(j, dict):
+                            fields.update({str(k).lower(): v for k, v in j.items()})
+                    elif "form-urlencoded" in ctype:
+                        fields.update({k.lower(): v[0] for k, v in urllib.parse.parse_qs(raw.decode("utf-8", "replace")).items()})
+                    else:
+                        fields["text"] = raw.decode("utf-8", "replace")
+                except ValueError:
+                    fields["text"] = raw.decode("utf-8", "replace")
+            text = next((str(fields[k]) for k in ("text", "message", "msg", "body", "content", "sms") if fields.get(k)), "")
+            sender = next((str(fields[k]) for k in ("from", "sender", "number", "phone", "address") if fields.get(k)), "")
+            if not text:
+                return self.json(200, {"ok": True, "note": "empty"})
+            try:
+                out = app.bot.shop.got_sms(text, sender)
+            except Exception as e:
+                print("sms: %s" % e, flush=True)
+                return self.json(500, {"ok": False})
+            return self.json(200, dict(out, ok=True))
+
         def do_POST(self):
             u, parts = self.route()
+            if len(parts) == 2 and parts[0] == "sms":
+                return self.sms(parts, u, self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 16384)))
             if parts == ["app", "api"]:  # the mini app, signed by Telegram
                 try:
                     body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536)).decode("utf-8") or "{}")

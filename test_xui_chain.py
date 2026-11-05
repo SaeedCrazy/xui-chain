@@ -690,6 +690,28 @@ class EndToEnd(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, dict(e.headers), e.read().decode()
 
+    def test_sms_address(self):
+        cfg = xc.load_config()
+        cfg.update(sms_on=True, sms_token="tok123secret")
+        xc.save_config(cfg)
+        self.app.reload()
+        try:
+            self.assertEqual(self.get("/sms/wrong", data=b"x")[0], 404)
+            status, _, body = self.get("/sms/tok123secret", data=json.dumps({"from": "999", "text": "واریز: 1,000,000"}).encode())
+            self.assertEqual(status, 200)
+            j = json.loads(body)
+            self.assertEqual((j["ok"], j["amounts"], j["matched"]), (True, [100000], []))
+            status, _, body = self.get("/sms/tok123secret?" + urllib.parse.urlencode({"text": "+2,000,000"}))
+            self.assertEqual(json.loads(body)["amounts"], [200000])
+            cfg["sms_on"] = False
+            xc.save_config(cfg)
+            self.app.reload()
+            self.assertEqual(self.get("/sms/tok123secret", data=b"x")[0], 404)  # off: no address
+        finally:
+            cfg.update(sms_on=False, sms_token="")
+            xc.save_config(cfg)
+            self.app.reload()
+
     def test_auto_detects_panel_sub(self):
         self.assertEqual(self.app.rt["xui_sub_url"], "http://127.0.0.1:%d/s3cret/" % self.panel.server_address[1])
 
@@ -2068,6 +2090,40 @@ class ShopTests(BotBase):
         self.say(988, "۱۲۳۴۵۶۷۸")
         self.assertEqual((o["status"], o["receipt_kind"], o["receipt_code"]), ("review", "code", "12345678"))
         self.assertIn("رسیدت رسید", BotAPI.sent[-1]["text"])
+
+    def test_bank_sms_approves_the_exact_amount(self):
+        cfg = xc.load_config()
+        cfg.update(sms_on=True, sms_token="t0k")
+        xc.save_config(cfg)
+        self.app.reload()
+        self.tap(989, "bp:p30")
+        o = self.shop.d["orders"][-1]
+        self.assertTrue(1 <= o.get("cents", 0) <= 999)
+        total = self.shop.total(o)
+        self.assertEqual(total, 150000 - o["cents"])
+        page = BotAPI.sent[-1]["text"]
+        self.assertIn("دقیقاً", page)
+        self.assertIn('"copy_text": {"text": "%d"}' % total, json.dumps(BotAPI.sent[-1]["reply_markup"]))
+        self.tap(990, "bp:p30")
+        o2 = self.shop.d["orders"][-1]
+        self.assertNotEqual(self.shop.total(o2), total)  # every open invoice has its own amount
+        # another amount, a withdrawal and a balance line approve nothing
+        self.assertEqual(self.shop.got_sms("برداشت: %s\nمانده: %s" % ("{:,}".format(total * 10), "{:,}".format(total * 10)))["matched"], [])
+        self.assertEqual(self.shop.got_sms("واریز: 1,000,000")["matched"], [])
+        self.assertEqual(o["status"], "receipt")
+        sms = "بانک پارسیان\nواریز: %s\nحساب: 47001234567\nمانده: 25,400,000\n1403/08/15-12:30" % "{:,}".format(total * 10)
+        BotAPI.sent = []
+        self.assertEqual(self.shop.got_sms(sms)["matched"], [o["id"]])
+        self.assertEqual(o["status"], "done")
+        self.assertEqual(self.panel.added[-1][:3], ("tg989", 30, 30))
+        self.assertTrue(any("آماده" in (m.get("text") or "") and str(m["chat_id"]) == "989" for m in BotAPI.sent))
+        self.assertEqual(self.shop.got_sms(sms)["note"], "تکراری")  # the same SMS twice counts once
+        self.assertEqual(o2["status"], "receipt")
+        self.assertEqual(self.shop.got_sms("+%s" % "{:,}".format(self.shop.total(o2) * 10), sender="999")["matched"], [o2["id"]])
+        cfg["sms_senders"] = "9830006060"
+        xc.save_config(cfg)
+        self.app.reload()
+        self.assertIn("مجاز", self.shop.got_sms("واریز: 5,000,000", sender="12345")["note"])
 
     def test_support_button_links_sub_and_opens_tickets(self):
         out = self.say(986, "/start t_sarasub12345")  # "support" on the user page
