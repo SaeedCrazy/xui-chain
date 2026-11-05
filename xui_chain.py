@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.18.1"
+VERSION = "5.18.2"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -130,6 +130,7 @@ DEFAULTS = {
     "shop_help": "",
     "shop_prefix": "tg",        # client names: <prefix><telegram id>
     "brand_color": "",          # brand colours for the customer pages and the mini app (#rrggbb)
+    "brand_banner_url": "",     # banner above the bot's menu when the panel is not on port 443 (an https link)
     "brand_accent": "",
     "shop_gb_price": 0,         # custom plans: Toman per GB (0 = no custom plans)
     "shop_day_price": 0,        # ... and per day
@@ -4794,7 +4795,7 @@ def net_state(app):
 
 SETTING_BOOLS = ("bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
                  "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable", "shop_channel_on", "shop_phone", "shop_phone_ir")
-SETTING_TEXTS = {"brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
+SETTING_TEXTS = {"brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
                  "shop_welcome": 1000, "shop_help": 2000, "shop_prefix": 10, "bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
@@ -8426,10 +8427,14 @@ class Shop:
         return base[:-len(self.app.rt["sub_path"]) - 1] + "app/"
 
     def banner_url(self):
-        """The brand banner as a link Telegram can preview above a message; "" when there is none."""
+        """The brand banner as a link Telegram can preview above a message; "" when there is none.
+        Telegram previews only links on the standard port, so a panel on another port needs brand_banner_url."""
+        url = str(self.app.cfg.get("brand_banner_url") or "").strip()
+        if url.startswith("https://"):
+            return url
         p = brand_file("banner.png")
         base = self.app_url()
-        if not (p and base):
+        if not (p and base) or not re.match(r"https://[^/:]+/", base):
             return ""
         return base[:-len("app/")] + "brand/banner.png?v=%d" % int(os.path.getmtime(p))
 
