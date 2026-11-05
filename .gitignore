@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+*.ttf
+*.otf
+*.woff
+*.woff2

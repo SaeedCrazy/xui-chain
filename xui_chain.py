@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.18.2"
+VERSION = "5.19.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -131,6 +131,7 @@ DEFAULTS = {
     "shop_prefix": "tg",        # client names: <prefix><telegram id>
     "brand_color": "",          # brand colours for the customer pages and the mini app (#rrggbb)
     "brand_banner_url": "",     # banner above the bot's menu when the panel is not on port 443 (an https link)
+    "brand_font_licensed": False,  # serve <conf>/brand/display.ttf to customers (only with a web licence for the font)
     "brand_accent": "",
     "shop_gb_price": 0,         # custom plans: Toman per GB (0 = no custom plans)
     "shop_day_price": 0,        # ... and per day
@@ -4794,7 +4795,8 @@ def net_state(app):
 
 
 SETTING_BOOLS = ("bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
-                 "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable", "shop_channel_on", "shop_phone", "shop_phone_ir")
+                 "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable", "shop_channel_on", "shop_phone", "shop_phone_ir",
+                 "brand_font_licensed")
 SETTING_TEXTS = {"brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
                  "shop_welcome": 1000, "shop_help": 2000, "shop_prefix": 10, "bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
@@ -8276,12 +8278,15 @@ def shop_path():
     return conf_path("shop.json")
 
 
-BRAND_FILES = ("mark.svg", "avatar-640.png", "banner.png", "banner.svg")
+BRAND_FILES = ("mark.svg", "mark.png", "avatar-640.png", "banner.png", "banner.svg", "display.ttf")
 
 
 def brand_file(name):
-    """A brand asset placed in <conf>/brand (logo, banner); "" when there is none."""
+    """A brand asset placed in <conf>/brand (logo, banner); "" when there is none. A display font
+    (display.ttf) is only ever served when brand_font_licensed says its licence covers the web."""
     p = conf_path(os.path.join("brand", name))
+    if name == "display.ttf" and not load_config().get("brand_font_licensed"):
+        return ""
     return p if name in BRAND_FILES and os.path.isfile(p) else ""
 
 
@@ -8294,9 +8299,56 @@ def brand_css(cfg):
     return "<style>:root{--brand:%s;--brand2:%s}</style>" % (c1, c2)
 
 
-def branded(page, cfg):
+GLASS_BASE = """<style>
+:root{--g-bg:#060B18;--g-fg:#F8FAFC;--g-mut:#94A3B8;--g-line:rgba(255,255,255,.13);--g-fill:linear-gradient(135deg,rgba(255,255,255,.11),rgba(255,255,255,.035));
+--g-cta:linear-gradient(90deg,#5EEAD4,var(--brand,#38BDF8) 55%,#A78BFA);--g-glow:0 10px 28px color-mix(in srgb,var(--brand,#38BDF8) 38%,transparent);
+--font-display:{{display}}}
+{{face}}
+html,body{background:var(--g-bg)!important;color:var(--g-fg)}
+body:before{content:"";position:fixed;inset:-25%;z-index:-1;pointer-events:none;filter:blur(36px);
+ background:radial-gradient(38% 32% at 12% 8%,rgba(139,92,246,.42),transparent 70%),radial-gradient(42% 36% at 92% 26%,color-mix(in srgb,var(--brand,#38BDF8) 42%,transparent),transparent 70%),
+ radial-gradient(48% 38% at 50% 104%,rgba(94,234,212,.22),transparent 70%)}
+</style>"""
+
+GLASS_APP = """<style>
+:root{--bg:transparent;--sec:rgba(255,255,255,.06);--card:rgba(255,255,255,.06);--fg:var(--g-fg);--mut:var(--g-mut);--line:var(--g-line);--acc:var(--brand,#38BDF8);--acct:#060B18}
+.card,.plan,.chip,.stepper,.link,.in input,.cardbox{background:var(--g-fill)!important;border:1px solid var(--g-line);-webkit-backdrop-filter:blur(18px) saturate(150%);backdrop-filter:blur(18px) saturate(150%);box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}
+.sheet .in{background:rgba(9,15,34,.82);-webkit-backdrop-filter:blur(24px);backdrop-filter:blur(24px);border-top:1px solid var(--g-line)}
+.hero{background:linear-gradient(135deg,rgba(94,234,212,.30),color-mix(in srgb,var(--brand,#38BDF8) 28%,transparent) 50%,rgba(139,92,246,.40))!important;border:1px solid rgba(255,255,255,.2);-webkit-backdrop-filter:blur(22px);backdrop-filter:blur(22px);box-shadow:var(--g-glow)!important}
+.hero .acts button{background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22)}
+.btn{background:var(--g-cta)!important;color:#060B18!important;box-shadow:var(--g-glow),inset 0 1px 0 rgba(255,255,255,.55);border-radius:999px}
+.btn.ghost{background:rgba(255,255,255,.07)!important;color:var(--g-fg)!important;border:1px solid var(--g-line);box-shadow:none}
+.plan .pr{color:#7DD3FC}.plan:after{background:color-mix(in srgb,var(--brand,#38BDF8) 16%,transparent)}
+.tabs{background:rgba(6,11,24,.55)!important;-webkit-backdrop-filter:blur(22px);backdrop-filter:blur(22px);border-top:1px solid var(--g-line)}
+.tabs button.on{color:#7DD3FC}.bar i{background:linear-gradient(90deg,#5EEAD4,var(--brand,#38BDF8),#A78BFA)!important}
+.stepper button{background:rgba(255,255,255,.08);color:#7DD3FC;border:1px solid var(--g-line)}
+.brandbar span,.hero .w,.plan .gb,h2,.sheet h3,.total b{font-family:var(--font-display)}
+.brandbar img{box-shadow:0 6px 20px color-mix(in srgb,var(--brand,#38BDF8) 40%,transparent)}
+</style>"""
+
+GLASS_USER = """<style>
+:root,:root[data-theme=light]{--bg:#060B18;--bg2:rgba(255,255,255,.05);--card:rgba(255,255,255,.06);--card2:rgba(255,255,255,.08);--line:var(--g-line);--fg:var(--g-fg);--mut:var(--g-mut);color-scheme:dark}
+.card,.tile,.ibtn,.linkbox,.chip,.tabs button{background:var(--g-fill)!important;border:1px solid var(--g-line)!important;-webkit-backdrop-filter:blur(18px) saturate(150%);backdrop-filter:blur(18px) saturate(150%)}
+.hero{background:linear-gradient(135deg,rgba(94,234,212,.24),color-mix(in srgb,var(--brand,#38BDF8) 22%,transparent) 50%,rgba(139,92,246,.32))!important;box-shadow:var(--g-glow)}
+.btn{background:var(--g-cta)!important;color:#060B18!important;box-shadow:var(--g-glow),inset 0 1px 0 rgba(255,255,255,.55);border-radius:999px}
+.btn.ghost{background:rgba(255,255,255,.07)!important;color:var(--g-fg)!important;border:1px solid var(--g-line);box-shadow:none}
+.brand span,.ring .c b,.tile .v,.card h2{font-family:var(--font-display)}
+</style>"""
+
+
+def glass_css(cfg, kind):
+    """The brand's liquid-glass look for the mini app ("app") or the subscription page ("user")."""
+    if not brand_css(cfg):
+        return ""
+    licensed = cfg.get("brand_font_licensed") and brand_file("display.ttf")
+    face = "@font-face{font-family:BrandDisplay;src:url(/brand/display.ttf) format('truetype');font-display:swap}" if licensed else ""
+    display = "BrandDisplay,Vazirmatn,system-ui,sans-serif" if licensed else "Vazirmatn,system-ui,sans-serif"
+    return GLASS_BASE.replace("{{display}}", display).replace("{{face}}", face) + (GLASS_APP if kind == "app" else GLASS_USER)
+
+
+def branded(page, cfg, kind="user"):
     """Customer pages with the brand: its colours and, when there is one, its logo instead of the EZ badge."""
-    page = page.replace("</head>", brand_css(cfg) + "</head>", 1)
+    page = page.replace("</head>", brand_css(cfg) + glass_css(cfg, kind) + "</head>", 1)
     if brand_file("mark.svg"):
         page = page.replace('<div class="logo">EZ</div>', '<img class="logo" src="/brand/mark.svg" alt="">')
     return page
@@ -10272,7 +10324,7 @@ function svcCard(x,i){const d=days(x),p=x.total?Math.max(0,1-x.used/x.total):1;
    <div class="meta"><span>${x.total?`${gb(x.total-x.used)} از ${gb(x.total)} گیگ`:"حجم نامحدود"}</span><span>${d===null?(x.expiry<0?"از اولین اتصال":"بدون محدودیت"):d?fa(d)+" روز مانده":"منقضی"}</span></div>
    <div class="row2"><button class="btn" onclick="renew(${q(x.sub)})">🔄 تمدید</button>${D.custom?`<button class="btn ghost" onclick="builderSheet('addon',${q(x.sub)})">➕ حجم و زمان</button>`:D.traffic.length?`<button class="btn ghost" onclick="traffic(${q(x.sub)})">➕ حجم</button>`:""}<button class="btn ghost" onclick="linkSheet(${i})">🔗</button></div></div>`}
 V.home=()=>{const n=(D.name||"").split(" ")[0];
-  return `<div class="brandbar"><img src="/brand/mark.svg" alt="" onerror="this.remove()"><span>${esc(D.title)}</span></div><div class="hero"><div class="hi">سلام ${esc(n)} 👋</div><div class="w">${tm(D.wallet)} <span style="font-size:14px;font-weight:600">تومان</span></div><div class="k">موجودی کیف پول</div>
+  return `<div class="brandbar"><img src="/brand/mark.png" alt="" onerror="this.src='/brand/mark.svg';this.onerror=()=>this.remove()"><span>${esc(D.title)}</span></div><div class="hero"><div class="hi">سلام ${esc(n)} 👋</div><div class="w">${tm(D.wallet)} <span style="font-size:14px;font-weight:600">تومان</span></div><div class="k">موجودی کیف پول</div>
    <div class="acts"><button onclick="go('buy')">🛍 خرید</button><button onclick="showStatus()">📡 سرورها</button><button onclick="go('wallet')">➕ شارژ</button>${D.trial?`<button onclick="trial()">🎁 تست</button>`:""}</div></div>
    <h2>سرویس‌های من <small>${fa(D.services.length)}</small></h2>
    ${D.services.length?D.services.map(svcCard).join(""):`<div class="card empty"><span class="e">📦</span>هنوز سرویسی نداری<div style="height:10px"></div><button class="btn" onclick="go('buy')">🛍 خرید اولین سرویس</button></div>`}`};
@@ -10756,7 +10808,7 @@ def make_handler(app):
         def do_GET(self):
             u, parts = self.route()
             if parts == ["app"]:
-                return self.send(200, branded(APP_HTML, app.cfg), APP_HEADERS)
+                return self.send(200, branded(APP_HTML, app.cfg, "app"), APP_HEADERS)
             if len(parts) == 2 and parts[0] == "brand" and brand_file(parts[1]):
                 return self.brand(parts[1])
             if len(parts) == 2 and parts[0] == app.cfg["sub_path"]:
@@ -10786,14 +10838,18 @@ def make_handler(app):
                     self.send_header("Location", "/%s/" % parts[0])
                     self.end_headers()
                     return
-                return self.send(200, ADMIN_HTML, ADMIN_HEADERS)
+                acc = app.cfg.get("brand_color") or ""
+                page = ADMIN_HTML.replace("</head>", "<style>:root,:root[data-theme=light]{--acc:%s}</style></head>" % acc, 1) \
+                    if re.fullmatch(r"#[0-9a-fA-F]{6}", acc) else ADMIN_HTML
+                return self.send(200, page, ADMIN_HEADERS)
             self.send(404, "404 page not found\n")
 
         def brand(self, name, body=True):
             with open(brand_file(name), "rb") as f:
                 data = f.read()
             self.send_response(200)
-            for k, v in (("Content-Type", "image/svg+xml" if name.endswith(".svg") else "image/png"),
+            ctype = {"svg": "image/svg+xml", "png": "image/png", "ttf": "font/ttf"}[name.rsplit(".", 1)[1]]
+            for k, v in (("Content-Type", ctype),
                          ("Cache-Control", "public, max-age=3600"), ("Content-Length", str(len(data))),
                          ("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")):
                 self.send_header(k, v)

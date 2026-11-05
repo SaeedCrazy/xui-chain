@@ -743,6 +743,19 @@ class EndToEnd(unittest.TestCase):
             self.assertIn('src="/brand/mark.svg"', page)
             self.assertIn("--brand:#38BDF8", page)
             self.assertIn("--brand:#38BDF8", self.get("/app/")[2])
+            self.assertIn("backdrop-filter", self.get("/app/")[2])  # the liquid-glass look comes with the brand colours
+            with open(os.path.join(d, "display.ttf"), "wb") as f:
+                f.write(b"font")
+            self.assertEqual(self.get("/brand/display.ttf")[0], 404)  # a licensed font never leaves without a web licence
+            self.assertNotIn("BrandDisplay", self.get("/app/")[2])
+            cfg2 = xc.load_config()
+            cfg2["brand_font_licensed"] = True
+            xc.save_config(cfg2)
+            self.app.reload()
+            self.assertEqual(self.get("/brand/display.ttf")[0], 200)
+            self.assertIn("BrandDisplay", self.get("/app/")[2])
+            os.remove(os.path.join(d, "display.ttf"))
+            cfg.update(brand_font_licensed=False)
         finally:
             os.remove(os.path.join(d, "mark.svg"))
             cfg.update(brand_color="", brand_accent="")
