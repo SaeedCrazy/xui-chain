@@ -14,6 +14,7 @@ Standard library only. Python 3.8+.
 """
 
 import base64
+import concurrent.futures
 import http.cookies
 import glob
 import hashlib
@@ -46,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.17.0"
+VERSION = "5.17.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -7676,6 +7677,11 @@ class Bot:
         self.lock = threading.RLock()
         self.me = {}        # net -> {"username", "error"}
         self.threads = {}
+        self.gen = {}         # net -> reader generation (a replaced reader stops itself)
+        self.last_poll = {}   # net -> when Telegram last answered the reader
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="bot")
+        self.chat_locks = {}
+        self.users_cache, self.users_at = None, 0
         self.hits = {}  # chat -> recent update times (flood guard)
         self.st = self._load()
         self.shop = Shop(self)
@@ -7817,7 +7823,7 @@ class Bot:
 
     # customers ----------------------------------------------------------------
     def user_of(self, sub):
-        users = group_users(clients_of(self.app))
+        users = self.cached_users()
         return next((u for u in users if u.get("sub") == sub), None)
 
     def user_text(self, u, link=False):
@@ -7944,7 +7950,7 @@ class Bot:
         return reply("سلام 👋\nلینک اشتراکت رو اینجا بفرست تا قبل از تموم شدن حجم یا زمانت خبرت کنم و هر وقت خواستی مصرفت رو ببینی.")
 
     def admin_status(self):
-        users = group_users(clients_of(self.app))
+        users = self.cached_users()
         now = time.time() * 1000
         act = [u for u in users if u["enable"] and not (u["expiry"] > 0 and u["expiry"] < now) and not (u["total"] and u["used"] >= u["total"])]
         soon = [u for u in act if (u["expiry"] > 0 and u["expiry"] - now < 3 * 86400000) or (u["total"] and u["used"] / u["total"] >= .9)]
@@ -7960,7 +7966,7 @@ class Bot:
     def admin_user(self, q):
         if not q:
             return "اسم کاربر رو بعد از /user بنویس."
-        users = group_users(clients_of(self.app))
+        users = self.cached_users()
         hits = [u for u in users if q.lower() in u["name"].lower()]
         if not hits:
             return "کاربری با این اسم نیست."
@@ -7979,8 +7985,20 @@ class Bot:
             self.me.setdefault(net, {})["error"] = str(e)[:160]
             time.sleep(15)
             return
+        self.last_poll[net] = time.time()
         for up in ups or []:
             self.st["offset"][net] = up["update_id"] + 1
+            self.pool.submit(self.dispatch, net, up)  # polling never waits for a slow answer
+        if ups:
+            self.save()
+
+    def dispatch(self, net, up):
+        """Handle one update on a worker; one chat's updates still go in order."""
+        src = up.get("message") or (up.get("callback_query") or {}).get("message") or {}
+        chat = (src.get("chat") or {}).get("id")
+        with self.lock:
+            lk = self.chat_locks.setdefault("%s:%s" % (net, chat), threading.Lock())
+        with lk:
             try:
                 if up.get("message"):
                     self.handle(net, up["message"])
@@ -7988,8 +8006,16 @@ class Bot:
                     self.on_callback(net, up["callback_query"])
             except Exception as e:  # one bad update must not stop the bot
                 print("bot %s: %s" % (net, e), flush=True)
-        if ups:
-            self.save()
+
+    def cached_users(self, ttl=10):
+        """Every customer from the panel, read at most every few seconds (each button used to read the whole DB)."""
+        now = time.time()
+        if now - self.users_at > ttl or self.users_cache is None:
+            self.users_cache, self.users_at = group_users(clients_of(self.app)), now
+        return self.users_cache
+
+    def users_changed(self):
+        self.users_at = 0
 
     FLOOD = (25, 10)  # at most this many updates per chat in this many seconds
 
@@ -8022,10 +8048,15 @@ class Bot:
         except (ValueError, OSError):
             pass
 
-    def poll_loop(self, net):
-        while net in self.nets():
-            self.poll(net)
-        self.threads.pop(net, None)
+    def poll_loop(self, net, gen):
+        while self.gen.get(net) == gen and net in self.nets():
+            try:
+                self.poll(net)
+            except Exception as e:  # never let the reader die quietly
+                print("bot poll %s: %s" % (net, e), flush=True)
+                time.sleep(5)
+        if self.gen.get(net) == gen:
+            self.threads.pop(net, None)
 
     def identify(self, net):
         try:
@@ -8040,12 +8071,21 @@ class Bot:
         except (ValueError, OSError) as e:
             self.me[net] = {"username": "", "error": str(e)[:160]}
 
+    STALE = 90  # a reader with no answer from Telegram for this long is replaced
+
     def start(self):
-        """(Re)start polling for every bot that is on; called at start and after settings change."""
+        """(Re)start polling for every bot that is on; also the watchdog for a reader that hangs."""
+        now = time.time()
         for net in self.nets():
-            if net not in self.threads:
+            t = self.threads.get(net)
+            stale = t is not None and now - self.last_poll.get(net, now) > self.STALE
+            if t is None or not t.is_alive() or stale:
+                if stale:
+                    print("bot %s: reader stuck for %ds, starting a new one" % (net, now - self.last_poll[net]), flush=True)
                 self.identify(net)
-                t = threading.Thread(target=self.poll_loop, args=(net,), daemon=True)
+                self.gen[net] = self.gen.get(net, 0) + 1
+                self.last_poll[net] = now
+                t = threading.Thread(target=self.poll_loop, args=(net, self.gen[net]), daemon=True)
                 self.threads[net] = t
                 t.start()
 
@@ -8064,7 +8104,7 @@ class Bot:
                 return 0  # quiet hours: the same notices go out once they end
         days = sorted({_int(x) for x in str(cfg.get("bot_days") or "3,1").split(",") if _int(x) > 0}, reverse=True)
         pcts = sorted({_int(x) for x in str(cfg.get("bot_pcts") or "80,95").split(",") if 0 < _int(x) < 100})
-        users = {u["sub"]: u for u in group_users(clients_of(self.app)) if u.get("sub")}
+        users = {u["sub"]: u for u in self.cached_users() if u.get("sub")}
         sent = 0
         for cid, c in list(self.st["customers"].items()):
             u = users.get(c["sub"])
@@ -8120,7 +8160,7 @@ class Bot:
         if self.st.get("daily") == day or int((now + TEHRAN) % 86400 // 3600) < 10:
             return 0
         self.st["daily"] = day
-        users = group_users(clients_of(self.app))
+        users = self.cached_users()
         ms = now * 1000
         soon = [u for u in users if u["enable"] and ((u["expiry"] > 0 and 0 < u["expiry"] - ms < 3 * 86400000) or
                                                     (u["total"] and .9 <= u["used"] / u["total"] < 1))]
@@ -8132,7 +8172,7 @@ class Bot:
 
     def broadcast(self, text, target="all", dry=False):
         """A message from the admin to linked customers. -> number of chats."""
-        users = {u["sub"]: u for u in group_users(clients_of(self.app)) if u.get("sub")}
+        users = {u["sub"]: u for u in self.cached_users() if u.get("sub")}
         ms = time.time() * 1000
         nets = self.nets()
 
@@ -8176,17 +8216,20 @@ class Bot:
             print("menu button: %s" % e, flush=True)
 
     def loop(self):
+        k = 0
         while True:
             try:
-                self.start()
-                self.menu_button()
+                self.start()  # every 30 s: the watchdog
                 self.retry()
-                self.reminders()
-                self.daily_users()
-                self.shop.cleanup()
+                if k % 10 == 0:
+                    self.menu_button()
+                    self.reminders()
+                    self.daily_users()
+                    self.shop.cleanup()
             except Exception as e:
                 print("bot loop: %s" % e, flush=True)
-            time.sleep(300)
+            k += 1
+            time.sleep(30)
 
     def public(self):
         """The bot's state for the admin page (no tokens)."""
@@ -8555,7 +8598,7 @@ class Shop:
         linked = (self.bot.st["customers"].get(cid) or {}).get("sub") if cid else None
         if linked and linked not in subs:
             subs.append(linked)
-        users = {x["sub"]: x for x in group_users(clients_of(self.app)) if x.get("sub")}
+        users = {x["sub"]: x for x in self.bot.cached_users() if x.get("sub")}
         return [(s, users.get(s)) for s in subs]
 
     def svc_menu(self, net, chat, uid, msg, renew=False):
@@ -9047,6 +9090,7 @@ class Shop:
         except Exception as e:
             self.bot.notify_admins("shop", "⚠️ ساخت تست رایگان نشد: %s" % e)
             return "الان نشد؛ چند دقیقه‌ی دیگه دوباره امتحان کن 🙏", ""
+        self.bot.users_changed()
         with self.lock:
             u["trial"] = True
             u.setdefault("subs", []).append(sub)
@@ -9108,7 +9152,7 @@ class Shop:
                 self.bot.save()
                 self.delivered(net, chat, sub, "🎉 <b>سرویست آماده‌ست!</b>\n%s" % self.esc(o["plan_name"]), msg)
             else:
-                x = next((x for x in group_users(clients_of(self.app)) if x.get("sub") == o["sub"]), None)
+                x = next((x for x in self.bot.cached_users() if x.get("sub") == o["sub"]), None)
                 if not x:
                     raise PanelError("سرویس پیدا نشد")
                 if o["kind"] == "renew":
@@ -9154,6 +9198,7 @@ class Shop:
             self.bot.notify_admins("shop", "⚠️ سفارش #%s انجام نشد و پولش به کیف پول برگشت: %s" % (o["id"], e))
             return False
         o["done_at"] = int(time.time())
+        self.bot.users_changed()
         self.reward(o)
         self.save()
         self.bot.notify_admins("shop", "🛍 %s #%s · %s · %s%s" % (self.KINDS[o["kind"]], o["id"], u.get("name") or uid,
@@ -9535,7 +9580,7 @@ class AdminBot:
         return self.sh.show(net, chat, text, rows, msg, effect)
 
     def users(self):
-        return group_users(clients_of(self.app))
+        return self.bot.cached_users()
 
     def find(self, sub):
         return next((u for u in self.users() if u.get("sub") == sub), None)
@@ -9672,6 +9717,7 @@ class AdminBot:
                 return
         except Exception as e:
             note = "⚠️ نشد: %s" % self.sh.esc(str(e)[:150])
+        self.bot.users_changed()
         self.user_card(net, chat, sub, msg, note)
 
     def receipts(self, net, chat, msg):
@@ -9857,6 +9903,7 @@ class AdminBot:
                 return "از اول شروع کن"
             try:
                 sub = self.app.panel.add_client(w["name"], w["gb"], w["days"], 0, False, self.sh.inbounds())
+                self.bot.users_changed()
             except Exception as e:
                 self.show(net, chat, "⚠️ ساخته نشد: %s" % self.sh.esc(str(e)[:160]), [[("⬅️ پنل", "a:home")]], mid)
                 return ""

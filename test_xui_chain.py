@@ -1676,6 +1676,30 @@ class BotTests(BotBase):
         self.assertEqual((self.app.rt["tg_source"], self.app.rt["tg_token_rt"]), ("bot", "1:test"))
         self.assertIn("900", self.app.rt["tg_chat_rt"])
 
+    def test_reader_watchdog_and_workers(self):
+        BotAPI.updates = [{"update_id": 500, "message": {"chat": {"id": 700}, "from": {"id": 700}, "text": "/id"}}]
+        self.bot.poll("tg")
+        self.bot.pool.shutdown(wait=True)  # the answer is sent by a worker, not the reader
+        self.bot.pool = xc.concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self.assertTrue(any("700" in m["text"] for m in BotAPI.sent))
+        self.assertEqual(self.bot.st["offset"]["tg"], 501)
+        # a reader that stopped hearing from Telegram is replaced by a fresh one
+        class Hung:
+            def is_alive(self):
+                return True
+        self.bot.threads["tg"], self.bot.gen["tg"] = Hung(), 1
+        self.bot.last_poll["tg"] = time.time() - 600
+        self.bot.identify = lambda net: None
+        started = []
+        orig = xc.threading.Thread
+        xc.threading.Thread = lambda target, args, daemon: started.append(args) or type("T", (), {"start": lambda s: None, "is_alive": lambda s: True})()
+        try:
+            self.bot.start()
+        finally:
+            xc.threading.Thread = orig
+        self.assertEqual(started, [("tg", 2)])
+        self.assertEqual(self.bot.gen["tg"], 2)  # the old reader sees a new generation and stops itself
+
     def test_failed_send_is_retried(self):
         self.bot.st["admins"]["tg:400"] = {"name": "x", "events": "all"}
         xc.TG_API = "http://127.0.0.1:9"  # nothing listens
