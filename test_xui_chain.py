@@ -1859,7 +1859,9 @@ class ShopTests(BotBase):
         inv = self.tap(500, "bp:p30")
         self.assertIn("۱۵۰٬۰۰۰ تومان", inv)
         oid = self.shop.d["orders"][-1]["id"]
-        self.assertIn("6037-1111-2222-3333", self.tap(500, "pc:%d" % oid))
+        self.assertIn("<code>6037111122223333</code>", self.tap(500, "pc:%d" % oid))
+        kb = json.dumps(BotAPI.sent[-1]["reply_markup"])
+        self.assertIn('"copy_text": {"text": "6037111122223333"}', kb)
         self.photo(500)
         o = self.shop.order(oid)
         self.assertEqual(o["status"], "review")
@@ -2009,7 +2011,7 @@ class ShopTests(BotBase):
     def test_flood_guard(self):
         for i in range(30):
             self.bot.handle("tg", {"chat": {"id": 980, "type": "private"}, "from": {"id": 980}, "text": "/start"})
-        self.assertLessEqual(sum(1 for m in BotAPI.sent if str(m.get("chat_id")) == "980"), 25)
+        self.assertLessEqual(sum(1 for m in BotAPI.sent if str(m.get("chat_id")) == "980"), 26)  # 25 + the bottom keyboard once
 
     def test_reminder_has_renew_button(self):
         self.say(985, "/start s_sarasub12345")
@@ -2044,6 +2046,26 @@ class ShopTests(BotBase):
         finally:
             os.remove(png)
 
+    def test_tracking_code_receipt_and_bottom_keyboard(self):
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 988, "type": "private"}, "from": {"id": 988}, "text": "/start"})
+        kb = [m for m in BotAPI.sent if "keyboard" in (m.get("reply_markup") or {})]
+        self.assertEqual(len(kb), 1)
+        self.assertTrue(kb[0]["reply_markup"]["is_persistent"])
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 988, "type": "private"}, "from": {"id": 988}, "text": "/start"})
+        self.assertFalse([m for m in BotAPI.sent if "keyboard" in (m.get("reply_markup") or {})])  # only once
+        self.assertIn("خرید", self.say(988, "🛒 خرید سرویس"))  # a bottom button opens its menu
+        plan = self.shop.plans()[0]
+        self.tap(988, "bp:%s" % plan["id"])
+        o = self.shop.d["orders"][-1]
+        self.tap(988, "pc:%d" % o["id"])
+        self.assertIn("کد رهگیری", self.say(988, "."))  # a stray message keeps the payment open
+        self.assertEqual(o["status"], "receipt")
+        self.say(988, "۱۲۳۴۵۶۷۸")
+        self.assertEqual((o["status"], o["receipt_kind"], o["receipt_code"]), ("review", "code", "12345678"))
+        self.assertIn("رسیدت رسید", BotAPI.sent[-1]["text"])
+
     def test_support_button_links_sub_and_opens_tickets(self):
         out = self.say(986, "/start t_sarasub12345")  # "support" on the user page
         self.assertIn("پشتیبانی", out)
@@ -2062,14 +2084,17 @@ class ShopTests(BotBase):
         self.assertIn("cbo:buy:", json.dumps(BotAPI.sent and None) + json.dumps(self.shop.kb([[("x", "cbo:buy:")]])))
         self.tap(990, "cbo:buy:")
         text = self.tap(990, "cb:g:10")      # 30 -> 40 GB
-        self.tap(990, "cb:d:-1")             # 30 -> 29 days
+        self.tap(990, "cb:d:-5")             # 30 -> 25 days
         self.assertIn("۴۰ گیگ", text)
+        labels = [b["text"] for row in BotAPI.sent[-1]["reply_markup"]["inline_keyboard"] for b in row]
+        self.assertEqual(labels[:6], ["➖ ۵", "۴۰ گیگ", "➕ ۵", "➖ ۵", "۲۵ روز", "➕ ۵"])
         self.tap(990, "cb:g:-1000")          # never below 1
         self.assertEqual(self.shop.build["tg:990"]["gb"], 1)
-        self.tap(990, "cb:g:9")              # 10 GB
+        self.tap(990, "cb:g:5")              # 1 -> 5 (whole steps)
+        self.tap(990, "cb:g:5")              # 10 GB
         self.tap(990, "cb:go")
         o = self.shop.d["orders"][-1]
-        self.assertEqual((o["kind"], o["gb"], o["days"], o["price"]), ("buy", 10, 29, 10 * 10000 + 29 * 1000))
+        self.assertEqual((o["kind"], o["gb"], o["days"], o["price"]), ("buy", 10, 25, 10 * 10000 + 25 * 1000))
         # add volume and days to an existing service
         u = self.shop.user("tg:991")
         u["wallet"], u["subs"] = 1000000, ["sarasub12345"]

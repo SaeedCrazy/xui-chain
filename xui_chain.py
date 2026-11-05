@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.20.0"
+VERSION = "5.21.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -989,6 +989,7 @@ def route_cost(r):
 
 
 FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+EN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 PERSIAN = re.compile(r"[\u0600-\u06FF]")
 
 
@@ -7140,10 +7141,11 @@ function ordSheet(o){const st=OST[o.status]||["",o.status];
    <div class="kv"><span>نوع</span><span>${OKIND[o.kind]||""}${o.plan_name?" · "+esc(o.plan_name):""}</span></div>
    <div class="kv"><span>مبلغ</span><span>${tmn(o.total)}${o.discount?` <span class="mut xs">(تخفیف ${tmn(o.discount)} با ${esc(o.code)})</span>`:""}</span></div>
    <div class="kv"><span>پرداخت</span><span>${o.method==="wallet"?"کیف پول":o.method==="card"?"کارت به کارت":"—"}</span></div>
+   ${o.receipt_code?`<div class="kv"><span>کد رهگیری</span><span class="ltr">${esc(o.receipt_code)}</span></div>`:""}
    <div class="kv"><span>زمان</span><span>${ago(o.at*1000)}</span></div>
    ${o.reviewed_by?`<div class="kv"><span>بررسی</span><span>${esc(o.reviewed_by)}</span></div>`:""}${o.error?`<div class="err">${esc(o.error)}</div>`:""}
    <div id="orc"></div>
-   <div class="bar-btns">${o.receipt_kind?`<button class="btn ghost" data-r>🖼 رسید</button>`:""}${o.status==="review"?`<button class="btn" data-ok>✅ تأیید</button><button class="btn danger" data-no>❌ رد</button>`:""}${["done","rejected"].includes(o.status)&&o.kind!=="topup"?`<button class="btn ghost" data-ref>💰 برگشت به کیف پول</button>`:""}${o.status==="failed"?`<button class="btn" data-retry>${ic("refresh")} دوباره</button>`:""}</div>`,el=>{
+   <div class="bar-btns">${o.receipt_kind&&o.receipt_kind!=="code"?`<button class="btn ghost" data-r>🖼 رسید</button>`:""}${o.status==="review"?`<button class="btn" data-ok>✅ تأیید</button><button class="btn danger" data-no>❌ رد</button>`:""}${["done","rejected"].includes(o.status)&&o.kind!=="topup"?`<button class="btn ghost" data-ref>💰 برگشت به کیف پول</button>`:""}${o.status==="failed"?`<button class="btn" data-retry>${ic("refresh")} دوباره</button>`:""}</div>`,el=>{
     const on=(sel,fn)=>{const b=$(sel,el);if(b)b.onclick=()=>fn(b)};
     on("[data-r]",b=>showReceipt(o.id,$("#orc",el),b));
     on("[data-ok]",async b=>{const j=await act(b,"shop_order",{id:o.id,act:"approve"});if(j.ok)closeSheet()});
@@ -7668,6 +7670,71 @@ def support_link(cfg):
 
 
 SUB_RE = re.compile(r"(?:/[A-Za-z0-9_.-]+/|^s_?|^)([A-Za-z0-9_-]{8,64})/?$")
+def fast_connect(host, port, timeout):
+    """A TCP connection that tries IPv4 first with a short connect timeout. On some hosts IPv6 to
+    Telegram drops now and then, and a plain connect sat out the whole timeout before trying IPv4."""
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    infos.sort(key=lambda i: i[0] != socket.AF_INET)
+    err = None
+    for fam, typ, proto, _, addr in infos:
+        s = socket.socket(fam, typ, proto)
+        s.settimeout(min(timeout, 4))
+        try:
+            s.connect(addr)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.settimeout(timeout)
+            return s
+        except OSError as e:
+            err = e
+            s.close()
+    raise err or OSError("no address for %s" % host)
+
+
+class _FastHTTP(http.client.HTTPConnection):
+    def connect(self):
+        self.sock = fast_connect(self.host, self.port, self.timeout)
+
+
+class _FastHTTPS(http.client.HTTPSConnection):
+    def connect(self):
+        self.sock = self._context.wrap_socket(fast_connect(self.host, self.port, self.timeout), server_hostname=self.host)
+
+
+_API_CONN = threading.local()
+
+
+def api_post(url, body, ctype, timeout):
+    """POST on a kept-alive connection (one per thread and host). -> (status, body bytes).
+    A kept connection the server has closed meanwhile is replaced once."""
+    u = urllib.parse.urlsplit(url)
+    pool = getattr(_API_CONN, "pool", None)
+    if pool is None:
+        pool = _API_CONN.pool = {}
+    key = (u.scheme, u.netloc)
+    for _ in (0, 1):
+        c = pool.get(key)
+        fresh = c is None
+        if fresh:
+            c = pool[key] = (_FastHTTPS if u.scheme == "https" else _FastHTTP)(u.hostname, u.port, timeout=timeout)
+        c.timeout = timeout
+        if c.sock:
+            c.sock.settimeout(timeout)
+        try:
+            c.request("POST", u.path + ("?" + u.query if u.query else ""), body=body, headers={"Content-Type": ctype})
+            r = c.getresponse()
+            data = r.read()
+            if r.will_close:
+                c.close()
+                pool.pop(key, None)
+            return r.status, data
+        except (http.client.HTTPException, OSError) as e:
+            c.close()
+            pool.pop(key, None)
+            if fresh or isinstance(e, (socket.timeout, TimeoutError)):
+                raise
+    raise OSError("connection lost")
+
+
 BTN_ME, BTN_LINK, BTN_HELP = "📊 وضعیت من", "🔗 لینک اشتراک", "💬 پشتیبانی"
 
 
@@ -7742,19 +7809,17 @@ class Bot:
         base, token = self.nets().get(net, (None, None))
         if not token:
             raise ValueError("bot is off")
-        req = urllib.request.Request("%s/bot%s/%s" % (base, token, method), data=json.dumps(payload or {}).encode(),
-                                     headers={"Content-Type": "application/json"})
+        status, raw = api_post("%s/bot%s/%s" % (base, token, method), json.dumps(payload or {}).encode(), "application/json", timeout)
+        return self.api_result(status, raw)
+
+    @staticmethod
+    def api_result(status, raw):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                j = json.loads(r.read().decode() or "{}")
-        except urllib.error.HTTPError as e:
-            try:
-                j = json.loads(e.read().decode() or "{}")
-            except ValueError:
-                j = {}
-            raise ValueError(j.get("description") or "HTTP %d" % e.code)
-        if not j.get("ok"):
-            raise ValueError(j.get("description") or "error")
+            j = json.loads(raw.decode() or "{}")
+        except ValueError:
+            j = {}
+        if status != 200 or not j.get("ok"):
+            raise ValueError(j.get("description") or ("HTTP %d" % status if status != 200 else "error"))
         return j.get("result")
 
     def upload(self, net, method, fields, field, filename, data, mime, timeout=60):
@@ -7767,20 +7832,9 @@ class Bot:
             boundary, k, json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v)).encode() for k, v in fields.items()]
         parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"; filename="%s"\r\nContent-Type: %s\r\n\r\n' % (
             boundary, field, filename, mime)).encode() + data + b"\r\n")
-        req = urllib.request.Request("%s/bot%s/%s" % (base, token, method), data=b"".join(parts) + ("--%s--\r\n" % boundary).encode(),
-                                     headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                j = json.loads(r.read().decode() or "{}")
-        except urllib.error.HTTPError as e:
-            try:
-                j = json.loads(e.read().decode() or "{}")
-            except ValueError:
-                j = {}
-            raise ValueError(j.get("description") or "HTTP %d" % e.code)
-        if not j.get("ok"):
-            raise ValueError(j.get("description") or "error")
-        return j.get("result")
+        status, raw = api_post("%s/bot%s/%s" % (base, token, method), b"".join(parts) + ("--%s--\r\n" % boundary).encode(),
+                               "multipart/form-data; boundary=" + boundary, timeout)
+        return self.api_result(status, raw)
 
     def send(self, net, chat, text, kind="", keyboard=None, queue=True):
         """Send now; on failure keep it for a retry. -> "" or the error."""
@@ -7894,6 +7948,8 @@ class Bot:
         return link_base(self.app.rt, self.st.get("host") or "localhost") + sub
 
     def customer_keyboard(self):
+        if self.shop.on():
+            return self.shop.quick_kb()
         rows = [[{"text": BTN_ME}, {"text": BTN_LINK}]]
         if self.app.cfg.get("support_url"):
             rows.append([{"text": BTN_HELP}])
@@ -8423,6 +8479,8 @@ class Shop:
         self.bot = bot
         self.app = bot.app
         self.lock = threading.RLock()
+        self.photo_menus = set()  # (chat, message id) of menus under the banner: edited by caption
+        self.members = {}  # Telegram user id -> when they were last seen in the channel
         self.wait = {}  # chat id -> {"what": "receipt"|"code"|"gift"|"amount", "order": id}
         self.build = {}  # chat id -> the custom plan being set up
         self.d = self._load()
@@ -8492,6 +8550,37 @@ class Shop:
     ICON = {"buy": "buy", "bp": "buy", "renew": "renew", "rn": "renew", "svc": "svc", "sv": "svc", "wallet": "wallet", "tu": "wallet",
             "trial": "trial", "gift": "gift", "ref": "ref", "help": "help", "guide": "guide", "m": "home", "app": "app",
             "pw": "ok", "ok": "ok", "a:ok": "ok", "no": "no", "x": "no", "a:no": "no", "a:home": "admin", "a:cust": "home"}
+    QUICK = {"🛒 خرید سرویس": "buy", "📦 سرویس‌های من": "svc", "💰 کیف پول": "wallet", "🎫 پشتیبانی": "tk", "🏠 منوی اصلی": "m"}
+    QUICK_V = 1  # bump when the keyboard changes so everyone gets the new one
+
+    def quick_kb(self):
+        return {"keyboard": [[{"text": "🛒 خرید سرویس"}, {"text": "📦 سرویس‌های من"}],
+                             [{"text": "💰 کیف پول"}, {"text": "🎫 پشتیبانی"}, {"text": "🏠 منوی اصلی"}]],
+                "resize_keyboard": True, "is_persistent": True, "input_field_placeholder": "از منوی پایین انتخاب کن"}
+
+    def give_quick(self, net, chat, uid, text="⌨️ دکمه‌های اصلی پایین صفحه‌ست؛ هر وقت خواستی از اونجا بزن."):
+        """The main buttons stay at the bottom of the chat (a reply keyboard), sent once per customer."""
+        u = self.user(uid)
+        if u.get("kb") == self.QUICK_V or str(chat).startswith("-"):
+            return
+        try:
+            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": text, "reply_markup": self.quick_kb()})
+            with self.lock:
+                u["kb"] = self.QUICK_V
+            self.save()
+        except (ValueError, OSError) as e:
+            self.bot.log(net, chat, "shop", str(e)[:160])
+
+    def gate(self, net, chat, uid, who):
+        """Phone and channel checks before any menu. -> True when the customer may go on."""
+        if self.need_phone(uid):
+            self.phone_prompt(net, chat)
+            return False
+        if not self.joined(net, who.get("id")):
+            self.join_prompt(net, chat)
+            return False
+        return True
+
     EFFECT = {"party": "5046509860389126442", "fire": "5104841245755180586", "like": "5107584321108051014", "heart": "5159385139981059251"}
 
     def emoji_map(self):
@@ -8515,7 +8604,9 @@ class Shop:
 
         def btn(item):
             t, d = item[0], item[1]
-            if d.startswith("app:"):
+            if d.startswith("copy:"):
+                b = {"text": t, "copy_text": {"text": d[5:]}}
+            elif d.startswith("app:"):
                 b = {"text": t, "web_app": {"url": d[4:]}}
             elif d.startswith("http"):
                 b = {"text": t, "url": d}
@@ -8586,7 +8677,12 @@ class Shop:
                         self.bot.call(net, "deleteMessage", {"chat_id": chat, "message_id": msg})
                     except (ValueError, OSError):
                         pass
-                return self.send_banner(net, chat, text, markup, effect)
+                res = self.send_banner(net, chat, text, markup, effect)
+                if res and res.get("message_id"):
+                    if len(self.photo_menus) > 5000:
+                        self.photo_menus.clear()
+                    self.photo_menus.add((str(chat), res["message_id"]))
+                return res
             except (ValueError, OSError) as e:
                 if attempt == 0 and re.search(r"emoji|style|button|entit", str(e), re.I) and not getattr(self, "plain", False):
                     self.plain = True
@@ -8608,6 +8704,8 @@ class Shop:
             try:
                 if msg and not effect:
                     try:
+                        if (str(chat), msg) in self.photo_menus:
+                            raise ValueError("there is no text in the message to edit")
                         return self.bot.call(net, "editMessageText", dict(payload, message_id=msg))
                     except (ValueError, OSError) as e:
                         if "not modified" in str(e):
@@ -8660,7 +8758,7 @@ class Shop:
         return html.escape(str(s or ""), quote=False)
 
     def back(self, to="m"):
-        return [("⬅️ بازگشت", to)]
+        return [("⬅️ بازگشت", to, "")]
 
     # menus ----------------------------------------------------------------------
     def main_menu(self, net, chat, uid, msg=None):
@@ -8743,6 +8841,10 @@ class Shop:
         b = self.build.get(cid) or {}
         if b.get("mode") != mode or b.get("sub") != sub:
             b = {"mode": mode, "sub": sub, "gb": 0 if mode == "add" else 30, "days": 0 if mode == "add" else 30}
+        if gb is not None and gb > 1:
+            gb = 5 * round(gb / 5)  # whole steps of 5 (the lowest step of a new service stays 1)
+        if days is not None and days > 1:
+            days = 5 * round(days / 5)
         if gb is not None:
             b["gb"] = gb
         if days is not None:
@@ -8759,8 +8861,8 @@ class Shop:
         text = "%s\n\n📦 حجم: <b>%s گیگ</b>%s\n📅 زمان: <b>%s روز</b>%s\n\n💳 مبلغ: <b>%s</b>" % (
             title, fa_num(b["gb"]), "  <i>(هر گیگ %s)</i>" % toman(g) if g else "", fa_num(b["days"]),
             "  <i>(هر روز %s)</i>" % toman(d) if d else "", toman(price))
-        rows = [[("➖۱۰", "cb:g:-10"), ("➖", "cb:g:-1"), ("📦 %s گیگ" % fa_num(b["gb"]), "noop"), ("➕", "cb:g:1"), ("➕۱۰", "cb:g:10")],
-                [("➖۱۰", "cb:d:-10"), ("➖", "cb:d:-1"), ("📅 %s روز" % fa_num(b["days"]), "noop"), ("➕", "cb:d:1"), ("➕۱۰", "cb:d:10")]]
+        rows = [[("➖ ۵", "cb:g:-5"), ("%s گیگ" % fa_num(b["gb"]), "noop"), ("➕ ۵", "cb:g:5")],
+                [("➖ ۵", "cb:d:-5"), ("%s روز" % fa_num(b["days"]), "noop"), ("➕ ۵", "cb:d:5")]]
         ok = price > 0 and (b["gb"] or b["days"])
         rows.append([("✅ ادامه · %s" % toman(price), "cb:go", "success")] if ok else [("بیشتر از صفر انتخاب کن", "noop")])
         rows.append(self.back("sv:%s" % sub if sub else "buy"))
@@ -8906,19 +9008,35 @@ class Shop:
         return out
 
     def card_text(self, o):
-        cards = "\n".join("💳 <code>%s</code>\n👤 %s%s" % (self.esc(c[0]), self.esc(c[1]), " · " + self.esc(c[2]) if c[2] else "")
+        cards = "\n".join("💳 <code>%s</code>%s" % (re.sub(r"\D", "", c[0]), "\n👤 " + " · ".join(self.esc(x) for x in c[1:3] if x) if c[1] or c[2] else "")
                           for c in self.cards())
-        return ("💳 <b>کارت به کارت</b>\n\nمبلغ <b>%s</b> رو به این کارت واریز کن:\n\n%s\n\n📸 بعد از واریز، <b>عکس رسید</b> رو همین‌جا بفرست. "
-                "بعد از تأیید، سرویست خودکار فعال می‌شه.") % (toman(self.total(o)), cards)
+        return ("💳 <b>کارت به کارت</b>\n\nمبلغ <b>%s</b> رو به این کارت واریز کن:\n\n%s\n\n"
+                "👆 روی شماره کارت بزن تا <b>کپی</b> بشه (یا دکمه‌ی کپی پایین).\n\n"
+                "📸 بعد از واریز، <b>عکس رسید</b> یا <b>کد رهگیری</b> رو همین‌جا بفرست. بعد از تأیید، سرویست خودکار فعال می‌شه.") % (toman(self.total(o)), cards)
+
+    def card_rows(self, o, net):
+        rows = []
+        if net == "tg":
+            cards = self.cards()
+            for c in cards[:3]:
+                num = re.sub(r"\D", "", c[0])
+                rows.append([("📋 کپی شماره کارت" + (" …%s" % num[-4:] if len(cards) > 1 else ""), "copy:" + num, "primary")])
+            rows.append([("📋 کپی مبلغ (تومان)", "copy:%d" % self.total(o))])
+        return rows + [[("✖️ انصراف", "x:%s" % o["id"])]]
 
     # actions ----------------------------------------------------------------------
     def joined(self, net, uid_num):
         ch = str(self.app.cfg.get("shop_channel") or "").strip()
         if not ch or not self.app.cfg.get("shop_channel_on", True):
             return True
+        if time.time() - self.members.get(uid_num, 0) < 600:
+            return True
         try:
             m = self.bot.call(net, "getChatMember", {"chat_id": ch, "user_id": uid_num}, timeout=10)
-            return (m or {}).get("status") in ("member", "administrator", "creator", "restricted")
+            ok = (m or {}).get("status") in ("member", "administrator", "creator", "restricted")
+            if ok:
+                self.members[uid_num] = time.time()
+            return ok
         except (ValueError, OSError):
             return True  # the bot is not admin there: do not lock customers out
 
@@ -8939,6 +9057,7 @@ class Shop:
             return self.phone_prompt(net, chat, first=True)
         if not self.joined(net, who.get("id")):
             return self.join_prompt(net, chat)
+        self.give_quick(net, chat, uid)
         self.main_menu(net, chat, uid)
 
     def open_support(self, net, chat, who):
@@ -8978,7 +9097,11 @@ class Shop:
             self.user(uid, who)["phone"] = "+" + num
         self.save()
         try:
-            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "✅ شماره‌ت ثبت شد. خوش اومدی!", "reply_markup": {"remove_keyboard": True}})
+            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "✅ شماره‌ت ثبت شد. خوش اومدی!\n⌨️ دکمه‌های اصلی پایین صفحه‌ست.",
+                                               "reply_markup": self.quick_kb()})
+            with self.lock:
+                self.user(uid)["kb"] = self.QUICK_V
+            self.save()
         except (ValueError, OSError):
             pass
         if not self.joined(net, who.get("id")):
@@ -8996,10 +9119,24 @@ class Shop:
         cid, uid = "%s:%s" % (net, chat), "%s:%s" % (net, who.get("id", chat))
         if msg.get("contact"):
             return self.got_contact(net, chat, who, msg["contact"])
+        text = (msg.get("text") or "").strip()
+        if text in self.QUICK:  # the keyboard at the bottom of the chat
+            self.wait.pop(cid, None)
+            if self.gate(net, chat, uid, who):
+                self.user(uid, who)
+                self.route(net, chat, uid, who, self.QUICK[text], None)
+            return True
         w = self.wait.get(cid)
         if w and w["what"] == "receipt" and (msg.get("photo") or msg.get("document")):
             return self.got_receipt(net, chat, uid, w["order"], msg)
-        text = (msg.get("text") or "").strip()
+        if w and w["what"] == "receipt" and text and not text.startswith("/"):
+            code = text.translate(EN_DIGITS)
+            if re.fullmatch(r"[\s\-:#A-Za-z0-9]{4,40}", code) and len(re.sub(r"\D", "", code)) >= 4:
+                return self.got_receipt(net, chat, uid, w["order"], msg, code=re.sub(r"\s+", " ", code).strip())
+            o = self.order(w["order"])
+            self.show(net, chat, "📸 <b>عکس رسید</b> یا <b>کد رهگیری</b> (عدد) واریز رو بفرست.\nاگه منصرف شدی، «انصراف» رو بزن.",
+                      self.card_rows(o, net) if o else [[("🏠 منوی اصلی", "m")]])
+            return True
         if msg.get("photo") or msg.get("document"):
             self.show(net, chat, "اول از منو سفارشت رو ثبت کن، بعد رسید رو بفرست 🙏", [[("🏠 منوی اصلی", "m")]])
             return True
@@ -9020,13 +9157,16 @@ class Shop:
             return True
         return False
 
-    def got_receipt(self, net, chat, uid, oid, msg):
+    def got_receipt(self, net, chat, uid, oid, msg, code=""):
         o = self.order(oid)
         if not o or o["status"] not in ("receipt", "new"):
             self.wait.pop("%s:%s" % (net, chat), None)
             return False
         self.wait.pop("%s:%s" % (net, chat), None)
-        if msg.get("photo"):
+        if code:
+            media = ("sendMessage", "code", code)
+            fuid = "code:" + re.sub(r"\D", "", code)
+        elif msg.get("photo"):
             media = ("sendPhoto", "photo", msg["photo"][-1]["file_id"])
             fuid = msg["photo"][-1].get("file_unique_id", "")
         else:
@@ -9038,18 +9178,23 @@ class Shop:
         with self.lock:
             o["status"], o["receipt"], o["receipt_at"] = "review", media[2], int(time.time())
             o["receipt_kind"] = media[1]
+            if code:
+                o["receipt"], o["receipt_code"] = "", code
         u = self.user(uid)
-        cap = ("⚠️ <b>این عکس قبلاً برای سفارش #%s فرستاده شده!</b>\n\n" % fa_num(dup["id"]) if dup else "") + ("🧾 <b>رسید #%s</b>\n👤 %s%s\n🛍 %s%s\n💳 <b>%s</b>" % (
+        cap = ("⚠️ <b>این %s قبلاً برای سفارش #%s فرستاده شده!</b>\n\n" % ("کد" if code else "عکس", fa_num(dup["id"])) if dup else "") + ("🧾 <b>رسید #%s</b>\n👤 %s%s\n🛍 %s%s\n💳 <b>%s</b>" % (
             fa_num(o["id"]), self.esc(u.get("name") or uid), " (@%s)" % self.esc(u["username"]) if u.get("username") else "",
             self.KINDS[o["kind"]], " · " + self.esc(o["plan_name"]) if o["plan_name"] else "", toman(self.total(o))))
+        if code:
+            cap += "\n🔢 کد رهگیری: <code>%s</code>" % self.esc(code)
         sent = 0
         for acid, a in list(self.bot.admin_chats().items()):
             anet, achat = acid.split(":", 1)
             if anet != net or a.get("paused"):
                 continue  # a Bale file id means nothing on Telegram
             try:
-                r = self.bot.call(anet, media[0], {"chat_id": achat, media[1]: media[2], "caption": cap, "parse_mode": "HTML",
-                                                   "reply_markup": self.kb([[("✅ تأیید", "ok:%s" % o["id"]), ("❌ رد", "no:%s" % o["id"])]])})
+                pay = {"chat_id": achat, "parse_mode": "HTML", "reply_markup": self.kb([[("✅ تأیید", "ok:%s" % o["id"]), ("❌ رد", "no:%s" % o["id"])]])}
+                pay.update({"text": cap} if code else {media[1]: media[2], "caption": cap})
+                r = self.bot.call(anet, media[0], pay)
                 o["admin_msgs"].append([anet, achat, r.get("message_id")])
                 sent += 1
             except (ValueError, OSError) as e:
@@ -9164,7 +9309,7 @@ class Shop:
         self.fulfil(o, by="کیف پول", msg=msg)
 
     # orders the customer can follow -----------------------------------------------
-    HINT = {"new": "هنوز پرداخت نشده؛ از «🧾 فاکتور» پرداخت کن.", "receipt": "📸 منتظر عکس رسیدیم؛ همین‌جا بفرستش.",
+    HINT = {"new": "هنوز پرداخت نشده؛ از «🧾 فاکتور» پرداخت کن.", "receipt": "📸 منتظر عکس رسید یا کد رهگیری‌ایم؛ همین‌جا بفرستش.",
             "review": "⏳ رسیدت در حال بررسیه.", "done": "", "rejected": "اگه اشتباه شده تیکت بزن.",
             "failed": "مبلغ به کیف پولت برگشت.", "refunded": "مبلغ به کیف پولت برگشت.", "cancelled": ""}
 
@@ -9508,8 +9653,15 @@ class Shop:
                 self.join_prompt(net, chat, mid)
                 note = "اول عضو کانال شو"
             else:
+                try:  # stop the button's spinner first; the menu follows
+                    self.bot.call(net, "answerCallbackQuery", {"callback_query_id": cq.get("id")}, timeout=10)
+                except (ValueError, OSError):
+                    pass
+                if msg.get("photo"):
+                    self.photo_menus.add((str(chat), mid))
                 self.user(uid, who)
                 self.route(net, chat, uid, who, data, mid)
+                return
         except Exception as e:
             print("shop callback: %s" % e, flush=True)
             note = "خطا؛ دوباره امتحان کن"
@@ -9583,7 +9735,7 @@ class Shop:
             o["status"], o["method"] = "receipt", "card"
             self.save()
             self.wait[cid] = {"what": "receipt", "order": o["id"]}
-            return self.show(net, chat, self.card_text(o), [[("✖️ انصراف", "x:%s" % o["id"])]], mid)
+            return self.show(net, chat, self.card_text(o), self.card_rows(o, net), mid)
         if head == "dc":
             self.wait[cid] = {"what": "code", "order": o["id"]}
             return self.show(net, chat, "🏷 کد تخفیفت رو بفرست:", [[("⬅️ فاکتور", "iv:%s" % o["id"])]], mid)
@@ -9967,6 +10119,8 @@ class AdminBot:
         cap = "🧾 <b>رسید #%s</b>\n👤 %s\n🛍 %s%s\n💳 <b>%s</b>" % (fa_num(o["id"]), self.sh.esc(u.get("name") or o["uid"]), self.sh.KINDS[o["kind"]],
                                                                 " · " + self.sh.esc(o["plan_name"]) if o["plan_name"] else "", toman(self.sh.total(o)))
         kb = self.sh.kb([[("✅ تأیید", "ok:%s" % o["id"]), ("❌ رد", "no:%s" % o["id"])]], net)
+        if o.get("receipt_code"):
+            cap += "\n🔢 کد رهگیری: <code>%s</code>" % self.sh.esc(o["receipt_code"])
         if o.get("receipt") and o["net"] == net:
             try:
                 m = "sendPhoto" if o.get("receipt_kind") == "photo" else "sendDocument"

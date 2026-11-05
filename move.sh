@@ -88,6 +88,8 @@ prepare() {
   r "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq curl socat cron fail2ban python3 tar >/dev/null && systemctl enable --now fail2ban cron >/dev/null 2>&1 || true"
   say "DNS: fast public resolvers first (a provider's IPv6 resolvers that stall made every Telegram call wait 10 s)"
   r "mkdir -p /etc/systemd/resolved.conf.d && printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\nFallbackDNS=1.0.0.1 8.8.4.4\n' > /etc/systemd/resolved.conf.d/ez-dns.conf && systemctl restart systemd-resolved 2>/dev/null || true"
+  # prefer IPv4: on some hosts IPv6 to Telegram drops now and then, and a connection waits out its timeout
+  r "grep -q '^precedence ::ffff:0:0/96' /etc/gai.conf 2>/dev/null || echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf"
   say "network tuning (BBR)"
   [ -f /etc/sysctl.d/99-ez-xui.conf ] && put /etc/sysctl.d/99-ez-xui.conf /etc/sysctl.d && r "sysctl -q --system >/dev/null 2>&1 || true"
 
