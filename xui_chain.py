@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.18.0"
+VERSION = "5.18.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -10753,16 +10753,7 @@ def make_handler(app):
             if parts == ["app"]:
                 return self.send(200, branded(APP_HTML, app.cfg), APP_HEADERS)
             if len(parts) == 2 and parts[0] == "brand" and brand_file(parts[1]):
-                with open(brand_file(parts[1]), "rb") as f:
-                    data = f.read()
-                self.send_response(200)
-                for k, v in (("Content-Type", "image/svg+xml" if parts[1].endswith(".svg") else "image/png"),
-                             ("Cache-Control", "public, max-age=3600"), ("Content-Length", str(len(data))),
-                             ("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")):
-                    self.send_header(k, v)
-                self.end_headers()
-                self.wfile.write(data)
-                return
+                return self.brand(parts[1])
             if len(parts) == 2 and parts[0] == app.cfg["sub_path"]:
                 q = urllib.parse.parse_qs(u.query)
                 if _q(q, "format") == "info":
@@ -10792,6 +10783,27 @@ def make_handler(app):
                     return
                 return self.send(200, ADMIN_HTML, ADMIN_HEADERS)
             self.send(404, "404 page not found\n")
+
+        def brand(self, name, body=True):
+            with open(brand_file(name), "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            for k, v in (("Content-Type", "image/svg+xml" if name.endswith(".svg") else "image/png"),
+                         ("Cache-Control", "public, max-age=3600"), ("Content-Length", str(len(data))),
+                         ("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")):
+                self.send_header(k, v)
+            self.end_headers()
+            if body:
+                self.wfile.write(data)
+
+        def do_HEAD(self):
+            """Telegram checks a link (the banner preview) with HEAD before fetching it."""
+            u, parts = self.route()
+            if len(parts) == 2 and parts[0] == "brand" and brand_file(parts[1]):
+                return self.brand(parts[1], body=False)
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def do_POST(self):
             u, parts = self.route()

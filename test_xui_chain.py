@@ -735,6 +735,8 @@ class EndToEnd(unittest.TestCase):
             status, h, body = self.get("/brand/mark.svg")
             self.assertEqual((status, h["Content-Type"]), (200, "image/svg+xml"))
             self.assertEqual(self.get("/brand/config.json")[0], 404)
+            head = urllib.request.urlopen(urllib.request.Request(self.base + "/brand/mark.svg", method="HEAD"), timeout=10)
+            self.assertEqual((head.status, head.headers["Content-Type"], head.read()), (200, "image/svg+xml", b""))
             self.assertEqual(self.get("/brand/..%2Fconfig.json")[0], 404)
             req = urllib.request.Request(self.base + "/chain/abc", headers={"User-Agent": "Mozilla/5.0 Chrome/130", "Accept": "text/html"})
             page = urllib.request.urlopen(req, timeout=10).read().decode()
