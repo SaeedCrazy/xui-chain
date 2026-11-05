@@ -722,6 +722,31 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(xc.split_lines(plain), links)
 
+    def test_brand_assets(self):
+        d = xc.conf_path("brand")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "mark.svg"), "w") as f:
+            f.write("<svg xmlns='http://www.w3.org/2000/svg'/>")
+        cfg = xc.load_config()
+        cfg.update(brand_color="#38BDF8", brand_accent="#FF8A3D")
+        xc.save_config(cfg)
+        self.app.reload()
+        try:
+            status, h, body = self.get("/brand/mark.svg")
+            self.assertEqual((status, h["Content-Type"]), (200, "image/svg+xml"))
+            self.assertEqual(self.get("/brand/config.json")[0], 404)
+            self.assertEqual(self.get("/brand/..%2Fconfig.json")[0], 404)
+            req = urllib.request.Request(self.base + "/chain/abc", headers={"User-Agent": "Mozilla/5.0 Chrome/130", "Accept": "text/html"})
+            page = urllib.request.urlopen(req, timeout=10).read().decode()
+            self.assertIn('src="/brand/mark.svg"', page)
+            self.assertIn("--brand:#38BDF8", page)
+            self.assertIn("--brand:#38BDF8", self.get("/app/")[2])
+        finally:
+            os.remove(os.path.join(d, "mark.svg"))
+            cfg.update(brand_color="", brand_accent="")
+            xc.save_config(cfg)
+            self.app.reload()
+
     def test_mini_app_routes(self):
         status, h, body = self.get("/app/")
         self.assertEqual(status, 200)

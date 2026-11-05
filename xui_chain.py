@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.17.1"
+VERSION = "5.18.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -129,6 +129,8 @@ DEFAULTS = {
     "shop_welcome": "",
     "shop_help": "",
     "shop_prefix": "tg",        # client names: <prefix><telegram id>
+    "brand_color": "",          # brand colours for the customer pages and the mini app (#rrggbb)
+    "brand_accent": "",
     "shop_gb_price": 0,         # custom plans: Toman per GB (0 = no custom plans)
     "shop_day_price": 0,        # ... and per day
     "shop_custom_max": "500,365",  # largest custom plan "GB,days"
@@ -4706,7 +4708,7 @@ def admin_state(app, host):
             "announce": cfg.get("announce", ""),
             "label_deco": label(cfg, "label_deco"), "label_auto": label(cfg, "label_auto"),
             "xui_sub_url": cfg.get("xui_sub_url", "auto"), "public_host": cfg.get("public_host", ""),
-            "monitor_minutes": int(cfg.get("monitor_minutes") or 10), "test_sub_id": cfg.get("test_sub_id", ""),
+            "monitor_minutes": int(cfg.get("monitor_minutes") or 10), "brand_color": cfg.get("brand_color", ""), "brand_accent": cfg.get("brand_accent", ""), "test_sub_id": cfg.get("test_sub_id", ""),
             "tg_enable": cfg.get("tg_enable", True), "tg_chat": cfg.get("tg_chat", ""),
             "tg_token_set": bool(cfg.get("tg_token")), "tg_source": rt.get("tg_source", ""),
             "tg_chat_rt": rt.get("tg_chat_rt", ""),
@@ -4792,7 +4794,7 @@ def net_state(app):
 
 SETTING_BOOLS = ("bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
                  "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable", "shop_channel_on", "shop_phone", "shop_phone_ir")
-SETTING_TEXTS = {"shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
+SETTING_TEXTS = {"brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
                  "shop_welcome": 1000, "shop_help": 2000, "shop_prefix": 10, "bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
@@ -7173,6 +7175,7 @@ function botCard(){
    ${tg.error&&tg.on?`<div class="err">${esc(tg.error)}</div>`:""}
    ${field("bot_token","توکن ربات تلگرام","",`class="in ltr" type="password" autocomplete="off" placeholder="${b.token_set?"ذخیره شده":"123456:ABC…"}"`,'از <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a> یه ربات <b>فقط برای EZ</b> بساز؛ ربات 3x-ui یا هر برنامه‌ی دیگه رو نذار.')}
    ${field("bot_owner","آیدی عددی صاحب ربات",b.owner||"",'class="in ltr" inputmode="numeric" placeholder="123456789"',"مدیریت کامل پنل از داخل ربات. آیدیت رو با فرستادن <span class=\"ltr\">/id</span> به ربات بگیر؛ چندتا رو با , جدا کن")}
+   <div class="cols2">${field("brand_color","رنگ اصلی برند",S.state.settings.brand_color||"",'class="in ltr" placeholder="#38BDF8"')}${field("brand_accent","رنگ دوم برند",S.state.settings.brand_accent||"",'class="in ltr" placeholder="#FF8A3D"')}</div>
    ${sw("bot_bale",b.bale,"روی بله هم",b.bale_ready?"با همون ربات بله‌ی بخش بکاپ":"اول توی بخش بکاپ توکن بله رو بذار")}
    ${field("monitor_minutes","فاصله‌ی تست خودکار (دقیقه)",S.state.settings.monitor_minutes,'class="in ltr" inputmode="numeric"',"واسط‌ها، تانل‌ها و ترافیک سرورها؛ هشدارشون برای چت‌های مدیر میاد")}
    <details><summary>یادآوری مشتری‌ها</summary>
@@ -8272,6 +8275,32 @@ def shop_path():
     return conf_path("shop.json")
 
 
+BRAND_FILES = ("mark.svg", "avatar-640.png", "banner.png", "banner.svg")
+
+
+def brand_file(name):
+    """A brand asset placed in <conf>/brand (logo, banner); "" when there is none."""
+    p = conf_path(os.path.join("brand", name))
+    return p if name in BRAND_FILES and os.path.isfile(p) else ""
+
+
+def brand_css(cfg):
+    """The brand's two colours for the customer pages (main, accent); nothing when unset."""
+    c1, c2 = str(cfg.get("brand_color") or ""), str(cfg.get("brand_accent") or "")
+    ok = lambda c: re.fullmatch(r"#[0-9a-fA-F]{6}", c)
+    if not (ok(c1) and ok(c2)):
+        return ""
+    return "<style>:root{--brand:%s;--brand2:%s}</style>" % (c1, c2)
+
+
+def branded(page, cfg):
+    """Customer pages with the brand: its colours and, when there is one, its logo instead of the EZ badge."""
+    page = page.replace("</head>", brand_css(cfg) + "</head>", 1)
+    if brand_file("mark.svg"):
+        page = page.replace('<div class="logo">EZ</div>', '<img class="logo" src="/brand/mark.svg" alt="">')
+    return page
+
+
 class Shop:
     STATUS = {"new": "در انتظار پرداخت", "receipt": "منتظر رسید", "review": "در حال بررسی", "done": "انجام شد",
               "rejected": "رد شد", "cancelled": "لغو شد", "failed": "ناموفق (برگشت به کیف پول)", "refunded": "برگشت به کیف پول"}
@@ -8396,11 +8425,23 @@ class Shop:
             return ""
         return base[:-len(self.app.rt["sub_path"]) - 1] + "app/"
 
-    def show(self, net, chat, text, rows=None, msg=None, effect=None):
+    def banner_url(self):
+        """The brand banner as a link Telegram can preview above a message; "" when there is none."""
+        p = brand_file("banner.png")
+        base = self.app_url()
+        if not (p and base):
+            return ""
+        return base[:-len("app/")] + "brand/banner.png?v=%d" % int(os.path.getmtime(p))
+
+    def show(self, net, chat, text, rows=None, msg=None, effect=None, banner=False):
         """Edit the message in place when there is one (smooth menus), else send a new one. A message with
         an effect (confetti, fire) is always a new one, since an edit cannot carry it."""
         for attempt in (0, 1):
             payload = {"chat_id": chat, "text": text[:4000], "disable_web_page_preview": True, "parse_mode": "HTML"}
+            url = self.banner_url() if banner and net == "tg" else ""
+            if url:
+                payload.pop("disable_web_page_preview")
+                payload["link_preview_options"] = {"url": url, "prefer_large_media": True, "show_above_text": True}
             if rows is not None:
                 payload["reply_markup"] = self.kb(rows, net)
             try:
@@ -8469,7 +8510,7 @@ class Shop:
         rows.append([("📚 راهنمای اتصال", "guide")])
         if self.bot.admin.is_owner(net, uid.split(":", 1)[1]):
             rows.append([("🛠 پنل مدیریت", "a:home", "danger")])
-        self.show(net, chat, text, rows, msg)
+        self.show(net, chat, text, rows, msg, banner=True)
 
     def trial_cfg(self):
         parts = [x for x in str(self.app.cfg.get("shop_trial") or "").replace(" ", "").split(",") if x]
@@ -8706,7 +8747,7 @@ class Shop:
         ch = str(self.app.cfg.get("shop_channel") or "").strip()
         url = "https://t.me/" + ch.lstrip("@") if ch.startswith("@") else ch
         self.show(net, chat, "📢 برای استفاده از ربات، اول عضو کانال ما شو و بعد «✅ عضو شدم» رو بزن.",
-                  [[("📢 عضویت در کانال", url)], [("✅ عضو شدم", "m")]], msg)
+                  [[("📢 عضویت در کانال", url, "primary")], [("✅ عضو شدم", "m", "success")]], msg, banner=True)
 
     def on_start(self, net, chat, who, arg):
         uid = "%s:%s" % (net, who.get("id", chat))
@@ -10125,15 +10166,16 @@ APP_HTML = r"""<!doctype html>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css">
 <style>
-:root{--bg:var(--tg-theme-bg-color,#0f1420);--sec:var(--tg-theme-secondary-bg-color,#161d2d);--fg:var(--tg-theme-text-color,#eef2fb);--mut:var(--tg-theme-hint-color,#8d99b5);
---acc:var(--tg-theme-button-color,#4f8cff);--acct:var(--tg-theme-button-text-color,#fff);--card:var(--tg-theme-section-bg-color,var(--sec));--line:color-mix(in srgb,var(--mut) 22%,transparent);
+:root{--brandc:var(--brand,var(--tg-theme-button-color,#4f8cff));--bg:var(--tg-theme-bg-color,#0f1420);--sec:var(--tg-theme-secondary-bg-color,#161d2d);--fg:var(--tg-theme-text-color,#eef2fb);--mut:var(--tg-theme-hint-color,#8d99b5);
+--acc:var(--brandc);--acct:#fff;--card:var(--tg-theme-section-bg-color,var(--sec));--line:color-mix(in srgb,var(--mut) 22%,transparent);
 --ok:#22c55e;--bad:#f43f5e;--warn:#f5a524}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;background:var(--bg);color:var(--fg)}
 body{font:15px/1.6 Vazirmatn,system-ui,sans-serif;padding-bottom:calc(84px + env(safe-area-inset-bottom));min-height:100vh}
 button{font:inherit;color:inherit;border:0;background:none;cursor:pointer}
 .wrap{max-width:560px;margin:0 auto;padding:14px 14px 0}
-.hero{border-radius:22px;padding:18px;background:linear-gradient(135deg,var(--acc),color-mix(in srgb,var(--acc) 55%,#8b5cff));color:var(--acct);box-shadow:0 12px 30px color-mix(in srgb,var(--acc) 35%,transparent);animation:up .35s ease-out both}
+.brandbar{display:flex;align-items:center;gap:10px;margin:2px 4px 12px;font-weight:800;font-size:17px}.brandbar img{width:36px;height:36px;border-radius:11px}
+.hero{border-radius:22px;padding:18px;background:linear-gradient(135deg,var(--acc),var(--brand2,color-mix(in srgb,var(--acc) 55%,#8b5cff)));color:var(--acct);box-shadow:0 12px 30px color-mix(in srgb,var(--acc) 35%,transparent);animation:up .35s ease-out both}
 .hero .hi{opacity:.85;font-size:13px}.hero .w{font-size:28px;font-weight:800;margin:4px 0 2px;letter-spacing:-.5px}.hero .k{opacity:.85;font-size:12.5px}
 .hero .acts{display:flex;gap:8px;margin-top:14px}.hero .acts button{flex:1;background:rgba(255,255,255,.18);border-radius:14px;padding:9px 6px;font-weight:700;font-size:13.5px;backdrop-filter:blur(6px)}
 h2{font-size:15px;margin:20px 4px 10px;display:flex;justify-content:space-between;align-items:center}
@@ -10225,7 +10267,7 @@ function svcCard(x,i){const d=days(x),p=x.total?Math.max(0,1-x.used/x.total):1;
    <div class="meta"><span>${x.total?`${gb(x.total-x.used)} از ${gb(x.total)} گیگ`:"حجم نامحدود"}</span><span>${d===null?(x.expiry<0?"از اولین اتصال":"بدون محدودیت"):d?fa(d)+" روز مانده":"منقضی"}</span></div>
    <div class="row2"><button class="btn" onclick="renew(${q(x.sub)})">🔄 تمدید</button>${D.custom?`<button class="btn ghost" onclick="builderSheet('addon',${q(x.sub)})">➕ حجم و زمان</button>`:D.traffic.length?`<button class="btn ghost" onclick="traffic(${q(x.sub)})">➕ حجم</button>`:""}<button class="btn ghost" onclick="linkSheet(${i})">🔗</button></div></div>`}
 V.home=()=>{const n=(D.name||"").split(" ")[0];
-  return `<div class="hero"><div class="hi">سلام ${esc(n)} 👋</div><div class="w">${tm(D.wallet)} <span style="font-size:14px;font-weight:600">تومان</span></div><div class="k">موجودی کیف پول</div>
+  return `<div class="brandbar"><img src="/brand/mark.svg" alt="" onerror="this.remove()"><span>${esc(D.title)}</span></div><div class="hero"><div class="hi">سلام ${esc(n)} 👋</div><div class="w">${tm(D.wallet)} <span style="font-size:14px;font-weight:600">تومان</span></div><div class="k">موجودی کیف پول</div>
    <div class="acts"><button onclick="go('buy')">🛍 خرید</button><button onclick="showStatus()">📡 سرورها</button><button onclick="go('wallet')">➕ شارژ</button>${D.trial?`<button onclick="trial()">🎁 تست</button>`:""}</div></div>
    <h2>سرویس‌های من <small>${fa(D.services.length)}</small></h2>
    ${D.services.length?D.services.map(svcCard).join(""):`<div class="card empty"><span class="e">📦</span>هنوز سرویسی نداری<div style="height:10px"></div><button class="btn" onclick="go('buy')">🛍 خرید اولین سرویس</button></div>`}`};
@@ -10423,6 +10465,8 @@ a{color:inherit;text-decoration:none}
 .top{display:flex;align-items:center;justify-content:space-between;margin:4px 2px 14px}
 .brand{display:flex;align-items:center;gap:10px;font-weight:800}
 .logo{width:36px;height:36px;border-radius:12px;display:grid;place-items:center;color:#fff;background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:0 6px 18px rgba(91,140,255,.35);font:800 14px/1 Vazirmatn,system-ui;direction:ltr}
+img.logo{background:none;object-fit:cover;width:40px;height:40px}
+:root{--acc:var(--brand,#5b8cff);--acc2:var(--brand2,#8b5cff)}
 .ibtn{width:38px;height:38px;border-radius:12px;border:1px solid var(--line);background:var(--card);display:grid;place-items:center;cursor:pointer}
 .card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:16px;margin:12px 0;box-shadow:var(--shadow);animation:in .3s ease-out both}
 .card h2{font-size:15.5px;margin:0 0 10px;display:flex;align-items:center;gap:8px}.card h2 .i{color:var(--acc)}
@@ -10707,14 +10751,25 @@ def make_handler(app):
         def do_GET(self):
             u, parts = self.route()
             if parts == ["app"]:
-                return self.send(200, APP_HTML, APP_HEADERS)
+                return self.send(200, branded(APP_HTML, app.cfg), APP_HEADERS)
+            if len(parts) == 2 and parts[0] == "brand" and brand_file(parts[1]):
+                with open(brand_file(parts[1]), "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                for k, v in (("Content-Type", "image/svg+xml" if parts[1].endswith(".svg") else "image/png"),
+                             ("Cache-Control", "public, max-age=3600"), ("Content-Length", str(len(data))),
+                             ("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")):
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if len(parts) == 2 and parts[0] == app.cfg["sub_path"]:
                 q = urllib.parse.parse_qs(u.query)
                 if _q(q, "format") == "info":
                     info = user_info(app, parts[1])
                     return self.json(200, info) if info else self.json(404, {"error": "not found"})
                 if app.cfg.get("user_page", True) and not _q(q, "format") and (_q(q, "page") or wants_page(self.headers)):
-                    return self.send(200, USER_HTML, ADMIN_HEADERS)
+                    return self.send(200, branded(USER_HTML, app.cfg), ADMIN_HEADERS)
                 fmt = pick_format(_q(q, "format"), self.headers.get("User-Agent", ""))
                 status, hdrs, body = build_subscription(parts[1], fmt, app.rt, app)
                 return self.send(status, body, hdrs or None)
