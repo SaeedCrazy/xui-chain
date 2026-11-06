@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.23.3"
+VERSION = "5.24.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -67,7 +67,7 @@ DEFAULTS = {
     "key_file": "auto",
     "public_host": "",         # host shown in user links; empty = host the admin page was opened with
     "direct_first": True,      # try your own IP directly before the chain
-    "iran_direct": True,       # .ir sites go direct, not through the tunnel
+    "iran_direct": True,       # Iranian sites and apps (.ir and Iranian IPs) go direct, not through the tunnel
     "update_hours": 3,         # how often apps refresh the subscription
     "test_url": "https://www.gstatic.com/generate_204",
     "test_interval": 120,
@@ -1427,8 +1427,8 @@ def build_mihomo(own, ups, cfg, rts=None, info=None):
         groups.insert(1, {"name": name, "type": "select", "proxies": [groups[0]["proxies"][0]]})
         groups[0]["proxies"].insert(0, name)
     rules = []
-    if cfg.get("iran_direct", True):
-        rules.append("DOMAIN-SUFFIX,ir,DIRECT")
+    if cfg.get("iran_direct", True):  # banks and Iranian apps refuse foreign IPs: reach them directly
+        rules += ["DOMAIN-SUFFIX,ir,DIRECT"] + ["DOMAIN-SUFFIX,%s,DIRECT" % d for d in IRAN_DOMAINS] + ["GEOIP,IR,DIRECT"]
     rules.append("MATCH," + G_MAIN)
     prof = {
         "mixed-port": 7890,
@@ -1443,11 +1443,18 @@ def build_mihomo(own, ups, cfg, rts=None, info=None):
     return "\n".join(yaml_dump(prof)) + "\n", skipped
 
 
+# Iranian services that are not under .ir; anything else hosted in Iran is caught by its IP (geoip:ir).
+IRAN_DOMAINS = ("digikala.com", "snapp.taxi", "aparat.com", "filimo.com", "torob.com", "basalam.com", "eitaa.com",
+                "bale.ai", "telewebion.com", "varzesh3.com", "arvancloud.com")
+
+
 def xray_config(remarks, outbounds, cfg, route):
     """Full Xray client config around the given proxy outbounds; route = final routing rule."""
     rules = []
-    if cfg.get("iran_direct", True):
-        rules.append({"type": "field", "domain": ["domain:ir"], "outboundTag": "direct"})
+    iran = cfg.get("iran_direct", True)
+    if iran:  # banks and Iranian apps refuse foreign IPs: reach them directly (by name, then by Iranian IP)
+        rules.append({"type": "field", "domain": ["domain:ir"] + ["domain:" + d for d in IRAN_DOMAINS], "outboundTag": "direct"})
+        rules.append({"type": "field", "ip": ["geoip:ir"], "outboundTag": "direct"})
     rules.append(dict({"type": "field", "network": "tcp,udp"}, **route))
     return {
         "remarks": remarks,
@@ -1463,7 +1470,7 @@ def xray_config(remarks, outbounds, cfg, route):
             {"tag": "direct", "protocol": "freedom", "settings": {}},
             {"tag": "block", "protocol": "blackhole", "settings": {}},
         ],
-        "routing": {"domainStrategy": "AsIs", "rules": rules},
+        "routing": {"domainStrategy": "IPOnDemand" if iran else "AsIs", "rules": rules},
         "policy": {"levels": {"8": {"connIdle": 300, "downlinkOnly": 1, "handshake": 4, "uplinkOnly": 1}}},
     }
 
@@ -9999,7 +10006,10 @@ class Shop:
         if head == "guide":
             g = self.app.cfg.get("shop_help") or ("📚 <b>راهنمای اتصال</b>\n\n1️⃣ اپ <b>Happ</b> (اندروید و آیفون) یا v2rayNG رو نصب کن.\n"
                                                   "2️⃣ از «📦 سرویس‌های من» لینک اشتراک رو کپی کن.\n3️⃣ توی اپ «+» بزن و «از کلیپ‌بورد» رو انتخاب کن.\n"
-                                                  "4️⃣ گزینه‌ی ⚡ Auto رو انتخاب کن و وصل شو.\n\nصفحه‌ی اشتراکت دکمه‌ی افزودن خودکار به اپ‌ها رو هم داره.")
+                                                  "4️⃣ گزینه‌ی ⚡ Auto رو انتخاب کن و وصل شو.\n\nصفحه‌ی اشتراکت دکمه‌ی افزودن خودکار به اپ‌ها رو هم داره.\n\n"
+                                                  "🏦 <b>اپ بانک یا سایت ایرانی گفت «VPN رو خاموش کن»؟</b>\n"
+                                                  "سایت‌ها و اپ‌های ایرانی توی Happ خودکار بدون VPN باز می‌شن. اگه اپی باز هم گیر داد، "
+                                                  "توی تنظیمات اپ VPN بخش <b>Per-App Proxy / اپ‌های جدا</b> رو باز کن و اون اپ رو <b>از VPN خارج کن</b> (Bypass).")
             return self.show(net, chat, g, [self.back()], mid)
         return self.main_menu(net, chat, uid, mid)
 
@@ -11236,6 +11246,7 @@ function render(){
   <div class="card"><h2>${ic("help")} راهنما</h2>
    <details open><summary>چطور وصل شم؟</summary><ol><li>اپ <b>Happ</b> (یا یکی دیگه از اپ‌های بالا) رو نصب کن.</li><li>دکمه‌ی «افزودن» رو بزن؛ اگه باز نشد، لینک رو کپی کن و در اپ به‌عنوان Subscription اضافه کن.</li><li>گزینه‌ی <b>⚡ Auto</b> رو انتخاب کن و وصل شو.</li></ol></details>
    <details><summary>وصل نمی‌شه؟</summary><ol><li>توی اپ، اشتراک رو آپدیت کن (Update subscription).</li><li>گزینه‌ی Auto یا یکی دیگه از کانفیگ‌ها رو امتحان کن.</li><li>اگه حجم یا زمانت تموم شده، برای تمدید پیام بده.</li></ol></details>
+   <details><summary>اپ بانک یا سایت ایرانی می‌گه VPN رو خاموش کن؟</summary><p>سایت‌ها و اپ‌های ایرانی توی Happ خودکار بدون VPN باز می‌شن؛ اول اشتراک رو توی اپ آپدیت کن. اگه اپی باز هم گیر داد، توی تنظیمات اپ VPN بخش «Per-App Proxy» (اپ‌های جدا) رو باز کن و اون اپ رو از VPN خارج کن (Bypass).</p></details>
    <details><summary>تمدید کنم چی می‌شه؟</summary><p>لینکت عوض نمی‌شه. بعد از تمدید فقط اشتراک رو توی اپ آپدیت کن.</p></details>
    ${D.bot||D.support?`<a class="btn block" style="margin-top:10px" href="${D.bot?`https://t.me/${esc(D.bot)}?start=t_${esc(location.pathname.split("/").filter(Boolean).pop())}`:esc(D.support)}" target="_blank" rel="noopener">${ic("chat")} پشتیبانی و تمدید</a>`:""}
    ${D.bot?`<a class="btn ghost block" style="margin-top:8px" href="https://t.me/${esc(D.bot)}?start=s_${esc(location.pathname.split("/").filter(Boolean).pop())}" target="_blank" rel="noopener">${ic("bell")} یادآوری تمدید توی تلگرام</a>`:""}</div>

@@ -128,7 +128,9 @@ class ProfileTests(unittest.TestCase):
         ws = next(p for p in prof["proxies"] if p["name"] == "Deco1 · user1-ws")
         self.assertEqual(ws["ws-opts"], {"path": "/ws", "headers": {"Host": "cdn.example.com"}})
         self.assertEqual(ws["alpn"], ["h2", "http/1.1"])
-        self.assertEqual(prof["rules"], ["DOMAIN-SUFFIX,ir,DIRECT", "MATCH," + xc.G_MAIN])
+        self.assertEqual(prof["rules"][0], "DOMAIN-SUFFIX,ir,DIRECT")
+        self.assertIn("DOMAIN-SUFFIX,digikala.com,DIRECT", prof["rules"])
+        self.assertEqual(prof["rules"][-2:], ["GEOIP,IR,DIRECT", "MATCH," + xc.G_MAIN])  # Iranian IPs direct, the rest through
         for g in prof["proxy-groups"]:
             for member in g["proxies"]:
                 self.assertTrue(member in names or member in groups, member)
