@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.23.1"
+VERSION = "5.23.2"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -10028,7 +10028,7 @@ class Shop:
                              "expiry": x["expiry"], "link": self.bot.sub_link(sub)})
         me = (self.bot.me.get("tg") or {}).get("username", "")
         pub = lambda p: dict({k: p.get(k) for k in ("id", "gb", "days", "price", "devices", "desc", "kind")},
-                             name=self.plan_title(p), span=self.span(p.get("days")))
+                             name=self.plan_title(p), own=not self.GENERIC.match(str(p.get("name") or "")), span=self.span(p.get("days")))
         return {"title": cfg.get("title") or NAME, "welcome": cfg.get("shop_welcome") or "", "name": u.get("name", ""),
                 "wallet": u.get("wallet", 0), "services": svcs,
                 "plans": [pub(p) for p in sorted(self.plans(), key=self.plan_order)],
@@ -10132,7 +10132,8 @@ class Shop:
             self.save()
             self.wait["tg:%s" % chat] = {"what": "receipt", "order": o["id"]}
             self.show(net, chat, self.card_text(o), self.card_rows(o, net))
-            return True, {"cards": [{"number": c[0], "holder": c[1], "bank": c[2]} for c in self.cards()], "total": self.total(o)}
+            return True, {"cards": [{"number": c[0], "holder": c[1], "bank": c[2]} for c in self.cards()], "total": self.total(o),
+                          "cents": o.get("cents", 0)}
         if action == "trial":
             err, sub = self.make_trial(uid, net, chat)
             if err:
@@ -10864,7 +10865,7 @@ V.home=()=>{const n=(D.name||"").split(" ")[0];
    <h2>سرویس‌های من <small>${fa(D.services.length)}</small></h2>
    ${D.services.length?D.services.map(svcCard).join(""):`<div class="card empty"><span class="e">📦</span>هنوز سرویسی نداری<div style="height:10px"></div><button class="btn" onclick="go('buy')">🛍 خرید اولین سرویس</button></div>`}`};
 function planCard(p,i,act){return `<button class="plan" style="animation-delay:${i*35}ms" onclick="${act}"><div class="gb">${p.gb?fa(+p.gb)+' <small>گیگ</small>':"∞"}</div>
-  <div class="nm">${esc(p.name)}</div><div class="d">${p.kind==="traffic"?"به حجم فعلی اضافه می‌شه":esc(p.span||"")}${p.devices?" · "+fa(p.devices)+" دستگاه":""}</div><div class="pr">${tm(p.price)} <small style="font-weight:500">تومان</small></div></button>`}
+  ${p.own?`<div class="nm">${esc(p.name)}</div>`:""}<div class="d">${p.kind==="traffic"?"به حجم فعلی اضافه می‌شه":esc(p.span||"")}${p.devices?" · "+fa(p.devices)+" دستگاه":""}</div><div class="pr">${tm(p.price)} <small style="font-weight:500">تومان</small></div></button>`}
 function builderSheet(mode,sub){const C=D.custom;if(!C)return;const lo=mode==="addon"?0:1;let gb=mode==="addon"?0:30,dy=mode==="addon"?0:30;
   const draw=()=>{const price=gb*C.gb+dy*C.day,ok=price>0&&(gb||dy);
    $("#bld").innerHTML=`<div class="stepper"><span class="lb">📦 حجم</span><button onclick="bs('g',-10)">−۱۰</button><button onclick="bs('g',-1)">−</button><b>${fa(gb)}<small> گیگ</small></b><button onclick="bs('g',1)">+</button><button onclick="bs('g',10)">+۱۰</button></div>
@@ -10920,10 +10921,12 @@ async function payWallet(id){if(busy)return;busy=true;try{
   if(j.ok){okHap("success");sheet(`<div class="empty"><span class="e">🎉</span><b>انجام شد!</b><br>${j.link?"لینک اشتراک توی چت ربات هم فرستاده شد.":"کیف پولت به‌روز شد."}</div>${j.link?`<div class="link">${esc(j.link)}</div><button class="btn block" onclick="copy(${q(j.link)})">📋 کپی لینک</button>`:""}<div style="height:8px"></div><button class="btn ghost block" onclick="closeSheet();go('home')">سرویس‌های من</button>`)}
   else{okHap("error");sheet(`<div class="empty"><span class="e">⚠️</span>${esc(j.error)}</div><button class="btn block" onclick="closeSheet()">باشه</button>`)}}finally{busy=false}}
 async function payCard(id){if(busy)return;busy=true;try{const j=await api("card",{id});if(!j.ok)return toast(j.error);okHap("success");
-  sheet(`<h3>💳 کارت به کارت</h3><p class="mut" style="margin-top:-6px">مبلغ <b style="color:var(--fg)">${tm(j.total)} تومان</b> رو واریز کن:</p>
-   ${j.cards.map(c=>`<div class="cardbox" onclick="copy(${q(c.number.replace(/[^\d]/g,""))})"><div style="opacity:.7;font-size:12px">${esc(c.bank||"")}</div><div class="n">${esc(c.number)}</div><div class="h">${esc(c.holder)} · برای کپی لمس کن</div></div>`).join("")}
-   <div class="note">📸 بعد از واریز، <b>عکس رسید</b> رو توی چت ربات بفرست. فاکتور و کارت‌ها توی چت هم فرستاده شدن. بعد از تأیید، سرویس خودکار فعال می‌شه.</div>
-   <button class="btn block" onclick="tg.close()">📸 رفتن به چت و ارسال رسید</button>`)}finally{busy=false}}
+  sheet(`<h3>💳 کارت به کارت</h3><p class="mut" style="margin-top:-6px">${j.cents?"دقیقاً":"مبلغ"} <b style="color:var(--fg)">${tm(j.total)} تومان</b> رو واریز کن:</p>
+   <button class="btn ghost block" style="margin-bottom:10px" onclick="copy(${q(String(j.total))})">📋 کپی مبلغ: ${tm(j.total)} تومان</button>
+   ${j.cards.map(c=>`<div class="cardbox" onclick="copy(${q(c.number.replace(/[^\d]/g,""))})"><div style="opacity:.7;font-size:12px">${esc(c.bank||"")}</div><div class="n">${esc(c.number)}</div><div class="h">${c.holder?esc(c.holder)+" · ":""}برای کپی شماره کارت لمس کن</div></div>`).join("")}
+   ${j.cents?`<div class="note">⚡️ برای <b>تأیید سریع و خودکار</b>، <b>دقیقاً همین مبلغ</b> رو واریز کن (${fa(j.cents)} تومان هم تخفیف گرفتی 🎁). چند ثانیه بعد از واریز، سرویست توی چت ربات تحویل داده می‌شه.<br>اگه مبلغ دیگه‌ای زدی، عکس رسید یا کد رهگیری رو توی چت ربات بفرست.</div>`
+     :`<div class="note">📸 بعد از واریز، <b>عکس رسید</b> یا <b>کد رهگیری</b> رو توی چت ربات بفرست. بعد از تأیید، سرویس خودکار فعال می‌شه.</div>`}
+   <button class="btn block" onclick="tg.close()">${j.cents?"💬 رفتن به چت ربات":"📸 رفتن به چت و ارسال رسید"}</button>`)}finally{busy=false}}
 async function trial(){if(busy)return;busy=true;hap("medium");try{const j=await api("trial");await load();
   if(j.ok){okHap("success");sheet(`<div class="empty"><span class="e">🎁</span><b>تست رایگانت آماده‌ست!</b></div><div class="link">${esc(j.link)}</div><button class="btn block" onclick="copy(${q(j.link)})">📋 کپی لینک</button><div style="height:8px"></div><button class="btn ghost block" onclick="guide()">📚 راهنمای اتصال</button>`)}else toast(j.error)}finally{busy=false}}
 function giftSheet(){sheet(`<h3>🎁 کد هدیه</h3><div class="in"><input id="gc" placeholder="کد رو اینجا بنویس" style="direction:ltr;text-align:center;font-size:17px"></div><div style="height:10px"></div><button class="btn block" onclick="gift()">ثبت</button>`);setTimeout(()=>$("#gc").focus(),200)}
