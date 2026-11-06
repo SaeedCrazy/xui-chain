@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.23.0"
+VERSION = "5.23.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -10396,10 +10396,17 @@ class AdminBot:
         def t(key, label):
             on = bool(cfg.get(key))
             return ("%s %s" % ("🟢" if on else "⚪️", label), "a:tg:%s" % key)
-        rows = [[t("shop_enable", "فروشگاه")], [t("shop_channel_on", "عضویت اجباری کانال")], [t("shop_phone", "گرفتن شماره در شروع")],
-                [t("user_page", "صفحه‌ی اشتراک مشتری")], [t("skip_down", "حذف موقت مسیر قطع از ساب")],
-                [("⬅️ پنل", "a:home")]]
-        self.show(net, chat, "⚙️ <b>تنظیمات سریع</b>\nلمس کن تا روشن یا خاموش بشه. بقیه‌ی تنظیمات توی پنل وب.", rows, msg)
+        rows = [[t("shop_enable", "فروشگاه")], [t("sms_on", "🤖 تأیید خودکار با پیامک بانک")], [t("shop_channel_on", "عضویت اجباری کانال")],
+                [t("shop_phone", "گرفتن شماره در شروع")], [t("user_page", "صفحه‌ی اشتراک مشتری")], [t("skip_down", "حذف موقت مسیر قطع از ساب")]]
+        text = "⚙️ <b>تنظیمات سریع</b>\nلمس کن تا روشن یا خاموش بشه. بقیه‌ی تنظیمات توی پنل وب."
+        url = sms_url(self.app) if cfg.get("sms_on") else ""
+        if url:
+            text += ("\n\n🤖 <b>آدرس پیامک برای اپ گوشی</b> (لمس کن تا کپی بشه؛ به کسی نده):\n<code>%s</code>\n"
+                     "توی اپ «SMS to URL Forwarder» همین رو به‌عنوان Webhook URL بذار.") % self.sh.esc(url)
+            if net == "tg":
+                rows.insert(2, [("📋 کپی آدرس پیامک", "copy:" + url)])
+        rows.append([("⬅️ پنل", "a:home")])
+        self.show(net, chat, text, rows, msg)
 
     def emoji_help(self, net, chat, msg):
         cur = self.sh.emoji_map()
@@ -10567,10 +10574,12 @@ class AdminBot:
             self.shop_menu(net, chat, mid)
         elif head == "tg":
             key = parts[2]
-            if key not in ("shop_enable", "user_page", "skip_down", "shop_channel_on", "shop_phone"):
+            if key not in ("shop_enable", "user_page", "skip_down", "shop_channel_on", "shop_phone", "sms_on"):
                 return ""
             cfg = load_config()
             cfg[key] = not cfg.get(key, key in ("user_page", "skip_down", "shop_channel_on"))
+            if key == "sms_on" and cfg[key] and not cfg.get("sms_token"):
+                cfg["sms_token"] = secrets.token_urlsafe(18)
             save_config(cfg)
             self.app.reload()
             threading.Thread(target=self.bot.menu_button, daemon=True).start()

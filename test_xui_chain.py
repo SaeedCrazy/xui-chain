@@ -2091,6 +2091,19 @@ class ShopTests(BotBase):
         self.assertEqual((o["status"], o["receipt_kind"], o["receipt_code"]), ("review", "code", "12345678"))
         self.assertIn("رسیدت رسید", BotAPI.sent[-1]["text"])
 
+    def test_sms_toggle_in_bot_admin(self):
+        cfg = xc.load_config()
+        cfg["bot_owner"] = "42"
+        xc.save_config(cfg)
+        self.app.reload()
+        self.shop.app_url = lambda: "https://sub.example.com:2097/app/"
+        self.admin_tap(42, "a:tg:sms_on")
+        cfg = xc.load_config()
+        self.assertTrue(cfg["sms_on"] and cfg["sms_token"])
+        m = BotAPI.sent[-1]
+        self.assertIn("https://sub.example.com:2097/sms/" + cfg["sms_token"], m["text"])
+        self.assertIn("copy_text", json.dumps(m["reply_markup"]))
+
     def test_bank_sms_approves_the_exact_amount(self):
         cfg = xc.load_config()
         cfg.update(sms_on=True, sms_token="t0k")
