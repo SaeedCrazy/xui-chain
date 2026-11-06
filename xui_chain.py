@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.23.2"
+VERSION = "5.23.3"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -8426,6 +8426,11 @@ def toman(n):
     return ("{:,}".format(int(round(n or 0))).replace(",", "٬") + " تومان").translate(FA_DIGITS)
 
 
+def rial(toman_amount):
+    """What to type in a bank app: the amount in rial."""
+    return ("{:,}".format(int(round(toman_amount or 0)) * 10).replace(",", "٬") + " ریال").translate(FA_DIGITS)
+
+
 def fa_num(n):
     return str(n).translate(FA_DIGITS)
 
@@ -9244,15 +9249,15 @@ class Shop:
         cards = "\n".join("💳 <code>%s</code>%s" % (re.sub(r"\D", "", c[0]), "\n👤 " + " · ".join(self.esc(x) for x in c[1:3] if x) if c[1] or c[2] else "")
                           for c in self.cards())
         if o.get("cents"):
-            return ("%s\n\n💳 <b>کارت به کارت</b>\nدقیقاً <b>%s</b> رو به این کارت واریز کن:\n\n%s\n"
+            return ("%s\n\n💳 <b>کارت به کارت</b>\nدقیقاً این مبلغ رو به این کارت واریز کن:\n💰 <b>%s</b>  <i>(%s)</i>\n\n%s\n"
                     "👆 روی شماره بزن تا کپی بشه.\n\n"
-                    "⚡️ با واریز <b>همین مبلغ دقیق</b>، سرویست <b>خودکار</b> فعال می‌شه (%s تومان هم تخفیف گرفتی 🎁).\n"
+                    "⚡️ برای <b>تأیید سریع و خودکار</b>، <b>دقیقاً همین مبلغ</b> رو بزن (%s تومان هم تخفیف گرفتی 🎁).\n"
                     "اگه مبلغ دیگه‌ای زدی، عکس رسید یا کد رهگیری رو همین‌جا بفرست.") % (
-                self.order_head(o), toman(self.total(o)), cards, fa_num(o["cents"]))
-        return ("%s\n\n💳 <b>کارت به کارت</b>\nمبلغ <b>%s</b> رو به این کارت واریز کن:\n\n%s\n"
+                self.order_head(o), rial(self.total(o)), toman(self.total(o)), cards, fa_num(o["cents"]))
+        return ("%s\n\n💳 <b>کارت به کارت</b>\nاین مبلغ رو به این کارت واریز کن:\n💰 <b>%s</b>  <i>(%s)</i>\n\n%s\n"
                 "👆 روی شماره بزن تا کپی بشه.\n\n"
                 "📸 بعد از واریز، <b>عکس رسید</b> یا <b>کد رهگیری</b> رو همین‌جا بفرست؛ بعد از تأیید، خودکار فعال می‌شه.") % (
-            self.order_head(o), toman(self.total(o)), cards)
+            self.order_head(o), rial(self.total(o)), toman(self.total(o)), cards)
 
     def card_rows(self, o, net):
         rows = []
@@ -9261,7 +9266,7 @@ class Shop:
             for c in cards[:3]:
                 num = re.sub(r"\D", "", c[0])
                 rows.append([("📋 کپی شماره کارت" + (" …%s" % num[-4:] if len(cards) > 1 else ""), "copy:" + num, "primary")])
-            rows.append([("📋 کپی مبلغ: %s تومان" % fa_num("{:,}".format(self.total(o))).replace(",", "٬"), "copy:%d" % self.total(o))])
+            rows.append([("📋 کپی مبلغ: %s" % rial(self.total(o)), "copy:%d" % (self.total(o) * 10))])
         return rows + [[("✖️ انصراف", "x:%s" % o["id"])]]
 
     # actions ----------------------------------------------------------------------
@@ -10921,8 +10926,9 @@ async function payWallet(id){if(busy)return;busy=true;try{
   if(j.ok){okHap("success");sheet(`<div class="empty"><span class="e">🎉</span><b>انجام شد!</b><br>${j.link?"لینک اشتراک توی چت ربات هم فرستاده شد.":"کیف پولت به‌روز شد."}</div>${j.link?`<div class="link">${esc(j.link)}</div><button class="btn block" onclick="copy(${q(j.link)})">📋 کپی لینک</button>`:""}<div style="height:8px"></div><button class="btn ghost block" onclick="closeSheet();go('home')">سرویس‌های من</button>`)}
   else{okHap("error");sheet(`<div class="empty"><span class="e">⚠️</span>${esc(j.error)}</div><button class="btn block" onclick="closeSheet()">باشه</button>`)}}finally{busy=false}}
 async function payCard(id){if(busy)return;busy=true;try{const j=await api("card",{id});if(!j.ok)return toast(j.error);okHap("success");
-  sheet(`<h3>💳 کارت به کارت</h3><p class="mut" style="margin-top:-6px">${j.cents?"دقیقاً":"مبلغ"} <b style="color:var(--fg)">${tm(j.total)} تومان</b> رو واریز کن:</p>
-   <button class="btn ghost block" style="margin-bottom:10px" onclick="copy(${q(String(j.total))})">📋 کپی مبلغ: ${tm(j.total)} تومان</button>
+  sheet(`<h3>💳 کارت به کارت</h3><p class="mut" style="margin-top:-6px">${j.cents?"دقیقاً این مبلغ":"این مبلغ"} رو واریز کن:</p>
+   <div style="font-size:22px;font-weight:800;margin:-2px 0 2px">${tm(j.total*10)} <small style="font-weight:600">ریال</small></div><div class="mut" style="font-size:13px;margin-bottom:8px">(${tm(j.total)} تومان)</div>
+   <button class="btn ghost block" style="margin-bottom:10px" onclick="copy(${q(String(j.total*10))})">📋 کپی مبلغ به ریال</button>
    ${j.cards.map(c=>`<div class="cardbox" onclick="copy(${q(c.number.replace(/[^\d]/g,""))})"><div style="opacity:.7;font-size:12px">${esc(c.bank||"")}</div><div class="n">${esc(c.number)}</div><div class="h">${c.holder?esc(c.holder)+" · ":""}برای کپی شماره کارت لمس کن</div></div>`).join("")}
    ${j.cents?`<div class="note">⚡️ برای <b>تأیید سریع و خودکار</b>، <b>دقیقاً همین مبلغ</b> رو واریز کن (${fa(j.cents)} تومان هم تخفیف گرفتی 🎁). چند ثانیه بعد از واریز، سرویست توی چت ربات تحویل داده می‌شه.<br>اگه مبلغ دیگه‌ای زدی، عکس رسید یا کد رهگیری رو توی چت ربات بفرست.</div>`
      :`<div class="note">📸 بعد از واریز، <b>عکس رسید</b> یا <b>کد رهگیری</b> رو توی چت ربات بفرست. بعد از تأیید، سرویس خودکار فعال می‌شه.</div>`}

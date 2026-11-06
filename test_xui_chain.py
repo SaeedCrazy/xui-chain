@@ -2116,7 +2116,8 @@ class ShopTests(BotBase):
         self.assertEqual(total, 150000 - o["cents"])
         page = BotAPI.sent[-1]["text"]
         self.assertIn("دقیقاً", page)
-        self.assertIn('"copy_text": {"text": "%d"}' % total, json.dumps(BotAPI.sent[-1]["reply_markup"]))
+        self.assertIn('"copy_text": {"text": "%d"}' % (total * 10), json.dumps(BotAPI.sent[-1]["reply_markup"]))  # rial, as typed in a bank app
+        self.assertIn(xc.rial(total), page)
         self.tap(990, "bp:p30")
         o2 = self.shop.d["orders"][-1]
         self.assertNotEqual(self.shop.total(o2), total)  # every open invoice has its own amount
