@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.24.0"
+VERSION = "5.25.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -9139,13 +9139,50 @@ class Shop:
 
     def svc_menu(self, net, chat, uid, msg, renew=False):
         svcs = [(s, x) for s, x in self.services(uid, "%s:%s" % (net, chat)) if x]
+        more = [[("➕ افزودن سرویس با لینک اشتراک", "sva")], [("🛒 خرید سرویس جدید", "buy")]]
         if not svcs:
-            return self.show(net, chat, "هنوز سرویسی نداری.\nاز «🛒 خرید سرویس» شروع کن، یا اگه قبلاً خریدی لینک اشتراکت رو همین‌جا بفرست.",
-                             [[("🛒 خرید سرویس", "buy")], self.back()], msg)
-        if len(svcs) == 1:  # nothing to choose
-            return self.buy_menu(net, chat, msg, sub=svcs[0][0]) if renew else self.svc_detail(net, chat, uid, svcs[0][0], msg, only=True)
+            return self.show(net, chat, "📦 <b>سرویس‌های من</b>\n\nهنوز سرویسی اینجا نداری.\n"
+                             "اگه قبلاً سرویس گرفتی، با «➕ افزودن» لینک اشتراکش رو بفرست؛ وگرنه یه سرویس جدید بخر.", more + [self.back()], msg)
+        if renew and len(svcs) == 1:  # nothing to choose
+            return self.buy_menu(net, chat, msg, sub=svcs[0][0])
         rows = [[("%s %s · %s" % ("🟢" if self.active(x) else "🔴", x["name"], self.left_line(x)), ("rn:%s" if renew else "sv:%s") % s)] for s, x in svcs]
-        self.show(net, chat, "🔄 <b>کدوم سرویس رو تمدید کنیم؟</b>" if renew else "📦 <b>سرویس‌های من</b>", rows + [self.back()], msg)
+        if renew:
+            return self.show(net, chat, "🔄 <b>کدوم سرویس رو تمدید کنیم؟</b>", rows + [self.back()], msg)
+        self.show(net, chat, "📦 <b>سرویس‌های من</b>\nروی هر سرویس بزن تا جزئیات، لینک و تمدیدش بیاد.", rows + more + [self.back()], msg)
+
+    def add_sub(self, net, chat, uid, text):
+        """A customer adds a service they already have by sending its subscription link."""
+        cid = "%s:%s" % (net, chat)
+        cancel = [[("✖️ انصراف", "svc", "")]]
+        if self.bot.locked(cid):
+            return self.show(net, chat, "چند بار لینک اشتباه فرستادی؛ ۱۰ دقیقه دیگه دوباره امتحان کن.", cancel)
+        m = SUB_RE.search(text.strip())
+        x = self.bot.user_of(m.group(1)) if m else None
+        if not x:
+            with self.bot.lock:
+                self.bot.st["tries"].setdefault(cid, []).append(time.time())
+            self.wait[cid] = {"what": "addsub"}
+            return self.show(net, chat, "❌ این لینک پیدا نشد. لینک اشتراک رو <b>کامل</b> بفرست (از صفحه‌ی اشتراک یا اپ کپی کن).", cancel)
+        with self.lock:
+            subs = self.user(uid).setdefault("subs", [])
+            if x["sub"] not in subs:
+                subs.append(x["sub"])
+        self.save()
+        with self.bot.lock:  # reminders before it runs out, like a sub linked from the user page
+            self.bot.st["customers"].setdefault(cid, {"sub": x["sub"], "name": self.user(uid).get("name", ""), "at": int(time.time())})
+        self.bot.save()
+        self.svc_detail(net, chat, uid, x["sub"], None, note="✅ سرویس به «سرویس‌های من» اضافه شد.")
+
+    def remove_sub(self, uid, cid, sub):
+        """Take a service off the customer's list; the service itself stays in the panel."""
+        with self.lock:
+            u = self.user(uid)
+            u["subs"] = [x for x in u.get("subs") or [] if x != sub]
+        self.save()
+        with self.bot.lock:
+            if (self.bot.st["customers"].get(cid) or {}).get("sub") == sub:
+                self.bot.st["customers"].pop(cid, None)
+        self.bot.save()
 
     @staticmethod
     def gb_fa(b):
@@ -9165,12 +9202,12 @@ class Shop:
         ms = time.time() * 1000
         return x["enable"] and not (x["expiry"] > 0 and x["expiry"] < ms) and not (x["total"] and x["used"] >= x["total"])
 
-    def svc_detail(self, net, chat, uid, sub, msg, only=False):
+    def svc_detail(self, net, chat, uid, sub, msg, note=""):
         x = next((x for s, x in self.services(uid, "%s:%s" % (net, chat)) if s == sub and x), None)
         if not x:
             return self.show(net, chat, "این سرویس پیدا نشد.", [self.back("svc")], msg)
         ms = time.time() * 1000
-        lines = ["📦 <b>%s</b>  %s" % (self.esc(x["name"]), "🟢 فعال" if self.active(x) else "🔴 غیرفعال")]
+        lines = ([note + "\n"] if note else []) + ["📦 <b>%s</b>  %s" % (self.esc(x["name"]), "🟢 فعال" if self.active(x) else "🔴 غیرفعال")]
         if x["total"]:
             left = max(0, x["total"] - x["used"])
             lines.append("\n📊 حجم: %s\n%s گیگ مانده از %s گیگ" % (bar(1 - x["used"] / x["total"]), self.gb_fa(left), self.gb_fa(x["total"])))
@@ -9188,7 +9225,10 @@ class Shop:
         elif self.plans("traffic"):
             rows[0].append(("➕ حجم اضافه", "tf:%s" % sub))
         rows.append([("📱 صفحه‌ی اشتراک و آموزش", self.bot.sub_link(sub))])
-        rows.append(self.back("m" if only else "svc"))
+        if net == "tg":
+            rows.append([("📋 کپی لینک اشتراک", "copy:" + self.bot.sub_link(sub))])
+        rows.append([("🗑 حذف از لیست من", "svd:%s" % sub, "danger")])
+        rows.append(self.back("svc"))
         self.show(net, chat, "\n".join(lines), rows, msg)
 
     def traffic_menu(self, net, chat, sub, msg):
@@ -9400,6 +9440,8 @@ class Shop:
                 return self.apply_code(net, chat, uid, w["order"], text)
             if w["what"] == "gift":
                 return self.redeem(net, chat, uid, text)
+            if w["what"] == "addsub":
+                return self.add_sub(net, chat, uid, text) or True
         cmd, _, arg = text.partition(" ")
         if cmd.split("@")[0].lower() in ("/start", "/menu", "/shop"):
             self.wait.pop(cid, None)
@@ -9947,6 +9989,19 @@ class Shop:
         if head == "renew":
             return self.svc_menu(net, chat, uid, mid, renew=True)
         if head == "svc":
+            return self.svc_menu(net, chat, uid, mid)
+        if head == "sva":
+            self.wait[cid] = {"what": "addsub"}
+            return self.show(net, chat, "➕ <b>افزودن سرویس</b>\n\nلینک اشتراک سرویست رو همین‌جا بفرست (از صفحه‌ی اشتراک یا اپ کپی کن):",
+                             [[("✖️ انصراف", "svc", "")]], mid)
+        if head in ("svd", "svx"):
+            if rest not in [s for s, _ in self.services(uid, cid)]:
+                return self.svc_menu(net, chat, uid, mid)
+            if head == "svd":
+                return self.show(net, chat, "🗑 <b>این سرویس از لیستت برداشته بشه؟</b>\n\nخود سرویس و لینکش <b>کار می‌کنه</b> و حذف نمی‌شه؛ "
+                                 "فقط از «سرویس‌های من» برداشته می‌شه و دیگه یادآوری تمدیدش نمیاد. هر وقت خواستی با لینکش دوباره اضافه‌ش کن.",
+                                 [[("🗑 بله، از لیستم بردار", "svx:%s" % rest, "danger")], [("⬅️ نه، برگرد", "sv:%s" % rest, "")]], mid)
+            self.remove_sub(uid, cid, rest)
             return self.svc_menu(net, chat, uid, mid)
         if head == "sv":
             return self.svc_detail(net, chat, uid, rest, mid)

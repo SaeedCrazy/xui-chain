@@ -2141,6 +2141,27 @@ class ShopTests(BotBase):
         self.app.reload()
         self.assertIn("مجاز", self.shop.got_sms("واریز: 5,000,000", sender="12345")["note"])
 
+    def test_my_services_add_by_link_and_remove(self):
+        out = self.tap(994, "svc")
+        datas = json.dumps(BotAPI.sent[-1]["reply_markup"])
+        self.assertIn('"sva"', datas)
+        self.assertIn('"buy"', datas)
+        self.tap(994, "sva")
+        self.say(994, "https://sub.example.com/chain/nosuchsub999")
+        self.assertIn("پیدا نشد", BotAPI.sent[-1]["text"])
+        self.say(994, "https://sub.example.com/chain/omidsub12345")  # still waiting for the link
+        self.assertIn("اضافه شد", BotAPI.sent[-1]["text"])
+        self.assertIn("svd:omidsub12345", json.dumps(BotAPI.sent[-1]["reply_markup"]))
+        self.assertEqual(self.shop.user("tg:994")["subs"], ["omidsub12345"])
+        self.tap(994, "svc")  # one service is still a list to choose from
+        self.assertIn("sv:omidsub12345", json.dumps(BotAPI.sent[-1]["reply_markup"]))
+        self.assertIn("برداشته بشه", self.tap(994, "svd:omidsub12345"))
+        self.tap(994, "svx:omidsub12345")
+        self.assertEqual(self.shop.user("tg:994")["subs"], [])
+        self.assertNotIn("tg:994", self.bot.st["customers"])
+        self.assertEqual(self.panel.deleted if hasattr(self.panel, "deleted") else [], [])  # never deleted from the panel
+        self.assertIn("هنوز سرویسی", self.tap(994, "svc"))
+
     def test_support_button_links_sub_and_opens_tickets(self):
         out = self.say(986, "/start t_sarasub12345")  # "support" on the user page
         self.assertIn("پشتیبانی", out)
