@@ -1903,7 +1903,12 @@ class ShopTests(BotBase):
         self.assertEqual(self.panel.added[0][:3], ("tg500", 30, 30))
         self.assertEqual(self.panel.added[0][4], [1])  # every customer protocol, no mtproto
         self.assertEqual(self.bot.st["customers"]["tg:500"]["sub"], o["sub"])
-        self.assertIn(o["sub"], [m["text"] for m in BotAPI.sent if m["chat_id"] == "500"][-1])
+        card = [m for m in BotAPI.sent if str(m["chat_id"]) == "500"][-1]
+        self.assertEqual((card["method"], card["photo"]), ("sendPhoto", "<upload>"))  # the QR card
+        self.assertIn(o["sub"], card["caption"])
+        self.assertIn('"copy_text"', card["reply_markup"])
+        png = xc.qr_card("https://sub.example.com/chain/" + o["sub"])
+        self.assertEqual(xc.png_read(png)[:3], (720, 720, 3))  # no brand card: a plain QR
         self.assertTrue(any(m[0] == "editMessageReplyMarkup" for m in BotAPI.other))
         self.assertIn("قبلاً", self.shop.review(oid, True))  # no second fulfilment
 
@@ -2133,7 +2138,7 @@ class ShopTests(BotBase):
         self.assertEqual(self.shop.got_sms(sms)["matched"], [o["id"]])
         self.assertEqual(o["status"], "done")
         self.assertEqual(self.panel.added[-1][:3], ("tg989", 30, 30))
-        self.assertTrue(any("آماده" in (m.get("text") or "") and str(m["chat_id"]) == "989" for m in BotAPI.sent))
+        self.assertTrue(any("آماده" in (m.get("text") or m.get("caption") or "") and str(m["chat_id"]) == "989" for m in BotAPI.sent))
         self.assertEqual(self.shop.got_sms(sms)["note"], "تکراری")  # the same SMS twice counts once
         self.assertEqual(o2["status"], "receipt")
         self.assertEqual(self.shop.got_sms("+%s" % "{:,}".format(self.shop.total(o2) * 10), sender="999")["matched"], [o2["id"]])
@@ -2141,6 +2146,17 @@ class ShopTests(BotBase):
         xc.save_config(cfg)
         self.app.reload()
         self.assertIn("مجاز", self.shop.got_sms("واریز: 5,000,000", sender="12345")["note"])
+
+    def test_qr_matrix_shape(self):
+        g = xc.qr_matrix("https://sub.shelbyping.com:2097/chain/neoll2tbmlb1m0mg")
+        self.assertEqual(len(g), 41)  # version 6 at level H
+        for x, y in ((0, 0), (34, 0), (0, 34)):  # finder patterns
+            self.assertTrue(all(g[y][x + i] and g[y + 6][x + i] for i in range(7)))
+            self.assertFalse(any(g[y + 1][x + i] for i in range(1, 6)))
+        self.assertTrue(g[41 - 8][8])  # the dark module
+        self.assertEqual(len(xc.qr_matrix("x" * 300)), 89)  # version 18 at level H
+        with self.assertRaises(ValueError):
+            xc.qr_matrix("x" * 2000)
 
     def test_buyer_details_and_user_notes(self):
         self.shop.user("tg:995", {"id": 995, "first_name": "Neda", "username": "neda_x"})["phone"] = "+989121234567"

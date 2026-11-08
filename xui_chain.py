@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.26.0"
+VERSION = "5.27.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -7829,6 +7829,352 @@ def api_post(url, body, ctype, timeout):
     raise OSError("connection lost")
 
 
+# ---------------------------------------------------------------- QR codes and PNG (stdlib only)
+# QR: byte mode, error correction H (Q when H does not fit), versions 1-20, after Nayuki's
+# reference algorithm. PNG: 8-bit RGB/RGBA, enough to fill a brand template and send it as a photo.
+
+_QR_ECC = {  # level -> (EC codewords per block, number of blocks) for versions 1..20
+    "Q": ((13, 1), (22, 1), (18, 2), (26, 2), (18, 4), (24, 4), (18, 6), (22, 6), (20, 8), (24, 8),
+          (28, 8), (26, 10), (24, 12), (20, 16), (30, 12), (24, 17), (28, 16), (28, 18), (26, 21), (30, 20)),
+    "H": ((17, 1), (28, 1), (22, 2), (16, 4), (22, 4), (28, 4), (26, 5), (26, 6), (24, 8), (28, 8),
+          (24, 11), (28, 11), (22, 16), (24, 16), (24, 18), (30, 16), (28, 19), (28, 21), (26, 25), (28, 25)),
+}
+_QR_FORMAT = {"Q": 3, "H": 2}
+
+
+def _gf_mul(x, y):
+    z = 0
+    for i in range(7, -1, -1):
+        z = (z << 1) ^ ((z >> 7) * 0x11D)
+        z ^= ((y >> i) & 1) * x
+    return z
+
+
+def _rs_divisor(degree):
+    out, root = [0] * (degree - 1) + [1], 1
+    for _ in range(degree):
+        for j in range(len(out)):
+            out[j] = _gf_mul(out[j], root)
+            if j + 1 < len(out):
+                out[j] ^= out[j + 1]
+        root = _gf_mul(root, 2)
+    return out
+
+
+def _rs_remainder(data, divisor):
+    out = [0] * len(divisor)
+    for b in data:
+        factor = b ^ out.pop(0)
+        out.append(0)
+        for i, coef in enumerate(divisor):
+            out[i] ^= _gf_mul(coef, factor)
+    return out
+
+
+def _qr_raw_modules(ver):
+    n = (16 * ver + 128) * ver + 64
+    if ver >= 2:
+        k = ver // 7 + 2
+        n -= (25 * k - 10) * k - 55
+        if ver >= 7:
+            n -= 36
+    return n
+
+
+def _qr_align(ver):
+    if ver == 1:
+        return []
+    k, size = ver // 7 + 2, ver * 4 + 17
+    step = (ver * 8 + k * 3 + 5) // (k * 4 - 4) * 2
+    return [6] + sorted(size - 7 - i * step for i in range(k - 1))
+
+
+def qr_matrix(text):
+    """A QR code for text -> list of rows of booleans (True = dark), without the quiet zone."""
+    data = text.encode("utf-8")
+    for level in ("H", "Q"):
+        for ver in range(1, 21):
+            ecc, blocks = _QR_ECC[level][ver - 1]
+            cap = _qr_raw_modules(ver) // 8 - ecc * blocks
+            bits = 4 + (8 if ver < 10 else 16) + 8 * len(data)
+            if bits <= cap * 8:
+                break
+        else:
+            continue
+        break
+    else:
+        raise ValueError("text too long for a QR code")
+    size = ver * 4 + 17
+    # data codewords
+    bb = []
+    put = lambda v, n: bb.extend((v >> i) & 1 for i in range(n - 1, -1, -1))
+    put(4, 4)
+    put(len(data), 8 if ver < 10 else 16)
+    for b in data:
+        put(b, 8)
+    put(0, min(4, cap * 8 - len(bb)))
+    put(0, (-len(bb)) % 8)
+    words = [int("".join(map(str, bb[i:i + 8])), 2) for i in range(0, len(bb), 8)]
+    pad = 0xEC
+    while len(words) < cap:
+        words.append(pad)
+        pad ^= 0xEC ^ 0x11
+    # error correction, interleaved
+    raw = _qr_raw_modules(ver) // 8
+    short_n = blocks - raw % blocks
+    short_len = raw // blocks
+    div = _rs_divisor(ecc)
+    blks, k = [], 0
+    for i in range(blocks):
+        dat = words[k:k + short_len - ecc + (0 if i < short_n else 1)]
+        k += len(dat)
+        e = _rs_remainder(dat, div)
+        if i < short_n:
+            dat = dat + [0]
+        blks.append(dat + e)
+    stream = [blk[i] for i in range(len(blks[0])) for j, blk in enumerate(blks) if i != short_len - ecc or j >= short_n]
+    # function patterns
+    m = [[False] * size for _ in range(size)]
+    fn = [[False] * size for _ in range(size)]
+
+    def setf(x, y, dark):
+        m[y][x], fn[y][x] = dark, True
+    for i in range(size):
+        setf(6, i, i % 2 == 0)
+        setf(i, 6, i % 2 == 0)
+    for cx, cy in ((3, 3), (size - 4, 3), (3, size - 4)):
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                if 0 <= cx + dx < size and 0 <= cy + dy < size:
+                    setf(cx + dx, cy + dy, max(abs(dx), abs(dy)) not in (2, 4))
+    al = _qr_align(ver)
+    for i, ax in enumerate(al):
+        for j, ay in enumerate(al):
+            if (i, j) in ((0, 0), (0, len(al) - 1), (len(al) - 1, 0)):
+                continue
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    setf(ax + dx, ay + dy, max(abs(dx), abs(dy)) != 1)
+
+    def draw_format(mask):
+        d = _QR_FORMAT[level] << 3 | mask
+        r = d
+        for _ in range(10):
+            r = (r << 1) ^ ((r >> 9) * 0x537)
+        bits = (d << 10 | r) ^ 0x5412
+        g = lambda i: (bits >> i) & 1 == 1
+        for i in range(6):
+            setf(8, i, g(i))
+        setf(8, 7, g(6))
+        setf(8, 8, g(7))
+        setf(7, 8, g(8))
+        for i in range(9, 15):
+            setf(14 - i, 8, g(i))
+        for i in range(8):
+            setf(size - 1 - i, 8, g(i))
+        for i in range(8, 15):
+            setf(8, size - 15 + i, g(i))
+        setf(8, size - 8, True)
+    draw_format(0)
+    if ver >= 7:
+        r = ver
+        for _ in range(12):
+            r = (r << 1) ^ ((r >> 11) * 0x1F25)
+        bits = ver << 12 | r
+        for i in range(18):
+            a, b = size - 11 + i % 3, i // 3
+            setf(a, b, (bits >> i) & 1 == 1)
+            setf(b, a, (bits >> i) & 1 == 1)
+    # data, in the zigzag
+    i, right = 0, size - 1
+    while right >= 1:
+        if right == 6:
+            right = 5
+        for vert in range(size):
+            for jj in range(2):
+                x = right - jj
+                y = size - 1 - vert if ((right + 1) & 2) == 0 else vert
+                if not fn[y][x] and i < len(stream) * 8:
+                    m[y][x] = (stream[i >> 3] >> (7 - (i & 7))) & 1 == 1
+                    i += 1
+        right -= 2
+    # the mask with the lowest penalty
+    masks = (lambda x, y: (x + y) % 2 == 0, lambda x, y: y % 2 == 0, lambda x, y: x % 3 == 0,
+             lambda x, y: (x + y) % 3 == 0, lambda x, y: (x // 3 + y // 2) % 2 == 0,
+             lambda x, y: x * y % 2 + x * y % 3 == 0, lambda x, y: (x * y % 2 + x * y % 3) % 2 == 0,
+             lambda x, y: ((x + y) % 2 + x * y % 3) % 2 == 0)
+
+    def penalty(g):
+        p = 0
+        for line in g + [list(c) for c in zip(*g)]:
+            run = 1
+            for a, b in zip(line, line[1:]):
+                if a == b:
+                    run += 1
+                else:
+                    p += run - 2 if run >= 5 else 0
+                    run = 1
+            p += run - 2 if run >= 5 else 0
+        for y in range(size - 1):
+            for x in range(size - 1):
+                if g[y][x] == g[y][x + 1] == g[y + 1][x] == g[y + 1][x + 1]:
+                    p += 3
+        for line in g + [list(c) for c in zip(*g)]:  # finder-like stretches confuse readers
+            t = "0000" + "".join("1" if v else "0" for v in line) + "0000"
+            p += 40 * (t.count("10111010000") + t.count("00001011101"))
+        dark = sum(map(sum, g))
+        return p + abs(dark * 20 - size * size * 10) // (size * size) * 10
+    best = None
+    for k, f in enumerate(masks):
+        draw_format(k)
+        g = [[m[y][x] ^ (not fn[y][x] and f(x, y)) for x in range(size)] for y in range(size)]
+        score = penalty(g)
+        if best is None or score < best[0]:
+            best = (score, k, g)
+    draw_format(best[1])
+    g = best[2]
+    for y in range(size):  # the format bits drawn last
+        for x in range(size):
+            if fn[y][x]:
+                g[y][x] = m[y][x]
+    return g
+
+
+def png_read(data):
+    """8-bit RGB or RGBA PNG (not interlaced) -> (width, height, channels, pixels as bytearray)."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG")
+    pos, idat, w = 8, [], 0
+    while pos + 8 <= len(data):
+        n, typ = int.from_bytes(data[pos:pos + 4], "big"), data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + n]
+        pos += 12 + n
+        if typ == b"IHDR":
+            w, h = int.from_bytes(body[0:4], "big"), int.from_bytes(body[4:8], "big")
+            depth, ctype, interlace = body[8], body[9], body[12]
+            if depth != 8 or ctype not in (2, 6) or interlace:
+                raise ValueError("only 8-bit RGB/RGBA PNG")
+        elif typ == b"IDAT":
+            idat.append(body)
+        elif typ == b"IEND":
+            break
+    ch = 3 if ctype == 2 else 4
+    stride = w * ch
+    raw = zlib.decompress(b"".join(idat))
+    out, prev = bytearray(h * stride), bytearray(stride)
+    for y in range(h):
+        f = raw[y * (stride + 1)]
+        line = bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        if f == 1:
+            for i in range(ch, stride):
+                line[i] = (line[i] + line[i - ch]) & 255
+        elif f == 2:
+            line = bytearray((a + b) & 255 for a, b in zip(line, prev))
+        elif f == 3:
+            for i in range(stride):
+                line[i] = (line[i] + ((line[i - ch] if i >= ch else 0) + prev[i]) // 2) & 255
+        elif f == 4:
+            for i in range(stride):
+                a = line[i - ch] if i >= ch else 0
+                b, c = prev[i], (prev[i - ch] if i >= ch else 0)
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        out[y * stride:(y + 1) * stride] = line
+        prev = line
+    return w, h, ch, out
+
+
+def png_write(w, h, rgb, level=6):
+    """RGB pixels -> PNG bytes (rows unfiltered: quick to make, zlib does the rest)."""
+    stride = w * 3
+    raw = b"".join(b"\x00" + bytes(rgb[y * stride:(y + 1) * stride]) for y in range(h))
+
+    def chunk(t, b):
+        return len(b).to_bytes(4, "big") + t + b + zlib.crc32(t + b).to_bytes(4, "big")
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", w.to_bytes(4, "big") + h.to_bytes(4, "big") + bytes([8, 2, 0, 0, 0]))
+            + chunk(b"IDAT", zlib.compress(raw, level)) + chunk(b"IEND", b""))
+
+QR_BOX = (255, 375, 570)  # where the QR goes on brand/qr-card.png (x, y, size on a 1080-wide card)
+_BRAND_PNG = {}
+
+
+def brand_png(name):
+    """A brand PNG decoded once (and again when the file changes); None when there is none."""
+    p = brand_file(name)
+    if not p:
+        return None
+    key = (os.path.getmtime(p), os.path.getsize(p))
+    hit = _BRAND_PNG.get(name)
+    if not hit or hit[0] != key:
+        try:
+            with open(p, "rb") as f:
+                w, h, ch, px = png_read(f.read())
+        except (OSError, ValueError, zlib.error):
+            return None
+        if name == "qr-card.png" and ch == 4:  # the card is opaque: keep RGB
+            px = bytearray(b for i in range(0, len(px), 4) for b in px[i:i + 3])
+            ch = 3
+        hit = _BRAND_PNG[name] = (key, (w, h, ch, px))
+    return hit[1]
+
+
+def qr_card(link):
+    """The subscription as a picture: the brand card (brand/qr-card.png) with the QR on its white plate
+    and the logo (brand/qr-logo.png) in the middle; a plain white QR when there is no card. -> PNG bytes"""
+    g = qr_matrix(link)
+    card = brand_png("qr-card.png")
+    if card and card[0] >= 600:
+        w, h, _, px = card
+        rgb = bytearray(px)
+        k = w / 1080.0
+        bx, by, bs = (int(v * k) for v in QR_BOX)
+    else:
+        w = h = 720
+        rgb = bytearray(b"\xff" * (w * h * 3))
+        bx, by, bs = 40, 40, 640
+    n = len(g)
+    scale = max(2, bs // (n + 2))
+    ox, oy = bx + (bs - scale * n) // 2, by + (bs - scale * n) // 2
+    dark = bytes((11, 20, 48))
+
+    def rrect(x0, y0, size, r, colour):  # a filled rounded square, in pixels
+        for yy in range(size):
+            d = max(0, r - yy, yy - (size - 1 - r))
+            cut = r - int((r * r - d * d) ** 0.5) if d else 0
+            i = ((y0 + yy) * w + x0) * 3
+            rgb[i + cut * 3:i + (size - cut) * 3] = colour * (size - 2 * cut)
+    eyes = ((0, 0), (n - 7, 0), (0, n - 7))
+    for y, row in enumerate(g):  # square modules: what every reader expects
+        for x, on in enumerate(row):
+            if on and not any(ex <= x < ex + 7 and ey <= y < ey + 7 for ex, ey in eyes):
+                i = ((oy + y * scale) * w + ox + x * scale) * 3
+                for r in range(scale):
+                    rgb[i + r * w * 3:i + r * w * 3 + scale * 3] = dark * scale
+    white = b"\xff\xff\xff"
+    for ex, ey in eyes:  # the three corner eyes, rounded
+        x0, y0 = ox + ex * scale, oy + ey * scale
+        rrect(x0, y0, 7 * scale, int(0.5 * scale), dark)
+        rrect(x0 + scale, y0 + scale, 5 * scale, int(0.35 * scale), white)
+        rrect(x0 + 2 * scale, y0 + 2 * scale, 3 * scale, int(0.25 * scale), dark)
+    logo = brand_png("qr-logo.png")
+    if logo and logo[0] <= scale * n * 0.26 and logo[1] <= scale * n * 0.26:
+        lw, lh, lch, lpx = logo
+        lx, ly = ox + (scale * n - lw) // 2, oy + (scale * n - lh) // 2
+        for yy in range(lh):
+            for xx in range(lw):
+                j = (yy * lw + xx) * lch
+                a = lpx[j + 3] if lch == 4 else 255
+                if not a:
+                    continue
+                i = ((ly + yy) * w + lx + xx) * 3
+                if a == 255:
+                    rgb[i:i + 3] = lpx[j:j + 3]
+                else:
+                    rgb[i:i + 3] = bytes((lpx[j + c] * a + rgb[i + c] * (255 - a)) // 255 for c in range(3))
+    return png_write(w, h, rgb, 3)
+
+
 BTN_ME, BTN_LINK, BTN_HELP = "📊 وضعیت من", "🔗 لینک اشتراک", "💬 پشتیبانی"
 
 
@@ -8493,7 +8839,7 @@ def shop_path():
     return conf_path("shop.json")
 
 
-BRAND_FILES = ("mark.svg", "mark.png", "avatar-640.png", "banner.png", "banner.svg", "display.ttf")
+BRAND_FILES = ("mark.svg", "mark.png", "avatar-640.png", "banner.png", "banner.svg", "display.ttf", "qr-card.png", "qr-logo.png")
 
 
 def brand_file(name):
@@ -9268,6 +9614,7 @@ class Shop:
         rows.append([("📱 صفحه‌ی اشتراک و آموزش", self.bot.sub_link(sub))])
         if net == "tg":
             rows.append([("📋 کپی لینک اشتراک", "copy:" + self.bot.sub_link(sub))])
+        rows.append([("🔳 QR کد اشتراک", "qr:%s" % sub)])
         rows.append([("🗑 حذف از لیست من", "svd:%s" % sub, "danger")])
         rows.append(self.back("svc"))
         self.show(net, chat, "\n".join(lines), rows, msg)
@@ -9819,9 +10166,60 @@ class Shop:
 
     def delivered(self, net, chat, sub, head, msg=None):
         link = self.bot.sub_link(sub)
-        self.show(net, chat, "%s %s\n\n🔗 لینک اشتراک (لمس کن تا کپی بشه):\n<code>%s</code>\n\n📱 آموزش اتصال و دکمه‌ی افزودن به اپ‌ها توی صفحه‌ی اشتراکه." % (self.em("party", "🎉"), head, self.esc(link)),
-                  [[("📱 صفحه‌ی اشتراک و آموزش", link, "primary")], [("📚 راهنمای اتصال", "guide"), ("📦 سرویس‌های من", "svc")],
-                   [("🏠 منوی اصلی", "m")]], msg, effect="party")
+        text = "%s %s\n\n🔗 لینک اشتراک (لمس کن تا کپی بشه):\n<code>%s</code>\n\n📷 QR رو با اپ اسکن کن، یا لینک رو کپی کن و توی اپ اضافه کن." % (
+            self.em("party", "🎉"), head, self.esc(link))
+        rows = ([[("📋 کپی لینک اشتراک", "copy:" + link, "success")]] if net == "tg" else []) + [
+            [("📱 صفحه‌ی اشتراک و آموزش", link, "primary")], [("📚 راهنمای اتصال", "guide"), ("📦 سرویس‌های من", "svc")],
+            [("🏠 منوی اصلی", "m")]]
+        if msg:
+            for m, k in (("editMessageText", "text"), ("editMessageCaption", "caption")):
+                try:
+                    self.bot.call(net, m, {"chat_id": chat, "message_id": msg, k: "✅"})
+                    break
+                except (ValueError, OSError):
+                    pass
+        if not self.send_qr(net, chat, sub, text, rows, effect="party"):
+            self.show(net, chat, text, rows, effect="party")
+
+    def send_qr(self, net, chat, sub, caption, rows, effect=None):
+        """The subscription card (QR + logo) as a photo with this caption. -> True when sent."""
+        link = self.bot.sub_link(sub)
+        card = brand_file("qr-card.png")
+        key = "%s:%s:%s" % (net, sub, int(os.path.getmtime(card)) if card else 0)
+        payload = {"chat_id": chat, "caption": caption[:1024], "parse_mode": "HTML", "reply_markup": self.kb(rows, net)}
+        if effect and net == "tg" and not str(chat).startswith("-"):
+            payload["message_effect_id"] = self.EFFECT.get(effect, effect)
+        for attempt in (0, 1):
+            try:
+                fid = (self.d.get("qr") or {}).get(key)
+                if fid:
+                    return bool(self.bot.call(net, "sendPhoto", dict(payload, photo=fid)))
+                res = self.bot.upload(net, "sendPhoto", payload, "photo", "pingo.png", qr_card(link), "image/png")
+                sizes = (res or {}).get("photo") or []
+                if sizes:
+                    with self.lock:
+                        cache = self.d.setdefault("qr", {})
+                        cache[key] = sizes[-1]["file_id"]
+                        if len(cache) > 1000:
+                            for k in list(cache)[:200]:
+                                cache.pop(k, None)
+                    self.save()
+                return True
+            except (ValueError, OSError) as e:
+                if attempt == 0 and re.search(r"effect", str(e), re.I):
+                    payload.pop("message_effect_id", None)
+                    continue
+                if attempt == 0 and re.search(r"emoji|style|button|entit", str(e), re.I) and not getattr(self, "plain", False):
+                    self.plain = True
+                    payload["reply_markup"] = self.kb(rows, net)
+                    payload["caption"] = re.sub(r'<tg-emoji emoji-id="\d+">(.*?)</tg-emoji>', r"\1", payload["caption"])
+                    continue
+                self.bot.log(net, chat, "shop", "qr: " + str(e)[:150])
+                return False
+            except Exception as e:  # never lose a delivery over the picture
+                print("qr card: %s" % e, flush=True)
+                return False
+        return False
 
     def buyer_of(self, uid):
         """What we know about a customer: name, @username, Telegram id, phone."""
@@ -10056,6 +10454,14 @@ class Shop:
             return self.svc_menu(net, chat, uid, mid, renew=True)
         if head == "svc":
             return self.svc_menu(net, chat, uid, mid)
+        if head == "qr":
+            if rest not in [sb for sb, _ in self.services(uid, cid)]:
+                return self.svc_menu(net, chat, uid, mid)
+            link = self.bot.sub_link(rest)
+            rows = ([[("📋 کپی لینک اشتراک", "copy:" + link, "success")]] if net == "tg" else []) + [[("📦 سرویس‌های من", "svc"), ("🏠 منوی اصلی", "m")]]
+            if not self.send_qr(net, chat, rest, "🔳 <b>QR اشتراکت</b>\n\n🔗 <code>%s</code>\n\nبا اپ اسکن کن یا لینک رو کپی کن." % self.esc(link), rows):
+                self.show(net, chat, "⚠️ عکس ساخته نشد؛ لینک:\n<code>%s</code>" % self.esc(link), rows)
+            return
         if head == "sva":
             self.wait[cid] = {"what": "addsub"}
             return self.show(net, chat, "➕ <b>افزودن سرویس</b>\n\nلینک اشتراک سرویست رو همین‌جا بفرست (از صفحه‌ی اشتراک یا اپ کپی کن):",

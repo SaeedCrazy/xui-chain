@@ -127,3 +127,37 @@ ui += f'<rect x="140" y="880" width="1320" height="22" rx="11" fill="#fff" opaci
 ui += f'<text x="1460" y="960" font-family="{BODY}" font-weight="600" font-size="28" fill="{MIST}" text-anchor="end">‏۲۰٫۵ گیگ از ‏۳۰ گیگ مانده ‏•‏ ۱۸ روز‏</text>'
 write("ui-kit", 1600, 1100, ui, .75)
 print("ok")
+
+# 6. BotFather description picture, exactly 640x360 (drawn at 1280x720 and scaled)
+R = "‏"
+desc = (f'<rect width="1280" height="720" fill="url(#night)"/>'
+        + aurora(1280, 720, [(1000, 160, 230, AUR, .55), (1180, 600, 240, ICE, .55), (160, 640, 260, AQUA, .25)])
+        + glass(56, 56, 1168, 608, 72)
+        + f'<circle cx="980" cy="370" r="200" fill="{ICE}" opacity=".16" filter="url(#blur30)"/>'
+        + penguin(980, 392, 1.25)
+        + f'<text x="760" y="250" font-family="{DISPLAY}" font-size="140" fill="{SNOW}" text-anchor="end">پینگو</text>'
+        + f'<text x="760" y="350" font-family="{DISPLAY}" font-size="58" fill="url(#iceh)" text-anchor="end">همراه و رفیق تو</text>'
+        + pill(150, 420, 290, 76, "پشتیبانی واقعی", glow=AUR, size=27)
+        + pill(470, 420, 290, 76, "اتصال سریع", glow=ICE, size=27)
+        + f'<text x="150" y="600" font-family="{BODY}" font-weight="700" font-size="24" fill="{MIST}" letter-spacing="8">PINGO • VPN</text>')
+write("botfather-640x360", 1280, 720, desc, .5)
+
+# 7. subscription QR card (EZ fills the white plate with the QR; box = 255,375,570 on 1080x1350)
+qr = (f'<rect width="1080" height="1350" fill="url(#night)"/>'
+      + aurora(1080, 1350, [(900, 180, 260, AUR, .55), (160, 420, 240, ICE, .45), (980, 1180, 280, AQUA, .30), (120, 1260, 220, AUR3, .25)])
+      + glass(48, 48, 984, 1254, 72)
+      + f'<text x="540" y="200" font-family="{DISPLAY}" font-size="104" fill="{SNOW}" text-anchor="middle">پینگو</text>'
+      + f'<text x="540" y="282" font-family="{DISPLAY}" font-size="46" fill="url(#iceh)" text-anchor="middle">اشتراکت آماده‌ست</text>'
+      + f'<rect x="200" y="356" width="680" height="640" rx="64" fill="{ICE}" opacity=".35" filter="url(#blur60)"/>'
+      + f'<rect x="230" y="350" width="620" height="620" rx="56" fill="#FFFFFF"/>'
+      + f'<rect x="230.75" y="350.75" width="618.5" height="618.5" rx="56" fill="none" stroke="url(#rim)" stroke-width="1.5"/>'
+      + f'<text x="540" y="1062" font-family="{BODY}" font-weight="800" font-size="36" fill="{SNOW}" text-anchor="middle">با اپ اسکن کن یا لینک رو کپی کن</text>'
+      + f'<text x="540" y="1112" font-family="{BODY}" font-weight="600" font-size="27" fill="{MIST}" text-anchor="middle">لینک اشتراک زیر همین عکسه {R}• لمس کن تا کپی بشه</text>'
+      + pill(178, 1150, 220, 64, "Happ", glow=ICE, size=26) + pill(430, 1150, 220, 64, "v2rayNG", size=26) + pill(682, 1150, 220, 64, "Streisand", glow=AUR, size=26)
+      + f'<text x="540" y="1268" font-family="{BODY}" font-weight="700" font-size="24" fill="{MIST}" letter-spacing="8" text-anchor="middle">PINGO • VPN</text>')
+write("qr-card", 1080, 1350, qr)
+logo = (f'<rect x="4" y="4" width="152" height="152" rx="40" fill="#FFFFFF"/>'
+        f'<rect x="12" y="12" width="136" height="136" rx="34" fill="url(#night)"/>'
+        + penguin(80, 88, .37))
+write("qr-logo", 160, 160, logo, .8)
+print("qr card ok")
