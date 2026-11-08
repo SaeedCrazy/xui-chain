@@ -1841,7 +1841,7 @@ class ShopTests(BotBase):
         BotAPI.other, BotAPI.outside = [], False
         cfg = xc.load_config()
         cfg.update(shop_enable=True, shop_cards="6037-1111-2222-3333 | Ali Test | Melli", shop_trial="1,1", shop_ref="10",
-                   shop_topups="100000,200000")
+                   shop_topups="100000,200000", notify_activity=False)  # background alerts would land in other tests
         xc.save_config(cfg)
         try:
             os.remove(xc.shop_path())
@@ -2149,6 +2149,35 @@ class ShopTests(BotBase):
         xc.save_config(cfg)
         self.app.reload()
         self.assertIn("مجاز", self.shop.got_sms("واریز: 5,000,000", sender="12345")["note"])
+
+    def test_admins_hear_what_customers_do(self):
+        cfg = xc.load_config()
+        cfg["notify_activity"] = True
+        xc.save_config(cfg)
+        self.app.reload()
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 996, "type": "private"}, "from": {"id": 996, "first_name": "Sara", "username": "sara_k"}, "text": "/start"})
+        self.tap(996, "bp:p30")
+        time.sleep(2)
+        to_admin = [m.get("text", "") for m in BotAPI.sent if str(m.get("chat_id")) == "100"]
+        self.assertTrue(any("کاربر جدید" in t and "@sara_k" in t and "996" in t for t in to_admin), to_admin)
+        self.assertTrue(any("سفارش #" in t for t in to_admin))
+        self.assertFalse(any(t.startswith("👆") for t in to_admin))  # every tap only when asked for
+        cfg = xc.load_config()
+        cfg["notify_taps"] = True
+        xc.save_config(cfg)
+        self.app.reload()
+        BotAPI.sent = []
+        self.tap(996, "svc")
+        time.sleep(0.5)
+        self.assertTrue(any(m.get("text", "").startswith("👆 سرویس‌های من") for m in BotAPI.sent if str(m.get("chat_id")) == "100"))
+        cfg.update(notify_taps=False, notify_activity=False)
+        xc.save_config(cfg)
+        self.app.reload()
+        BotAPI.sent = []
+        self.tap(996, "bp:p30")
+        time.sleep(0.5)
+        self.assertFalse([m for m in BotAPI.sent if str(m.get("chat_id")) == "100"])  # all off
 
     def test_qr_matrix_shape(self):
         g = xc.qr_matrix("https://sub.shelbyping.com:2097/chain/neoll2tbmlb1m0mg")

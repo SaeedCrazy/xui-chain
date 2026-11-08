@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.27.1"
+VERSION = "5.28.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -138,6 +138,8 @@ DEFAULTS = {
     "shop_custom_max": "500,365",  # largest custom plan "GB,days"
     "shop_channel_on": True,    # make customers join shop_channel first
     "shop_phone": False,        # ask customers for their phone number before anything else
+    "notify_activity": True,    # tell admins what customers do in the bot (new user, order, payment page, cancel, trial, gift...)
+    "notify_taps": False,       # ...and every button they tap (a lot)
     "sms_on": False,            # approve card payments from the bank's deposit SMS (forwarded to /sms/<sms_token>)
     "sms_token": "",            # secret part of that address (made when sms_on is turned on)
     "sms_senders": "",          # only SMS from these numbers (comma separated); empty = any
@@ -4760,6 +4762,7 @@ def admin_state(app, host):
                                                           "shop_inbounds", "shop_prefix", "shop_welcome", "shop_help", "shop_gb_price",
                                                           "shop_day_price", "shop_custom_max")},
                          channel_on=bool(cfg.get("shop_channel_on", True)), phone=bool(cfg.get("shop_phone")), phone_ir=bool(cfg.get("shop_phone_ir")),
+                         notify_activity=bool(cfg.get("notify_activity", True)), notify_taps=bool(cfg.get("notify_taps")),
                          sms_on=bool(cfg.get("sms_on")), sms_senders=cfg.get("sms_senders", ""), sms_url=sms_url(app)),
         "routes": rts,
         "cf": cf_public(cfg),
@@ -4825,7 +4828,7 @@ def net_state(app):
             "iran": [s["id"] for s in net.servers() if s.get("role") == "iran"]}
 
 
-SETTING_BOOLS = ("sms_on", "bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
+SETTING_BOOLS = ("notify_activity", "notify_taps", "sms_on", "bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
                  "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable", "shop_channel_on", "shop_phone", "shop_phone_ir",
                  "brand_font_licensed")
 SETTING_TEXTS = {"sms_senders": 200, "brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
@@ -7171,6 +7174,9 @@ SHOPV.set=sh=>{const s=S.state.settings,c=S.state.shop_cfg||{};
    <div class="sec" style="margin:10px 2px 4px"><h3>🎛 پلن دلخواه (مشتری خودش حجم و روز رو انتخاب می‌کنه)</h3></div>
    <div class="cols2">${field("shop_gb_price","قیمت هر گیگ (تومان)",c.gb_price||"",'class="in ltr" inputmode="numeric" placeholder="10000"')}${field("shop_day_price","قیمت هر روز (تومان)",c.day_price||"",'class="in ltr" inputmode="numeric" placeholder="1000"')}</div>
    ${field("shop_custom_max","سقف (گیگ,روز)",c.custom_max||"500,365",'class="in ltr" placeholder="500,365"',"هر دو قیمت صفر = پلن دلخواه خاموش. با روشن بودنش، مشتری روی هر سرویس «➕ حجم و زمان» هم داره.")}
+   <div class="sec" style="margin:10px 2px 4px"><h3>🔔 اعلان‌ها برای تو</h3></div>
+   ${sw("notify_activity",c.notify_activity,"کارهای مشتری‌ها","عضو جدید، تأیید شماره، سفارش، رفتن به کارت به کارت، لغو، تست رایگان، کد هدیه، افزودن/حذف سرویس")}
+   ${sw("notify_taps",c.notify_taps,"همه‌ی کلیک‌ها","هر دکمه‌ای که مشتری می‌زنه؛ خیلی زیاده، فقط برای وقتی که می‌خوای دقیق ببینی")}
    <div class="sec" style="margin:10px 2px 4px"><h3>🤖 تأیید خودکار با پیامک بانک</h3></div>
    ${sw("sms_on",c.sms_on,"تأیید خودکار کارت به کارت","هر فاکتور یه مبلغ یکتا می‌گیره (تا ۹۹۹ تومان کمتر). پیامک واریز همون مبلغ که برسه، سفارش خودکار تأیید می‌شه.")}
    ${c.sms_on&&c.sms_url?`<div class="f"><span>آدرس برای اپ گوشی</span><div class="in ltr" style="word-break:break-all;font-size:12px">${esc(c.sms_url)}</div>
@@ -7761,7 +7767,7 @@ def bot_chat_ids(api, token):
 # /status and /user. Customers link their chat by sending their subscription link (or one tap from
 # their page) and get reminders before their time or volume runs out, and their usage on demand.
 
-BOT_EVENTS = (("shop", "فروش: رسیدها و سفارش‌ها"), ("tickets", "تیکت‌های پشتیبانی"), ("deco", "قطع و وصل واسط‌ها و تانل‌ها"), ("quota", "حجم و زمان واسط‌ها"),
+BOT_EVENTS = (("activity", "کارهای مشتری‌ها: عضو جدید، سفارش، پرداخت، لغو، تست، کد هدیه"), ("shop", "فروش: رسیدها و سفارش‌ها"), ("tickets", "تیکت‌های پشتیبانی"), ("deco", "قطع و وصل واسط‌ها و تانل‌ها"), ("quota", "حجم و زمان واسط‌ها"),
               ("users", "خلاصه‌ی روزانه‌ی کاربرهای رو به پایان"), ("backup", "خطای بکاپ"))
 BOT_NETS = {"tg": "تلگرام", "bale": "بله"}
 def sms_url(app):
@@ -8974,11 +8980,36 @@ class Shop:
 
     def user(self, uid, who=None):
         with self.lock:
+            new = uid not in self.d["users"]
             u = self.d["users"].setdefault(uid, {"wallet": 0, "subs": [], "trial": False, "joined": int(time.time()), "ref": ""})
             if who:
                 u["name"] = " ".join(x for x in (who.get("first_name"), who.get("last_name")) if x) or u.get("name", "")
                 u["username"] = who.get("username") or u.get("username", "")
-            return u
+        if new:
+            self.tell(uid, "🆕 کاربر جدید وارد ربات شد (کاربر شماره‌ی %s)" % fa_num(len(self.d["users"])), delay=1.5)
+        return u
+
+    TAPS = {"m": "منوی اصلی", "buy": "خرید سرویس", "renew": "تمدید", "svc": "سرویس‌های من", "sv": "جزئیات سرویس", "wallet": "کیف پول",
+            "tk": "پشتیبانی", "st": "وضعیت سرورها", "ord": "سفارش‌ها", "guide": "راهنمای اتصال", "gift": "کد هدیه", "trial": "تست رایگان",
+            "ref": "دعوت دوستان", "bp": "انتخاب پلن", "rp": "پلن تمدید", "tp": "حجم اضافه", "tu": "شارژ کیف پول", "cbo": "پلن دلخواه",
+            "cb": "تنظیم پلن دلخواه", "iv": "فاکتور", "pc": "کارت به کارت", "pw": "پرداخت از کیف پول", "x": "لغو سفارش", "dc": "کد تخفیف",
+            "rn": "تمدید سرویس", "tf": "حجم اضافه", "qr": "QR اشتراک", "sva": "افزودن سرویس", "svd": "حذف سرویس", "svx": "حذف سرویس"}
+
+    def tell(self, uid, what, delay=0, taps=False):
+        """Let the admins know what a customer did (in the background, never slowing the customer)."""
+        cfg = self.app.cfg
+        if not cfg.get("notify_taps" if taps else "notify_activity", not taps):
+            return
+
+        def go():
+            if delay:
+                time.sleep(delay)
+            u = self.d["users"].get(uid) or {}
+            net, _, tid = uid.partition(":")
+            who = " ".join(x for x in (u.get("name") or "بی‌نام", "@" + u["username"] if u.get("username") else "", "· " + tid,
+                                        "· " + u["phone"] if u.get("phone") else "") if x)
+            self.bot.notify_admins("activity", "%s\n👤 %s%s" % (what, who, " (بله)" if net == "bale" else ""))
+        threading.Thread(target=go, daemon=True).start()
 
     def plan(self, pid):
         return next((p for p in self.d["plans"] if p.get("id") == pid), None)
@@ -9000,6 +9031,7 @@ class Shop:
             self.d["orders"].append(o)
             self.d["orders"] = self.d["orders"][-3000:]
         self.save()
+        self.tell(uid, "🧾 سفارش #%s ساخت: %s · %s · %s" % (o["id"], self.KINDS.get(kind, kind), html.unescape(self.order_line(o)), toman(price)))
         return o
 
     def total(self, o):
@@ -9576,6 +9608,7 @@ class Shop:
         with self.bot.lock:  # reminders before it runs out, like a sub linked from the user page
             self.bot.st["customers"].setdefault(cid, {"sub": x["sub"], "name": self.user(uid).get("name", ""), "at": int(time.time())})
         self.bot.save()
+        self.tell(uid, "➕ سرویس %s رو با لینکش به ربات اضافه کرد" % x["name"])
         self.svc_detail(net, chat, uid, x["sub"], None, note="✅ سرویس به «سرویس‌های من» اضافه شد.")
 
     def remove_sub(self, uid, cid, sub):
@@ -9684,9 +9717,12 @@ class Shop:
         if o["status"] not in ("new", "receipt"):
             return self.show(net, chat, "این سفارش %s." % self.STATUS.get(o["status"]), [self.back()], msg)
         with self.lock:
+            fresh = o["status"] == "new"
             self.give_cents(o)
             o["status"], o["method"] = "receipt", "card"
         self.save()
+        if fresh:
+            self.tell(o["uid"], "💳 رفت برای کارت به کارت · سفارش #%s · %s" % (o["id"], rial(self.total(o))))
         self.wait["%s:%s" % (net, chat)] = {"what": "receipt", "order": o["id"]}
         self.show(net, chat, self.card_text(o), self.card_rows(o, net), msg)
 
@@ -9792,8 +9828,11 @@ class Shop:
             self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "⚠️ فقط شماره‌ی ایران (۹۸+) قبوله."})
             return True
         with self.lock:
+            had = self.user(uid, who).get("phone")
             self.user(uid, who)["phone"] = "+" + num
         self.save()
+        if not had:
+            self.tell(uid, "📱 شماره‌ش رو تأیید کرد: +%s" % num)
         try:
             self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "✅ شماره‌ت ثبت شد. خوش اومدی!\n⌨️ دکمه‌های اصلی پایین صفحه‌ست.",
                                                "reply_markup": self.quick_kb()})
@@ -9820,6 +9859,7 @@ class Shop:
         text = (msg.get("text") or "").strip()
         if text in self.QUICK:  # the keyboard at the bottom of the chat
             self.wait.pop(cid, None)
+            self.tell(uid, "👆 " + text, taps=True)
             if self.gate(net, chat, uid, who):
                 self.user(uid, who)
                 self.route(net, chat, uid, who, self.QUICK[text], None)
@@ -9987,6 +10027,7 @@ class Shop:
             return True
         u = self.user(uid)
         c = {"amount": amount}
+        self.tell(uid, "🎁 کد هدیه زد: +%s (موجودی %s)" % (toman(amount), toman(u.get("wallet", 0))))
         self.show(net, chat, "🎉 <b>%s</b> به کیف پولت اضافه شد!\nموجودی: %s" % (toman(c.get("amount")), toman(u["wallet"])),
                   [[("🛒 خرید سرویس", "buy")], self.back()])
         return True
@@ -10167,6 +10208,7 @@ class Shop:
             self.bot.notify_admins("shop", "⚠️ ساخت تست رایگان نشد: %s" % e)
             return "الان نشد؛ چند دقیقه‌ی دیگه دوباره امتحان کن 🙏", ""
         self.bot.users_changed()
+        self.tell(uid, "🆓 تست رایگان گرفت (%s گیگ · %s روز)" % (fa_num(_fmt_num(t[0])), fa_num(t[1])))
         with self.lock:
             u["trial"] = True
             u.setdefault("subs", []).append(sub)
@@ -10437,6 +10479,8 @@ class Shop:
                 if msg.get("photo"):
                     self.photo_menus.add((str(chat), mid))
                 self.user(uid, who)
+                head, _, rest = data.partition(":")
+                self.tell(uid, "👆 %s%s" % (self.TAPS.get(head, head), " · " + rest[:30] if rest else ""), taps=True)
                 self.route(net, chat, uid, who, data, mid)
                 return
         except Exception as e:
@@ -10492,6 +10536,7 @@ class Shop:
                                  "فقط از «سرویس‌های من» برداشته می‌شه و دیگه یادآوری تمدیدش نمیاد. هر وقت خواستی با لینکش دوباره اضافه‌ش کن.",
                                  [[("🗑 بله، از لیستم بردار", "svx:%s" % rest, "danger")], [("⬅️ نه، برگرد", "sv:%s" % rest, "")]], mid)
             self.remove_sub(uid, cid, rest)
+            self.tell(uid, "🗑 سرویس %s رو از لیستش برداشت" % rest)
             return self.svc_menu(net, chat, uid, mid)
         if head == "sv":
             return self.svc_detail(net, chat, uid, rest, mid)
@@ -10524,6 +10569,7 @@ class Shop:
             if o["status"] in ("new", "receipt"):
                 o["status"] = "cancelled"
                 self.save()
+                self.tell(uid, "✖️ سفارش #%s رو لغو کرد (%s)" % (o["id"], toman(self.total(o))))
             return self.main_menu(net, chat, uid, mid)
         if head == "pw":
             return self.pay_wallet(net, chat, uid, o, mid)
@@ -10980,7 +11026,8 @@ class AdminBot:
         def t(key, label):
             on = bool(cfg.get(key))
             return ("%s %s" % ("🟢" if on else "⚪️", label), "a:tg:%s" % key)
-        rows = [[t("shop_enable", "فروشگاه")], [t("sms_on", "🤖 تأیید خودکار با پیامک بانک")], [t("shop_channel_on", "عضویت اجباری کانال")],
+        rows = [[t("shop_enable", "فروشگاه")], [t("sms_on", "🤖 تأیید خودکار با پیامک بانک")],
+                [t("notify_activity", "🔔 اعلان کارهای مشتری‌ها")], [t("notify_taps", "👆 اعلان همه‌ی کلیک‌ها (زیاد)")], [t("shop_channel_on", "عضویت اجباری کانال")],
                 [t("shop_phone", "گرفتن شماره در شروع")], [t("user_page", "صفحه‌ی اشتراک مشتری")], [t("skip_down", "حذف موقت مسیر قطع از ساب")]]
         text = "⚙️ <b>تنظیمات سریع</b>\nلمس کن تا روشن یا خاموش بشه. بقیه‌ی تنظیمات توی پنل وب."
         url = sms_url(self.app) if cfg.get("sms_on") else ""
@@ -11207,10 +11254,10 @@ class AdminBot:
             self.shop_menu(net, chat, mid)
         elif head == "tg":
             key = parts[2]
-            if key not in ("shop_enable", "user_page", "skip_down", "shop_channel_on", "shop_phone", "sms_on"):
+            if key not in ("shop_enable", "user_page", "skip_down", "shop_channel_on", "shop_phone", "sms_on", "notify_activity", "notify_taps"):
                 return ""
             cfg = load_config()
-            cfg[key] = not cfg.get(key, key in ("user_page", "skip_down", "shop_channel_on"))
+            cfg[key] = not cfg.get(key, key in ("user_page", "skip_down", "shop_channel_on", "notify_activity"))
             if key == "sms_on" and cfg[key] and not cfg.get("sms_token"):
                 cfg["sms_token"] = secrets.token_urlsafe(18)
             save_config(cfg)
