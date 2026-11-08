@@ -2179,6 +2179,33 @@ class ShopTests(BotBase):
         time.sleep(0.5)
         self.assertFalse([m for m in BotAPI.sent if str(m.get("chat_id")) == "100"])  # all off
 
+    def test_admin_sees_bot_customers(self):
+        cfg = xc.load_config()
+        cfg["bot_owner"] = "42"
+        xc.save_config(cfg)
+        self.app.reload()
+        u = self.shop.user("tg:997", {"id": 997, "first_name": "Mina", "username": "mina_r"})
+        u["phone"], u["subs"] = "+989351112233", ["omidsub12345"]
+        m, _ = self.admin_tap(42, "a:cus:0")
+        self.assertIn("مشتری‌های ربات", m["text"])
+        self.assertIn("a:cu:tg:997", json.dumps(m["reply_markup"]))
+        m, _ = self.admin_tap(42, "a:cu:tg:997")
+        for bit in ("Mina", "@mina_r", "997", "+989351112233"):
+            self.assertIn(bit, m["text"])
+        self.assertIn("a:u:omidsub12345", json.dumps(m["reply_markup"]))  # their service opens its user card
+        self.admin_tap(42, "a:cuf")
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "9351112233"})
+        self.assertIn("a:cu:tg:997", json.dumps(BotAPI.sent[-1]["reply_markup"]))  # found by phone
+        self.admin_tap(42, "a:cw:tg:997")
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "۵۰۰۰۰"})
+        self.assertEqual(self.shop.user("tg:997")["wallet"], 50000)
+        self.admin_tap(42, "a:cm:tg:997")
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "سلام، سرویست تمدید شد"})
+        self.assertTrue(any(str(m["chat_id"]) == "997" and "سرویست تمدید شد" in m["text"] for m in BotAPI.sent))
+
     def test_qr_matrix_shape(self):
         g = xc.qr_matrix("https://sub.shelbyping.com:2097/chain/neoll2tbmlb1m0mg")
         self.assertEqual(len(g), 41)  # version 6 at level H

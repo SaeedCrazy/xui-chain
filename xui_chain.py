@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.28.0"
+VERSION = "5.29.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -7162,7 +7162,7 @@ SHOPV.plans=sh=>{const ps=(sh.plans||[]).slice().sort((a,b)=>(a.kind==="traffic"
   <div class="list">${ps.map(p=>`<div class="row btn-row" data-act="shop-plan" data-id="${p.id}">${mono(p.kind==="traffic"?"+GB":"📦",p.active!==false?"ok":"")}<div class="t"><b>${esc(p.name)}</b><small>${planLine(p)}${p.desc?" · "+esc(p.desc):""}</small></div><div class="r" style="flex-direction:column;align-items:flex-end;gap:3px"><span class="amt">${tmn(p.price)}</span>${p.active===false?'<span class="tag">مخفی</span>':""}</div></div>`).join("")||`<div class="empty">${ic("cart")}<p>هنوز پلنی نساختی.<br>مثلاً «۳۰ گیگ یک‌ماهه».</p></div>`}</div>`};
 SHOPV.codes=sh=>`<div class="toolbar"><button class="btn" data-act="shop-code">${ic("plus")} کد تخفیف</button><button class="btn ghost" data-act="shop-code" data-kind="gift">${ic("plus")} کد هدیه</button></div>
   <div class="list">${(sh.codes||[]).map(c=>`<div class="row btn-row" data-act="shop-code" data-code="${esc(c.code)}">${mono(c.kind==="gift"?"🎁":"%")}<div class="t"><b class="ltr" style="text-align:right">${esc(c.code)}</b><small>${c.kind==="gift"?"هدیه "+tmn(c.amount):c.pct?fa(c.pct)+"٪ تخفیف":tmn(c.amount)+" تخفیف"} · ${fa(c.used)}${c.max?" از "+fa(c.max):""} بار${c.exp?` · ${c.exp*1000<Date.now()?'<span class="bad">منقضی</span>':"تا "+new Intl.DateTimeFormat("fa-IR-u-ca-persian",{month:"long",day:"numeric"}).format(new Date(c.exp*1000))}`:""}</small></div></div>`).join("")||`<div class="note">کد تخفیف روی فاکتور اعمال می‌شه؛ کد هدیه کیف پول رو شارژ می‌کنه.</div>`}</div>`;
-SHOPV.cust=sh=>{const q=(S.cq||"").toLowerCase(),cs=(sh.customers||[]).filter(c=>!q||(c.name+" "+c.username+" "+c.id).toLowerCase().includes(q));
+SHOPV.cust=sh=>{const q=(S.cq||"").toLowerCase().replace(/^@/,""),cs=(sh.customers||[]).filter(c=>!q||(c.name+" "+c.username+" "+c.id+" "+(c.phone||"")).toLowerCase().includes(q));
   return `<input class="in" id="cq" placeholder="جستجو: اسم، یوزرنیم یا آیدی" value="${esc(S.cq||"")}" style="margin:6px 0 10px">
   <div class="list">${cs.slice(0,100).map(c=>`<div class="row btn-row" data-act="shop-cust" data-id="${esc(c.id)}"><div class="t"><b>${esc(c.name||c.id)} ${c.username?`<span class="mut xs ltr">@${esc(c.username)}</span>`:""}</b><small>${fa(c.subs)} سرویس · خرید ${tmn(c.spent)}</small></div><div class="r"><span class="amt">${tmn(c.wallet)}</span></div></div>`).join("")||`<div class="note">هنوز مشتری‌ای نیست.</div>`}</div>`};
 SHOPV.set=sh=>{const s=S.state.settings,c=S.state.shop_cfg||{};
@@ -7229,14 +7229,22 @@ function codeSheet(c,kind){c=c||{kind:kind||"discount"};const gift=c.kind==="gif
     const d=$("[data-del]",el);if(d)d.onclick=async()=>{const j=await act(null,"shop_code_delete",{code:c.code});if(j.ok)closeSheet()};
   });
 }
-function custSheet(c){
-  sheet(`<h3>${esc(c.name||c.id)}</h3>${c.username?`<p class="mut small ltr" style="text-align:right">@${esc(c.username)}</p>`:""}
-   ${c.phone?`<p class="mut small">📱 <span class="ltr">${esc(c.phone)}</span></p>`:""}
+function custSheet(c){const tid=c.id.split(":")[1];
+  sheet(`<h3>${esc(c.name||c.id)}</h3>
+   <div class="card" style="margin:6px 0 10px;padding:10px 12px">
+    <div class="kv"><span>یوزرنیم</span>${c.username?`<a class="ltr" href="https://t.me/${esc(c.username)}" target="_blank" rel="noopener">@${esc(c.username)}</a>`:'<span class="mut">ندارد</span>'}</div>
+    <div class="kv"><span>آیدی عددی</span><span class="ltr">${esc(tid)} <button type="button" class="lnk" data-act="copy" data-text="${esc(tid)}">کپی</button></span></div>
+    <div class="kv"><span>شماره</span>${c.phone?`<a class="ltr" href="tel:${esc(c.phone)}">${esc(c.phone)}</a>`:'<span class="mut">نداده</span>'}</div>
+    <div class="kv"><span>عضویت</span><span>${c.joined?new Intl.DateTimeFormat("fa-IR-u-ca-persian",{dateStyle:"medium",timeStyle:"short"}).format(new Date(c.joined*1000)):"—"}</span></div>
+    ${c.ref?`<div class="kv"><span>دعوت‌شده توسط</span><span>${esc(c.ref)}</span></div>`:""}${c.trial?`<div class="kv"><span>تست رایگان</span><span>گرفته</span></div>`:""}</div>
+   ${(c.sub_ids||[]).length?`<div class="sec"><h3>سرویس‌ها</h3></div><div class="list">${c.sub_ids.map(sb=>{const u=userBy(sb);return u?`<div class="row btn-row" data-act="share" data-sub="${esc(sb)}"><div class="t"><b class="ltr" style="text-align:right">${esc(u.name)}</b><small>${usage(u)} · ${daysText(u)}</small></div></div>`:""}).join("")}</div>`:""}
+   <form id="smf" style="margin-top:10px"><label class="f"><span>💬 پیام به مشتری (از طرف ربات)</span><textarea class="in" name="text" style="min-height:60px;font-family:inherit" required></textarea></label><button class="btn ghost block">${ic("check")} بفرست</button></form>
    <div class="tiles"><div class="tile2"><div class="k">کیف پول</div><div class="v">${tmn(c.wallet)}</div></div><div class="tile2"><div class="k">کل خرید</div><div class="v">${tmn(c.spent)}</div></div></div>
    <form id="swf"><label class="f"><span>تغییر کیف پول (تومان)</span><input class="in ltr" name="delta" inputmode="numeric" placeholder="50000 یا -20000" required></label>
    <div class="bar-btns"><button class="btn">${ic("check")} اعمال</button></div><div class="hint">به مشتری هم توی ربات خبر داده می‌شه.</div></form>
    <div class="sec" style="margin-top:12px"><h3>سفارش‌ها</h3></div><div class="list">${(S.state.shop.orders||[]).filter(o=>o.uid===c.id).slice(0,15).map(o=>ordRow(o)).join("")||'<div class="note">سفارشی نیست.</div>'}</div>`,el=>{
-    const f=$("#swf",el);f.onsubmit=async e=>{e.preventDefault();const v=f.delta.value.replace(/[^\d-]/g,"");const j=await act($("button.btn",f),"shop_wallet",{id:c.id,delta:v});if(j.ok)closeSheet()}});
+    const f=$("#swf",el);f.onsubmit=async e=>{e.preventDefault();const v=f.delta.value.replace(/[^\d-]/g,"");const j=await act($("button.btn",f),"shop_wallet",{id:c.id,delta:v});if(j.ok)closeSheet()};
+    const m=$("#smf",el);m.onsubmit=async e=>{e.preventDefault();const j=await act($("button",m),"shop_msg",{id:c.id,text:m.text.value.trim()});if(j.ok)m.text.value=""}});
 }
 function ordSheet(o){const st=OST[o.status]||["",o.status];
   sheet(`<h3>سفارش #${fa(o.id)} <span class="tag ${st[0]}">${st[1]}</span></h3>
@@ -10767,7 +10775,8 @@ class Shop:
                 "tickets": [dict(t, name=(users.get(t["uid"]) or {}).get("name", ""), username=(users.get(t["uid"]) or {}).get("username", ""))
                             for t in sorted(self.d["tickets"], key=lambda t: (t["status"] == "closed", -t["updated"]))[:150]],
                 "customers": sorted([{"id": k, "name": u.get("name", ""), "username": u.get("username", ""), "wallet": u.get("wallet", 0), "phone": u.get("phone", ""),
-                                      "subs": len(u.get("subs") or []), "joined": u.get("joined", 0),
+                                      "subs": len(u.get("subs") or []), "sub_ids": (u.get("subs") or [])[:10], "joined": u.get("joined", 0),
+                                      "trial": bool(u.get("trial")), "ref": (users.get(u.get("ref") or "") or {}).get("name", ""),
                                       "spent": sum(self.total(o) for o in done if o["uid"] == k)} for k, u in users.items()],
                                     key=lambda c: -c["joined"])[:300]}
 
@@ -10826,6 +10835,7 @@ class AdminBot:
             self.sh.em("admin", "🛠"), self.sh.esc(self.app.cfg.get("title") or NAME), fa_num(len(act)), fa_num(len(users)),
             fa_num(len(soon)), toman(st.get("today", 0)), "\n🧾 رسید منتظر: <b>%s</b>" % fa_num(rev) if rev else ""))
         rows = [[("👥 کاربرها", "a:users:0"), ("➕ کاربر جدید", "a:new")],
+                [("🧑‍💻 مشتری‌های ربات (%s)" % fa_num(len(self.sh.d["users"])), "a:cus:0")],
                 [("🧾 رسیدها%s" % (" (%s)" % fa_num(rev) if rev else ""), "a:rcpt", "success" if rev else ""), ("🛍 فروشگاه", "a:shop")],
                 [("📊 وضعیت سرور", "a:dash"), ("🛣 مسیرها", "a:routes")],
                 [("🎫 تیکت‌ها%s" % (" (%s)" % fa_num(self.open_tickets()) if self.open_tickets() else ""), "a:tks", "primary" if self.open_tickets() else ""),
@@ -10834,6 +10844,79 @@ class AdminBot:
                 [("✨ اموجی متحرک", "a:emoji"), ("⚙️ تنظیمات", "a:set")],
                 [("👁 نمای مشتری", "a:cust")]]
         self.show(net, chat, text, rows, msg)
+
+    def customers(self, net, chat, page, msg, q=""):
+        """Everyone who used the bot: newest first, searchable by name, @username, id or phone."""
+        users = self.sh.d["users"]
+        done = [o for o in self.sh.d["orders"] if o["status"] == "done" and o["kind"] != "topup"]
+        spent = {}
+        for o in done:
+            spent[o["uid"]] = spent.get(o["uid"], 0) + self.sh.total(o)
+        items = sorted(users.items(), key=lambda kv: -kv[1].get("joined", 0))
+        if q:
+            ql = q.lower().lstrip("@").strip()
+            items = [(k, u) for k, u in items if ql in " ".join([k, u.get("name", ""), u.get("username", ""), u.get("phone", "")]).lower()]
+        per = 10
+        pages = max(1, -(-len(items) // per))
+        page = min(max(0, page), pages - 1)
+        now = time.time()
+        day0 = now - (now + TEHRAN) % 86400
+        text = "🧑‍💻 <b>مشتری‌های ربات</b>\n👥 کل: <b>%s</b> · امروز: <b>%s</b> · خریدار: <b>%s</b>" % (
+            fa_num(len(users)), fa_num(sum(1 for u in users.values() if u.get("joined", 0) >= day0)), fa_num(len(spent)))
+        if q:
+            text += "\n🔎 «%s»: %s نتیجه" % (self.sh.esc(q), fa_num(len(items)))
+        if pages > 1:
+            text += "\nصفحه‌ی %s از %s" % (fa_num(page + 1), fa_num(pages))
+        text += "\n\n🛍 خریدار · 👤 هنوز خرید نکرده"
+        rows = [[("%s %s%s%s" % ("🛍" if spent.get(k) else "👤", (u.get("name") or k)[:18], " · @" + u["username"][:14] if u.get("username") else "",
+                                 " · " + toman(spent[k]) if spent.get(k) else ""), "a:cu:%s" % k)] for k, u in items[page * per:(page + 1) * per]]
+        nav = []
+        if page > 0:
+            nav.append(("➡️ قبلی", "a:cus:%d" % (page - 1)))
+        if page < pages - 1:
+            nav.append(("بعدی ⬅️", "a:cus:%d" % (page + 1)))
+        rows += [nav, [("🔎 جستجو", "a:cuf"), ("⬅️ پنل", "a:home")]]
+        if not items:
+            text += "\n\n" + ("کسی پیدا نشد." if q else "هنوز کسی ربات رو استارت نکرده.")
+        self.show(net, chat, text, rows, msg)
+
+    def customer(self, net, chat, uid, msg, note=""):
+        u = self.sh.d["users"].get(uid)
+        if not u:
+            return self.show(net, chat, "این مشتری پیدا نشد.", [[("⬅️ مشتری‌ها", "a:cus:0")]], msg)
+        b = self.sh.buyer_of(uid)
+        e = self.sh.esc
+        joined = time.strftime("%Y/%m/%d %H:%M", time.gmtime(u.get("joined", 0) + TEHRAN)) if u.get("joined") else "—"
+        lines = ([note, ""] if note else []) + [
+            "👤 <b>%s</b>%s" % (e(b["name"] or "بی‌نام"), " (بله)" if b["net"] == "bale" else ""),
+            "🔗 @%s" % e(b["username"]) if b["username"] else "🔗 یوزرنیم نداره",
+            "🆔 <code>%s</code>" % e(b["id"]),
+            "📱 <code>%s</code>" % e(b["phone"]) if b["phone"] else "📱 شماره نداده",
+            "📅 عضویت: <span>%s</span>" % fa_num(joined),
+            "💰 کیف پول: <b>%s</b>" % toman(b["wallet"]),
+            "🛍 خرید: <b>%s</b> سفارش · %s" % (fa_num(b["orders"]), toman(b["spent"])),
+        ]
+        if u.get("ref"):
+            lines.append("👥 دعوت‌شده توسط: %s" % e((self.sh.d["users"].get(u["ref"]) or {}).get("name") or u["ref"]))
+        if u.get("trial"):
+            lines.append("🆓 تست رایگان گرفته")
+        mine = [o for o in self.sh.d["orders"] if o["uid"] == uid][-5:][::-1]
+        if mine:
+            lines.append("\n<b>آخرین سفارش‌ها</b>")
+            for o in mine:
+                lines.append("#%s · %s · %s · %s" % (fa_num(o["id"]), self.sh.KINDS.get(o["kind"], ""), toman(self.sh.total(o)), self.sh.STATUS.get(o["status"], o["status"])))
+        rows = []
+        for sub in (u.get("subs") or [])[:8]:
+            x = self.find(sub)
+            if x:
+                rows.append([("%s %s · %s" % ("🟢" if self.sh.active(x) else "🔴", x["name"], self.sh.left_line(x)), "a:u:%s" % sub)])
+        if not rows:
+            lines.append("\n📦 سرویسی توی ربات نداره")
+        rows += [[("💬 پیام به مشتری", "a:cm:%s" % uid), ("💰 کیف پول", "a:cw:%s" % uid)]]
+        if b["username"] and net == "tg":
+            rows.append([("👤 باز کردن پروفایل تلگرام", "https://t.me/" + b["username"])])
+        rows.append([("⬅️ مشتری‌ها", "a:cus:0"), ("🏠 پنل", "a:home")])
+        self.show(net, chat, "\n".join(lines), rows, msg)
 
     def open_tickets(self):
         return sum(1 for t in self.sh.d["tickets"] if t["status"] == "open")
@@ -11067,6 +11150,29 @@ class AdminBot:
             err = self.sh.ticket_reply(w["id"], text, who="مدیر")
             self.show(net, chat, "⚠️ " + err if err else "✅ جوابت برای مشتری رفت.", [[("🎫 تیکت‌ها", "a:tks"), ("🏠 پنل", "a:home")]])
             return True
+        if what == "cfind":
+            self.wait.pop(cid)
+            self.customers(net, chat, 0, None, q=text)
+            return True
+        if what in ("cmsg", "cwal"):
+            self.wait.pop(cid)
+            uid = w["uid"]
+            cnet, cchat = uid.split(":", 1)
+            if what == "cmsg":
+                try:
+                    self.bot.call(cnet, "sendMessage", {"chat_id": cchat, "text": "💬 پیام از پشتیبانی:\n\n" + text[:3500]})
+                    note = "✅ پیامت رسید."
+                except (ValueError, OSError) as e:
+                    note = "⚠️ نرسید: %s" % self.sh.esc(str(e)[:120])
+            else:
+                delta = _int(re.sub(r"[^\d-]", "", text.translate(EN_DIGITS)))
+                if not delta:
+                    note = "⚠️ عدد نفرستادی؛ چیزی عوض نشد."
+                else:
+                    _, out = shop_action(self.app, "wallet", {"id": uid, "delta": delta}, lambda m="", **k: (200, {"msg": m}), lambda m: (200, {"msg": m}))
+                    note = "✅ " + out.get("msg", "")
+            self.customer(net, chat, uid, None, note=note)
+            return True
         if what == "unote":
             self.wait.pop(cid)
             u = self.find(w["sub"])
@@ -11172,6 +11278,22 @@ class AdminBot:
                 return "از اول شروع کن"
             w["days"] = _int(parts[2])
             self.new_confirm(net, chat, w, mid)
+        elif head == "cus":
+            self.customers(net, chat, _int(parts[2]) if len(parts) > 2 else 0, mid)
+        elif head == "cuf":
+            self.wait[cid] = {"what": "cfind"}
+            self.show(net, chat, "🔎 اسم، یوزرنیم، آیدی عددی یا شماره‌ی مشتری رو بفرست:", [[("✖️ انصراف", "a:cus:0")]], mid)
+        elif head == "cu":
+            self.customer(net, chat, ":".join(parts[2:]), mid)
+        elif head in ("cm", "cw"):
+            uid = ":".join(parts[2:])
+            if uid not in self.sh.d["users"]:
+                return "پیدا نشد"
+            self.wait[cid] = {"what": "cmsg" if head == "cm" else "cwal", "uid": uid}
+            name = self.sh.esc(self.sh.d["users"][uid].get("name") or uid)
+            self.show(net, chat, ("💬 پیامت برای <b>%s</b> رو بفرست؛ از طرف ربات بهش می‌رسه:" if head == "cm" else
+                                  "💰 مبلغ تغییر کیف پول <b>%s</b> رو به تومان بفرست (مثلاً <code>50000</code> یا <code>-20000</code>):") % name,
+                      [[("✖️ انصراف", "a:cu:%s" % uid)]], mid)
         elif head == "uq":
             sub = ":".join(parts[2:])
             if not self.send_card(net, chat, sub):
@@ -11388,6 +11510,17 @@ def shop_action(app, act, body, done, fail):
             net, chat = cid.split(":", 1)
             sh.show(net, chat, "💰 کیف پولت %s%s شد.\nموجودی: %s" % (toman(abs(delta)), " شارژ" if delta > 0 else " کم", toman(u["wallet"])), [[("🏠 منوی اصلی", "m")]])
         return done("موجودی: %s" % toman(u["wallet"]))
+    if act == "msg":
+        cid = str(body.get("id") or "")
+        text = str(body.get("text") or "").strip()[:3500]
+        if cid not in sh.d["users"] or not text:
+            return fail("مشتری یا پیام خالیه")
+        net, chat = cid.split(":", 1)
+        try:
+            app.bot.call(net, "sendMessage", {"chat_id": chat, "text": "💬 پیام از پشتیبانی:\n\n" + text})
+        except (ValueError, OSError) as e:
+            return fail("نرسید: %s" % str(e)[:120])
+        return done("پیام رسید")
     if act == "ticket":
         t = sh.ticket(_int(body.get("id")))
         if not t:
