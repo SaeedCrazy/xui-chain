@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.27.0"
+VERSION = "5.27.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -5698,6 +5698,13 @@ def do_action(app, action, body, host):
                 cfg["user_subs"] = dict(cfg.get("user_subs") or {}, **{sub: {"template": tpl}})
                 save_config(cfg)
                 app.reload()
+            if sub:  # the QR card in the admins' bot chats, ready to forward
+                def cards():
+                    app.bot.users_changed()
+                    for acid, a in list(app.bot.admin_chats().items()):
+                        if not a.get("paused"):
+                            app.bot.admin.send_card(*acid.split(":", 1), sub)
+                threading.Thread(target=cards, daemon=True).start()
             return done("کاربر %s ساخته شد" % name, sub=sub)
 
         if action in ("loc_add", "loc_setup", "loc_attach", "loc_delete"):
@@ -5746,6 +5753,15 @@ def do_action(app, action, body, host):
             save_config(cfg)
             app.reload()
             return done("لوکیشن %s حذف شد" % name)
+
+        if action == "user_card":
+            u = find_user(str(body.get("sub", "")))
+            sent = 0
+            for acid, a in list(app.bot.admin_chats().items()):
+                anet, achat = acid.split(":", 1)
+                if not a.get("paused") and app.bot.admin.send_card(anet, achat, u["sub"]):
+                    sent += 1
+            return done("کارت QR توی ربات فرستاده شد؛ برای کاربر فورواردش کن") if sent else fail("ربات وصل نیست یا چت مدیری نداره")
 
         if action == "user_note":
             u = find_user(str(body.get("sub", "")))
@@ -6937,6 +6953,7 @@ function shareSheet(u){
   <div class="mut small">این لینک رو در اپ کاربر به‌عنوان Subscription اضافه کن. FlClash، Clash Meta، v2rayNG، Streisand، V2Box و Happ خودکار تشخیص داده می‌شن.</div>
   <div class="linkbox">${esc(link)}</div>
   ${buyerBox(u)}
+  ${u.sub&&S.state.bot&&S.state.bot.on!==false?`<button type="button" class="btn ghost block" style="margin:6px 0" data-act="user-card" data-sub="${esc(u.sub)}">🔳 فرستادن کارت QR به ربات (برای فوروارد)</button>`:""}
   ${u.sub?`<div class="kv"><span>محتوای ساب</span><span>${esc(tplName(u.tpl||"default"))} <button type="button" class="lnk" data-act="user-sub" data-sub="${esc(u.sub)}">تغییر</button></span></div>`:""}
   <div class="bar-btns"><button class="btn" data-act="copy" data-text="${esc(link)}">${ic("copy")} کپی</button><a class="btn ghost" href="${esc(link)}?page=1" target="_blank" rel="noopener">${ic("users")} صفحه</a><button class="btn ghost icon" data-act="sub-map" data-sub="${esc(u.sub)}" title="نقشه‌ی ساب">${ic("route")}</button><button class="btn ghost icon" data-act="ping-user" data-sub="${esc(u.sub)}" title="پینگ کانفیگ‌ها">${ic("wifi")}</button>${navigator.share?`<button class="btn ghost icon" data-act="nshare" data-text="${esc(link)}">${ic("share")}</button>`:""}</div>
   ${ping?`<div class="sec"><h3>پینگ کانفیگ‌ها</h3><span class="mut xs">${ago(ping.at)}</span></div><table class="tbl"><tr><th>کانفیگ</th><th>پورت</th><th>اتصال</th></tr>${ping.rows.map(r=>`<tr class="${r.ok?"":"off"}"><td>${esc(r.name)}</td><td class="ltr">${ms_(r.tcp_ms)}</td><td class="ltr">${r.ok?ms_(r.ms):r.ok===null?"—":esc(r.error||"قطع")}</td></tr>`).join("")}</table>`:""}
@@ -7325,6 +7342,7 @@ document.addEventListener("submit",async e=>{
 
 /* actions */
 const ACTS={
+  "user-card":b=>act(b,"user_card",{sub:b.dataset.sub}),
   "user-note":b=>{const u=userBy(b.dataset.sub);if(!u)return;
     sheet(`<h3>📝 توضیحات <span class="ltr">${esc(u.name)}</span></h3><form id="nf"><label class="f"><span>توضیحات</span><textarea class="in" name="note" maxlength="300" style="min-height:90px;font-family:inherit">${esc(u.note||"")}</textarea></label><button class="btn block">${ic("check")} ذخیره</button></form>`,el=>{
       const f=$("#nf",el);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button",f),"user_note",{sub:u.sub,note:f.note.value.trim()});if(j.ok)closeSheet()}})},
@@ -10853,10 +10871,18 @@ class AdminBot:
                 [("🔄 تمدید ۳۰ روزه", "a:ux:%s:renew", "success"), ("♻️ صفر کردن مصرف", "a:ux:%s:reset")],
                 [("⏸ خاموش کن" if on else "▶️ روشن کن", "a:ux:%s:%s" % ("%s", "off" if on else "on"), "danger" if on else "success"),
                  ("🗑 حذف", "a:del:%s")],
-                [("📝 توضیحات", "a:un:%s")],
+                [("📝 توضیحات", "a:un:%s"), ("🔳 کارت QR", "a:uq:%s")],
                 [("⬅️ کاربرها", "a:users:0"), ("🏠 پنل", "a:home")]]
         rows = [[tuple([b[0], b[1].replace("%s", sub, 1)] + list(b[2:])) for b in row] for row in rows]
         self.show(net, chat, text, rows, msg)
+
+    def send_card(self, net, chat, sub):
+        """The user's QR card in this chat, ready to forward to them."""
+        u = self.find(sub)
+        link = self.bot.sub_link(sub)
+        text = "🔳 <b>%s</b>\n\n🔗 <code>%s</code>\n\nهمین عکس رو برای کاربر فوروارد کن." % (self.sh.esc(u["name"] if u else sub), self.sh.esc(link))
+        rows = ([[("📋 کپی لینک اشتراک", "copy:" + link, "success")]] if net == "tg" else []) + [[("👤 کارت کاربر", "a:u:%s" % sub), ("🏠 پنل", "a:home")]]
+        return self.sh.send_qr(net, chat, sub, text, rows)
 
     def new_confirm(self, net, chat, w, msg=None):
         self.show(net, chat, "👤 <b>%s</b>\n📊 %s\n⏳ %s%s\n\nبسازم؟" % (
@@ -11099,6 +11125,10 @@ class AdminBot:
                 return "از اول شروع کن"
             w["days"] = _int(parts[2])
             self.new_confirm(net, chat, w, mid)
+        elif head == "uq":
+            sub = ":".join(parts[2:])
+            if not self.send_card(net, chat, sub):
+                return "عکس ساخته نشد"
         elif head == "un":
             sub = ":".join(parts[2:])
             u = self.find(sub)
@@ -11131,8 +11161,18 @@ class AdminBot:
             except Exception as e:
                 self.show(net, chat, "⚠️ ساخته نشد: %s" % self.sh.esc(str(e)[:160]), [[("⬅️ پنل", "a:home")]], mid)
                 return ""
-            self.show(net, chat, "%s <b>%s</b> ساخته شد!\n\n🔗 <code>%s</code>" % (self.sh.em("party", "🎉"), self.sh.esc(w["name"]), self.sh.esc(self.bot.sub_link(sub))),
-                      [[("👤 کارت کاربر", "a:u:%s" % sub), ("➕ یکی دیگه", "a:new")], [("🏠 پنل", "a:home")]], mid, effect="party")
+            link = self.bot.sub_link(sub)
+            text = "%s <b>%s</b> ساخته شد!\n📊 %s · %s%s\n\n🔗 <code>%s</code>\n\nهمین عکس رو برای کاربر فوروارد کن." % (
+                self.sh.em("party", "🎉"), self.sh.esc(w["name"]), "%s گیگ" % fa_num(w["gb"]) if w["gb"] else "حجم نامحدود",
+                "%s روز" % fa_num(w["days"]) if w["days"] else "بدون محدودیت زمان", "\n📝 " + self.sh.esc(w["note"]) if w.get("note") else "", self.sh.esc(link))
+            rows = ([[("📋 کپی لینک اشتراک", "copy:" + link, "success")]] if net == "tg" else []) + [
+                [("👤 کارت کاربر", "a:u:%s" % sub), ("➕ یکی دیگه", "a:new")], [("🏠 پنل", "a:home")]]
+            try:
+                self.bot.call(net, "editMessageText", {"chat_id": chat, "message_id": mid, "text": "✅ ساخته شد"})
+            except (ValueError, OSError):
+                pass
+            if not self.sh.send_qr(net, chat, sub, text, rows, effect="party"):
+                self.show(net, chat, text, rows, effect="party")
         elif head == "tks":
             self.tickets(net, chat, mid)
         elif head == "tk":

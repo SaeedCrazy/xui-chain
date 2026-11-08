@@ -1985,8 +1985,11 @@ class ShopTests(BotBase):
         self.admin_tap(42, "a:nd:30")
         m, _ = self.admin_tap(42, "a:mk")
         self.assertEqual(self.panel.added[-1][:3], ("newguy", 20, 30))
-        self.assertIn("ساخته شد", m["text"])
+        self.assertIn("ساخته شد", m["caption"])
+        self.assertEqual((m["method"], m["photo"]), ("sendPhoto", "<upload>"))  # the QR card, to forward
         self.assertEqual(m.get("message_effect_id"), xc.Shop.EFFECT["party"])  # confetti
+        m, _ = self.admin_tap(42, "a:uq:newsub%04d" % len(self.panel.added))
+        self.assertEqual(m["method"], "sendPhoto")
         # the shop switch, and the customer view with a way back
         self.admin_tap(42, "a:tg:shop_enable")
         self.assertFalse(xc.load_config()["shop_enable"])
