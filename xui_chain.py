@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.25.0"
+VERSION = "5.26.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -2699,17 +2699,19 @@ class PanelAPI:
         self.forget()
         return len((j.get("obj") or {}).get("attached") or emails)
 
-    def add_client(self, name, gb, days, devices, first_use, inbound_ids):
-        """Create one client on the chosen inbounds -> its subId."""
+    def add_client(self, name, gb, days, devices, first_use, inbound_ids, note="", tg_id=0):
+        """Create one client on the chosen inbounds -> its subId. note shows as the client's comment."""
         inbounds = {ib["id"]: ib for ib in self.inbounds()}
         chosen = [inbounds[i] for i in inbound_ids if i in inbounds]
         if not chosen:
             raise PanelError("حداقل یک inbound انتخاب کن")
         sub_id = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(16))
         base = {"email": name, "enable": True, "subId": sub_id, "limitIp": int(devices),
-                "totalGB": int(float(gb) * 1024 ** 3), "comment": "EZ-XUI",
+                "totalGB": int(float(gb) * 1024 ** 3), "comment": clean_note(note) or "EZ-XUI",
                 "expiryTime": 0 if not days else (-int(days) * 86400000 if first_use else
                                                    int((time.time() + int(days) * 86400) * 1000))}
+        if _int(tg_id):
+            base["tgId"] = _int(tg_id)
         uid, pw = str(uuid.uuid4()), secrets.token_urlsafe(12)
 
         def for_inbound(ib, email):
@@ -3030,10 +3032,10 @@ class NXPanel:
         self._cache = (now, out)
         return out
 
-    def add_client(self, name, gb, days, devices, first_use, inbound_ids):
+    def add_client(self, name, gb, days, devices, first_use, inbound_ids, note="", tg_id=0):
         """Create a user on NX (its templates decide the configs) -> its subId."""
         body = {"name": name, "enable": True, "volume": int(float(gb) * 1024 ** 3), "ipLimit": int(devices),
-                "desc": "EZ-XUI", "expiry": 0}
+                "desc": clean_note(note) or "EZ-XUI", "expiry": 0}
         if days and first_use:
             body["duration"] = int(days) * 86400
         elif days:
@@ -3051,6 +3053,8 @@ class NXPanel:
             p["volume"] = int(changes["totalGB"])
         if "limitIp" in changes:
             p["ipLimit"] = int(changes["limitIp"])
+        if "comment" in changes:
+            p["desc"] = changes["comment"]
         if "expiryTime" in changes:
             ms = int(changes["expiryTime"])
             p.update({"duration": -ms // 1000, "expiry": 0} if ms < 0 else {"duration": 0, "expiry": ms // 1000})
@@ -3082,6 +3086,17 @@ class NXPanel:
 def on_nx(app_or_rt):
     rt = app_or_rt.rt if hasattr(app_or_rt, "rt") else app_or_rt
     return rt.get("backend") == "nx"
+
+
+def clean_note(v):
+    """A user's note: one or a few lines, at most 300 characters."""
+    return re.sub(r"[\x00-\x09\x0b-\x1f]", "", str(v or "")).strip()[:300]
+
+
+def note_of(c):
+    """The note shown for a client (EZ's old placeholder comment counts as none)."""
+    v = str(c.get("note") or "")
+    return "" if v == "EZ-XUI" else v
 
 
 def clients_of(app, fallback=False):
@@ -3143,7 +3158,8 @@ def read_clients(db_path=XUI_DB):
             for r in con.execute("SELECT * FROM clients"):
                 r = dict(r)
                 put(r.get("email"), sub=r.get("sub_id") or "", enable=bool(r.get("enable", 1)),
-                    total=_int(r.get("total_gb")), expiry=_int(r.get("expiry_time")), devices=_int(r.get("limit_ip")))
+                    total=_int(r.get("total_gb")), expiry=_int(r.get("expiry_time")), devices=_int(r.get("limit_ip")),
+                    note=r.get("comment") or "")
                 from_table.add(r.get("email"))
                 ids[r.get("id")] = r.get("email")
             for r in con.execute("SELECT client_id, inbound_id FROM client_inbounds"):
@@ -3162,7 +3178,8 @@ def read_clients(db_path=XUI_DB):
                         put(email, inbound=r["id"])
                     else:
                         put(email, inbound=r["id"], sub=c.get("subId") or "", enable=bool(c.get("enable", True)),
-                            total=_int(c.get("totalGB")), expiry=_int(c.get("expiryTime")), devices=_int(c.get("limitIp")))
+                            total=_int(c.get("totalGB")), expiry=_int(c.get("expiryTime")), devices=_int(c.get("limitIp")),
+                            note=c.get("comment") or "")
         except sqlite3.Error:
             pass
         try:
@@ -3192,7 +3209,7 @@ def clients_from_panel(inbounds):
             d = out.setdefault(email, {"email": email, "sub": c.get("subId") or "", "enable": bool(c.get("enable", True)),
                                        "total": _int(s.get("total") or c.get("totalGB")),
                                        "expiry": _int(s.get("expiryTime") or c.get("expiryTime")),
-                                       "devices": _int(c.get("limitIp")), "inbounds": [],
+                                       "devices": _int(c.get("limitIp")), "inbounds": [], "note": c.get("comment") or "",
                                        "used": _int(s.get("up")) + _int(s.get("down"))})
             d["inbounds"].append(ib["id"])
     return list(out.values())
@@ -4699,6 +4716,7 @@ def admin_state(app, host):
     onlines = set(panel["onlines"]) if panel["onlines"] is not None else None
     users = group_users(clients, onlines)
     users.reverse()  # newest first
+    buyers = app.bot.shop.buyers()
     return {
         "version": VERSION,
         "now": int(time.time() * 1000),
@@ -4765,7 +4783,8 @@ def admin_state(app, host):
              "inbounds": [ib["id"] for ib in panel["inbounds"] if ib.get("node") == n["id"]]}
             for n in panel.get("nodes") or []],
         "users": [dict({k: u[k] for k in ("sub", "name", "emails", "enable", "used", "total", "expiry", "devices",
-                                          "inbounds", "online")}, **user_sub_public(cfg, u["sub"])) for u in users],
+                                          "inbounds", "online")}, note=note_of(u), buyer=buyers.get(u["sub"]),
+                       **user_sub_public(cfg, u["sub"])) for u in users],
         "templates": templates_public(cfg, live, users),
         "users_source": source,
         "net": net_state(app),
@@ -5673,7 +5692,7 @@ def do_action(app, action, body, host):
                 return fail("این تمپلیت پیدا نشد")
             sub = app.panel.add_client(name, max(0.0, float(body.get("gb") or 0)), max(0, _int(body.get("days"))),
                                        max(0, _int(body.get("devices"))), bool(body.get("first_use")),
-                                       [_int(i) for i in body.get("inbounds") or []])
+                                       [_int(i) for i in body.get("inbounds") or []], note=clean_note(body.get("note")))
             if tpl != "default" and sub:
                 cfg = load_config()
                 cfg["user_subs"] = dict(cfg.get("user_subs") or {}, **{sub: {"template": tpl}})
@@ -5728,6 +5747,11 @@ def do_action(app, action, body, host):
             app.reload()
             return done("لوکیشن %s حذف شد" % name)
 
+        if action == "user_note":
+            u = find_user(str(body.get("sub", "")))
+            app.panel.update_user(u["sub"], u["emails"], {"comment": clean_note(body.get("note")) or "EZ-XUI"})
+            return done("توضیحات ذخیره شد")
+
         if action in ("user_update", "user_enable", "user_reset", "user_delete"):
             u = find_user(str(body.get("sub", "")))
             sub = u["sub"]
@@ -5737,6 +5761,8 @@ def do_action(app, action, body, host):
                            "limitIp": max(0, _int(body.get("devices"))), "enable": True,
                            "expiryTime": 0 if not days else (-days * 86400000 if body.get("first_use") else
                                                              int((time.time() + days * 86400) * 1000))}
+                if "note" in body:
+                    changes["comment"] = clean_note(body.get("note")) or "EZ-XUI"
                 app.panel.update_user(sub, u["emails"], changes)
                 if body.get("reset"):
                     app.panel.reset_user(sub, u["emails"])
@@ -6866,7 +6892,7 @@ const FILTERS=[["all","همه"],["on","فعال"],["online","آنلاین"],["so
 function filtered(){
   const q=S.q.trim().toLowerCase();
   return S.state.users.filter(u=>{
-    if(q&&!u.emails.some(e=>e.toLowerCase().includes(q)))return false;
+    if(q&&!(u.emails.join(" ")+" "+(u.note||"")+" "+(u.buyer?[u.buyer.name,u.buyer.username,u.buyer.id,u.buyer.phone].join(" "):"")).toLowerCase().includes(q))return false;
     const s=ustat(u)[0];
     switch(S.filter){case"on":return s==="on"||s==="soon"||s==="wait";case"online":return u.online;case"soon":return s==="soon";case"ended":return s==="exp"||s==="full";case"off":return s==="off";default:return true}
   });
@@ -6883,7 +6909,8 @@ function renderUserList(){
   if(!list.length){el.innerHTML=`<div class="empty">${ic("search")}<p>کاربری با این فیلتر پیدا نشد.</p></div>`;return}
   el.innerHTML=list.map(u=>{
     const s=ustat(u),p=pct(u.used,u.total);
-    return `<div class="ucard u"><div class="uhead"><div class="uname">${mono(u.name.slice(0,2).toUpperCase(),u.online?"ok":"")}<b>${esc(u.name)}</b></div><span style="display:flex;gap:6px;align-items:center">${u.tpl&&u.tpl!=="default"?`<span class="tag acc">${esc(tplName(u.tpl))}</span>`:""}<span class="tag ${STAT_CLS[s[0]]}">${s[1]}</span></span></div>
+    return `<div class="ucard u"><div class="uhead"><div class="uname">${mono(u.name.slice(0,2).toUpperCase(),u.online?"ok":"")}<b>${esc(u.name)}</b></div><span style="display:flex;gap:6px;align-items:center">${u.tpl&&u.tpl!=="default"?`<span class="tag acc">${esc(tplName(u.tpl))}</span>`:""}${u.buyer?`<span class="tag" title="از ربات">🤖</span>`:""}<span class="tag ${STAT_CLS[s[0]]}">${s[1]}</span></span></div>
+    ${u.note||u.buyer?`<div class="mut xs" style="margin:4px 2px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${u.note?"📝 "+esc(u.note):"👤 "+esc([u.buyer.name,u.buyer.username?"@"+u.buyer.username:"",u.buyer.phone].filter(Boolean).join(" · "))}</div>`:""}
     ${multiLoc()?`<div class="chips" style="padding:6px 0 0">${userLocs(u).map(l=>`<span class="tag">${esc(l.name)}</span>`).join("")||`<span class="tag">بدون خروجی</span>`}</div>`:""}
     <div class="bar"><i class="${barCls(p)}" style="width:${u.total?p:4}%"></i></div>
     <div class="umeta"><span>${usage(u)}</span><span>${daysText(u)}</span></div>
@@ -6895,11 +6922,21 @@ const userBy=sub=>S.state.users.find(u=>u.sub===sub);
 const locOfInbound=id=>{const ib=S.state.inbounds.find(x=>x.id===id);if(!ib)return null;return S.state.locations.find(l=>l.main?!ib.node:l.id===ib.node)||null};
 const userLocs=u=>{const out=[];u.inbounds.forEach(id=>{const l=locOfInbound(id);if(l&&!out.includes(l))out.push(l)});return out};
 const multiLoc=()=>S.state.locations.length>1;
+function buyerBox(u){const b=u.buyer;
+  return `<div class="card" style="margin:10px 0;padding:10px 12px">
+   <div class="kv"><span>📝 توضیحات</span><span style="max-width:65%;text-align:left;white-space:pre-wrap">${u.note?esc(u.note):'<span class="mut">—</span>'} <button type="button" class="lnk" data-act="user-note" data-sub="${esc(u.sub)}">ویرایش</button></span></div>
+   ${b?`<div class="kv"><span>🤖 مشتری ربات</span><span>${esc(b.name||"—")}</span></div>
+   ${b.username?`<div class="kv"><span>یوزرنیم</span><a class="ltr" href="https://t.me/${esc(b.username)}" target="_blank" rel="noopener">@${esc(b.username)}</a></div>`:""}
+   <div class="kv"><span>آیدی عددی</span><span class="ltr">${esc(b.id)} <button type="button" class="lnk" data-act="copy" data-text="${esc(b.id)}">کپی</button></span></div>
+   ${b.phone?`<div class="kv"><span>شماره</span><a class="ltr" href="tel:${esc(b.phone)}">${esc(b.phone)}</a></div>`:""}
+   <div class="kv"><span>خریدها</span><span>${fa(b.orders)} سفارش · ${tmn(b.spent)}</span></div>
+   <div class="kv"><span>کیف پول</span><span>${tmn(b.wallet)}</span></div>`:""}</div>`}
 function shareSheet(u){
   const link=linkOf(u);const ping=(S.state.pings||{})[u.sub];
   sheet(`<h3>${ic("share")} لینک <span class="ltr">${esc(u.name)}</span></h3>
   <div class="mut small">این لینک رو در اپ کاربر به‌عنوان Subscription اضافه کن. FlClash، Clash Meta، v2rayNG، Streisand، V2Box و Happ خودکار تشخیص داده می‌شن.</div>
   <div class="linkbox">${esc(link)}</div>
+  ${buyerBox(u)}
   ${u.sub?`<div class="kv"><span>محتوای ساب</span><span>${esc(tplName(u.tpl||"default"))} <button type="button" class="lnk" data-act="user-sub" data-sub="${esc(u.sub)}">تغییر</button></span></div>`:""}
   <div class="bar-btns"><button class="btn" data-act="copy" data-text="${esc(link)}">${ic("copy")} کپی</button><a class="btn ghost" href="${esc(link)}?page=1" target="_blank" rel="noopener">${ic("users")} صفحه</a><button class="btn ghost icon" data-act="sub-map" data-sub="${esc(u.sub)}" title="نقشه‌ی ساب">${ic("route")}</button><button class="btn ghost icon" data-act="ping-user" data-sub="${esc(u.sub)}" title="پینگ کانفیگ‌ها">${ic("wifi")}</button>${navigator.share?`<button class="btn ghost icon" data-act="nshare" data-text="${esc(link)}">${ic("share")}</button>`:""}</div>
   ${ping?`<div class="sec"><h3>پینگ کانفیگ‌ها</h3><span class="mut xs">${ago(ping.at)}</span></div><table class="tbl"><tr><th>کانفیگ</th><th>پورت</th><th>اتصال</th></tr>${ping.rows.map(r=>`<tr class="${r.ok?"":"off"}"><td>${esc(r.name)}</td><td class="ltr">${ms_(r.tcp_ms)}</td><td class="ltr">${r.ok?ms_(r.ms):r.ok===null?"—":esc(r.error||"قطع")}</td></tr>`).join("")}</table>`:""}
@@ -6915,6 +6952,7 @@ function userForm(u){
   const gbv=u?(u.total?+(u.total/GB).toFixed(2):0):30;
   const ibs=st.inbounds;
   return `${isNew?field("uname","اسم کاربر (انگلیسی و یکتا)","",'class="in ltr" required pattern="[A-Za-z0-9_.@\\-]+" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="ali"'):""}
+  ${field("note","توضیحات (اختیاری)",u?(u.note||""):"",'maxlength="300" placeholder="مثلاً: علی همکار · ۰۹۱۲…"',isNew?"فقط برای خودت؛ توی 3x-ui هم به‌عنوان Comment دیده می‌شه":"")}
   ${isNew?`<div class="chips">${[[30,30,"۳۰ گیگ، یک ماه"],[50,30,"۵۰ گیگ، یک ماه"],[100,30,"۱۰۰ گیگ، یک ماه"],[100,90,"۱۰۰ گیگ، سه ماه"],[0,30,"نامحدود، یک ماه"]].map(([g,d,l])=>`<button type="button" class="chip" data-preset="${g},${d}">${l}</button>`).join("")}</div>`:
    `<div class="chips">${[["gb",10,"+۱۰ گیگ"],["gb",50,"+۵۰ گیگ"],["days",30,"+۳۰ روز"],["days",90,"+۹۰ روز"]].map(([k,v,l])=>`<button type="button" class="chip" data-add="${k},${v}">${l}</button>`).join("")}</div>`}
   <div class="cols">
@@ -6935,7 +6973,7 @@ function addUserSheet(){
     const f=$("#uf",el);
     $$("[data-preset]",el).forEach(b=>b.onclick=()=>{const[g,d]=b.dataset.preset.split(",");f.gb.value=g;f.days.value=d;$$("[data-preset]",el).forEach(x=>x.classList.toggle("on",x===b))});
     f.onsubmit=async e=>{e.preventDefault();const b=$("button:not([type=button])",f);
-      const body={name:f.uname.value.trim(),gb:f.gb.value,days:f.days.value,devices:f.devices.value,first_use:f.first_use.checked,inbounds:$$("input[name=inbound]:checked",f).map(x=>+x.value),template:f.tpl?f.tpl.value:"default"};
+      const body={name:f.uname.value.trim(),note:f.note.value.trim(),gb:f.gb.value,days:f.days.value,devices:f.devices.value,first_use:f.first_use.checked,inbounds:$$("input[name=inbound]:checked",f).map(x=>+x.value),template:f.tpl?f.tpl.value:"default"};
       if(!body.inbounds.length&&S.state.panel.version!=="nx"){toast("حداقل یک inbound انتخاب کن","bad");return}
       const j=await act(b,"user_add",body);if(j.ok)shareSheet(userBy(j.sub)||{sub:j.sub,name:body.name})};
   });
@@ -6947,7 +6985,7 @@ function editSheet(u){
     const f=$("#ef",el);
     $$("[data-add]",el).forEach(b=>b.onclick=()=>{const[k,v]=b.dataset.add.split(",");f[k].value=Math.round((+f[k].value||0)*100+(+v)*100)/100});
     f.onsubmit=async e=>{e.preventDefault();const b=$("button:not([type=button])",f);
-      const j=await act(b,"user_update",{sub:u.sub,gb:f.gb.value,days:f.days.value,devices:f.devices.value,first_use:f.first_use.checked,reset:f.zero.checked});if(j.ok)closeSheet()};
+      const j=await act(b,"user_update",{sub:u.sub,note:f.note.value.trim(),gb:f.gb.value,days:f.days.value,devices:f.devices.value,first_use:f.first_use.checked,reset:f.zero.checked});if(j.ok)closeSheet()};
   });
 }
 function moreSheet(u){
@@ -7287,6 +7325,9 @@ document.addEventListener("submit",async e=>{
 
 /* actions */
 const ACTS={
+  "user-note":b=>{const u=userBy(b.dataset.sub);if(!u)return;
+    sheet(`<h3>📝 توضیحات <span class="ltr">${esc(u.name)}</span></h3><form id="nf"><label class="f"><span>توضیحات</span><textarea class="in" name="note" maxlength="300" style="min-height:90px;font-family:inherit">${esc(u.note||"")}</textarea></label><button class="btn block">${ic("check")} ذخیره</button></form>`,el=>{
+      const f=$("#nf",el);f.onsubmit=async e=>{e.preventDefault();const j=await act($("button",f),"user_note",{sub:u.sub,note:f.note.value.trim()});if(j.ok)closeSheet()}})},
   "sms-copy":()=>copy((S.state.shop_cfg||{}).sms_url||""),
   "sms-reset":async b=>{if(await confirmSheet("آدرس جدید","آدرس قبلی دیگه کار نمی‌کنه و باید توی اپ گوشی عوضش کنی.","بساز"))act(b,"sms_reset",{})},
   "sms-test":async b=>{const t=($("#smstxt")||{}).value||"";const box=$("#smsres");const j=await api("sms_test",{text:t});if(!box)return;
@@ -9755,7 +9796,8 @@ class Shop:
         if not t or u.get("trial"):
             return "تست رایگان قبلاً استفاده شده 🙏", ""
         try:
-            sub = self.app.panel.add_client(self.client_name(uid, "t"), t[0], t[1], 1, False, self.inbounds())
+            sub = self.app.panel.add_client(self.client_name(uid, "t"), t[0], t[1], 1, False, self.inbounds(),
+                                            note=self.buyer_note(uid, "تست ربات"), tg_id=uid.split(":", 1)[1] if net == "tg" else 0)
         except Exception as e:
             self.bot.notify_admins("shop", "⚠️ ساخت تست رایگان نشد: %s" % e)
             return "الان نشد؛ چند دقیقه‌ی دیگه دوباره امتحان کن 🙏", ""
@@ -9780,6 +9822,29 @@ class Shop:
         self.show(net, chat, "%s %s\n\n🔗 لینک اشتراک (لمس کن تا کپی بشه):\n<code>%s</code>\n\n📱 آموزش اتصال و دکمه‌ی افزودن به اپ‌ها توی صفحه‌ی اشتراکه." % (self.em("party", "🎉"), head, self.esc(link)),
                   [[("📱 صفحه‌ی اشتراک و آموزش", link, "primary")], [("📚 راهنمای اتصال", "guide"), ("📦 سرویس‌های من", "svc")],
                    [("🏠 منوی اصلی", "m")]], msg, effect="party")
+
+    def buyer_of(self, uid):
+        """What we know about a customer: name, @username, Telegram id, phone."""
+        u = self.d["users"].get(uid) or {}
+        net, _, tid = uid.partition(":")
+        return {"uid": uid, "net": net, "id": tid, "name": u.get("name", ""), "username": u.get("username", ""),
+                "phone": u.get("phone", ""), "wallet": u.get("wallet", 0), "joined": u.get("joined", 0),
+                "orders": sum(1 for o in self.d["orders"] if o["uid"] == uid and o["status"] == "done"),
+                "spent": sum(self.total(o) for o in self.d["orders"] if o["uid"] == uid and o["status"] == "done" and o["kind"] != "topup")}
+
+    def buyers(self):
+        """sub -> the customer who has it in the bot (bought it, or added it with its link)."""
+        out = {}
+        for uid, u in self.d["users"].items():
+            for sub in u.get("subs") or []:
+                out.setdefault(sub, self.buyer_of(uid))
+        return out
+
+    def buyer_note(self, uid, what="ربات"):
+        """The comment written on a client the bot makes, so the panel shows who it belongs to."""
+        b = self.buyer_of(uid)
+        bits = ["🤖 " + what, b["name"], "@" + b["username"] if b["username"] else "", ("Bale " if b["net"] == "bale" else "TG ") + b["id"], b["phone"]]
+        return " · ".join(x for x in bits if x)
 
     def client_name(self, uid, tag=""):
         prefix = re.sub(r"[^A-Za-z0-9_]", "", str(self.app.cfg.get("shop_prefix") or "tg"))[:10] or "tg"
@@ -9813,7 +9878,8 @@ class Shop:
                 self.save()
                 self.show(net, chat, head, [[("🛒 خرید سرویس", "buy"), ("🏠 منوی اصلی", "m")]], msg, effect="like")
             elif o["kind"] == "buy":
-                sub = self.app.panel.add_client(self.client_name(uid), o["gb"], o["days"], o.get("devices") or 0, False, self.inbounds())
+                sub = self.app.panel.add_client(self.client_name(uid), o["gb"], o["days"], o.get("devices") or 0, False, self.inbounds(),
+                                                note=self.buyer_note(uid), tg_id=uid.split(":", 1)[1] if net == "tg" else 0)
                 with self.lock:
                     o["sub"], o["status"] = sub, "done"
                     u.setdefault("subs", []).append(sub)
@@ -10367,6 +10433,13 @@ class AdminBot:
         if not u:
             return self.show(net, chat, "این کاربر پیدا نشد.", [[("⬅️ کاربرها", "a:users:0")]], msg)
         text = self.sh.esc(self.bot.user_text(u, link=True))
+        if note_of(u):
+            text += "\n\n📝 " + self.sh.esc(note_of(u))
+        b = self.sh.buyers().get(sub)
+        if b:
+            text += "\n\n🤖 <b>مشتری ربات</b>\n👤 %s%s\n🆔 <code>%s</code>%s\n🛍 %s سفارش · %s" % (
+                self.sh.esc(b["name"] or "—"), " · @" + self.sh.esc(b["username"]) if b["username"] else "", self.sh.esc(b["id"]),
+                "\n📱 <code>%s</code>" % self.sh.esc(b["phone"]) if b["phone"] else "", fa_num(b["orders"]), toman(b["spent"]))
         if note:
             text = note + "\n\n" + text
         on = u.get("enable", True)
@@ -10374,9 +10447,17 @@ class AdminBot:
                 [("🔄 تمدید ۳۰ روزه", "a:ux:%s:renew", "success"), ("♻️ صفر کردن مصرف", "a:ux:%s:reset")],
                 [("⏸ خاموش کن" if on else "▶️ روشن کن", "a:ux:%s:%s" % ("%s", "off" if on else "on"), "danger" if on else "success"),
                  ("🗑 حذف", "a:del:%s")],
+                [("📝 توضیحات", "a:un:%s")],
                 [("⬅️ کاربرها", "a:users:0"), ("🏠 پنل", "a:home")]]
         rows = [[tuple([b[0], b[1].replace("%s", sub, 1)] + list(b[2:])) for b in row] for row in rows]
         self.show(net, chat, text, rows, msg)
+
+    def new_confirm(self, net, chat, w, msg=None):
+        self.show(net, chat, "👤 <b>%s</b>\n📊 %s\n⏳ %s%s\n\nبسازم؟" % (
+            self.sh.esc(w["name"]), "%s گیگ" % fa_num(w["gb"]) if w["gb"] else "حجم نامحدود",
+            "%s روز" % fa_num(w["days"]) if w["days"] else "بدون محدودیت زمان", "\n📝 " + self.sh.esc(w["note"]) if w.get("note") else ""),
+                  [[("✅ بساز", "a:mk", "success")], [("📝 %s توضیحات" % ("ویرایش" if w.get("note") else "افزودن"), "a:nn")],
+                   [("✖️ انصراف", "a:home", "danger")]], msg)
 
     def user_act(self, net, chat, sub, act, msg):
         u = self.find(sub)
@@ -10507,6 +10588,21 @@ class AdminBot:
             err = self.sh.ticket_reply(w["id"], text, who="مدیر")
             self.show(net, chat, "⚠️ " + err if err else "✅ جوابت برای مشتری رفت.", [[("🎫 تیکت‌ها", "a:tks"), ("🏠 پنل", "a:home")]])
             return True
+        if what == "unote":
+            self.wait.pop(cid)
+            u = self.find(w["sub"])
+            if u:
+                try:
+                    self.app.panel.update_user(w["sub"], u["emails"], {"comment": clean_note(text) or "EZ-XUI"})
+                    self.bot.users_changed()
+                except PanelError as e:
+                    return self.show(net, chat, "⚠️ ذخیره نشد: %s" % self.sh.esc(str(e)[:160]), [[("⬅️ کارت کاربر", "a:u:%s" % w["sub"])]]) or True
+            self.user_card(net, chat, w["sub"], None, note="✅ توضیحات ذخیره شد")
+            return True
+        if what == "new_note":
+            w["what"], w["note"] = "new", clean_note(text)
+            self.new_confirm(net, chat, w)
+            return True
         if what == "find":
             self.wait.pop(cid)
             self.user_list(net, chat, 0, None, q=text)
@@ -10596,15 +10692,35 @@ class AdminBot:
             if w.get("what") != "new" or "gb" not in w:
                 return "از اول شروع کن"
             w["days"] = _int(parts[2])
-            self.show(net, chat, "👤 <b>%s</b>\n📊 %s\n⏳ %s\n\nبسازم؟" % (self.sh.esc(w["name"]), "%s گیگ" % fa_num(w["gb"]) if w["gb"] else "حجم نامحدود",
-                                                                        "%s روز" % fa_num(w["days"]) if w["days"] else "بدون محدودیت زمان"),
-                      [[("✅ بساز", "a:mk", "success"), ("✖️ انصراف", "a:home", "danger")]], mid)
+            self.new_confirm(net, chat, w, mid)
+        elif head == "un":
+            sub = ":".join(parts[2:])
+            u = self.find(sub)
+            if not u:
+                return "پیدا نشد"
+            self.wait[cid] = {"what": "unote", "sub": sub}
+            self.show(net, chat, "📝 توضیحات <b>%s</b> رو بفرست%s" % (self.sh.esc(u["name"]), "\n\nالان: " + self.sh.esc(note_of(u)) if note_of(u) else ":"),
+                      [[("🗑 پاک کردن توضیحات", "a:unx:%s" % sub, "danger")], [("✖️ انصراف", "a:u:%s" % sub)]], mid)
+        elif head == "unx":
+            sub = ":".join(parts[2:])
+            u = self.find(sub)
+            self.wait.pop(cid, None)
+            if u:
+                self.app.panel.update_user(sub, u["emails"], {"comment": "EZ-XUI"})
+                self.bot.users_changed()
+            self.user_card(net, chat, sub, mid, note="✅ توضیحات پاک شد")
+        elif head == "nn":
+            w = self.wait.get(cid) or {}
+            if w.get("what") != "new" or "days" not in w:
+                return "از اول شروع کن"
+            w["what"] = "new_note"
+            self.show(net, chat, "📝 توضیحات این کاربر رو بفرست (مثلاً اسم واقعی یا شماره):", [[("✖️ انصراف", "a:home", "danger")]], mid)
         elif head == "mk":
             w = self.wait.pop(cid, None) or {}
             if w.get("what") != "new" or "days" not in w:
                 return "از اول شروع کن"
             try:
-                sub = self.app.panel.add_client(w["name"], w["gb"], w["days"], 0, False, self.sh.inbounds())
+                sub = self.app.panel.add_client(w["name"], w["gb"], w["days"], 0, False, self.sh.inbounds(), note=w.get("note", ""))
                 self.bot.users_changed()
             except Exception as e:
                 self.show(net, chat, "⚠️ ساخته نشد: %s" % self.sh.esc(str(e)[:160]), [[("⬅️ پنل", "a:home")]], mid)

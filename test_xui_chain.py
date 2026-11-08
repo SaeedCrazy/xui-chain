@@ -1806,10 +1806,11 @@ class FakeShopPanel:
     def __init__(self):
         self.added, self.updated, self.reset, self.fail = [], [], [], False
 
-    def add_client(self, name, gb, days, devices, first_use, inbound_ids):
+    def add_client(self, name, gb, days, devices, first_use, inbound_ids, note="", tg_id=0):
         if self.fail:
             raise xc.PanelError("panel down")
         self.added.append((name, gb, days, devices, inbound_ids))
+        self.notes = getattr(self, "notes", []) + [(note, tg_id)]
         return "newsub%04d" % len(self.added)
 
     def update_user(self, sub, emails, changes):
@@ -2140,6 +2141,22 @@ class ShopTests(BotBase):
         xc.save_config(cfg)
         self.app.reload()
         self.assertIn("مجاز", self.shop.got_sms("واریز: 5,000,000", sender="12345")["note"])
+
+    def test_buyer_details_and_user_notes(self):
+        self.shop.user("tg:995", {"id": 995, "first_name": "Neda", "username": "neda_x"})["phone"] = "+989121234567"
+        self.tap(995, "bp:p30")
+        o = self.shop.d["orders"][-1]
+        self.photo(995)
+        self.tap(100, "ok:%d" % o["id"], chat=100)
+        self.assertEqual(o["status"], "done")
+        note, tg = self.panel.notes[-1]
+        for bit in ("U995", "@neda_x", "TG 995", "+989121234567"):
+            self.assertIn(bit, note)  # the panel's comment says whose it is
+        self.assertEqual(str(tg), "995")
+        b = self.shop.buyers()[o["sub"]]
+        self.assertEqual((b["name"], b["username"], b["id"], b["phone"], b["orders"]), ("U995", "neda_x", "995", "+989121234567", 1))
+        self.assertEqual(xc.note_of({"note": "EZ-XUI"}), "")
+        self.assertEqual(xc.clean_note(" a\x00b\nc "), "ab\nc")
 
     def test_my_services_add_by_link_and_remove(self):
         out = self.tap(994, "svc")
