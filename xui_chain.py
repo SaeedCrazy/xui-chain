@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.29.0"
+VERSION = "5.29.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -10892,7 +10892,7 @@ class AdminBot:
             "🔗 @%s" % e(b["username"]) if b["username"] else "🔗 یوزرنیم نداره",
             "🆔 <code>%s</code>" % e(b["id"]),
             "📱 <code>%s</code>" % e(b["phone"]) if b["phone"] else "📱 شماره نداده",
-            "📅 عضویت: <span>%s</span>" % fa_num(joined),
+            "📅 عضویت: %s" % fa_num(joined),
             "💰 کیف پول: <b>%s</b>" % toman(b["wallet"]),
             "🛍 خرید: <b>%s</b> سفارش · %s" % (fa_num(b["orders"]), toman(b["spent"])),
         ]

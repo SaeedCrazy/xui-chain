@@ -1615,6 +1615,13 @@ class BotAPI(BaseHTTPRequestHandler):
             body["multipart"] = True
         else:
             body = json.loads(raw or b"{}")
+        markup = body.get("text") or body.get("caption") or ""
+        if body.get("parse_mode") == "HTML" and isinstance(markup, str):  # what Telegram's HTML parser accepts
+            for tag, attrs in re.findall(r"</?([A-Za-z0-9-]+)([^>]*)>", markup):
+                ok = tag in ("b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "a", "code", "pre", "tg-spoiler",
+                             "tg-emoji", "blockquote") or (tag == "span" and "tg-spoiler" in attrs)
+                if not ok:
+                    return self.answer(400, {"ok": False, "description": "Bad Request: can't parse entities: Tag \"%s\"" % tag})
         if method == "editMessageText" and body.get("message_id") in BotAPI.photos:
             return self.answer(400, {"ok": False, "description": "Bad Request: there is no text in the message to edit"})
         if method == "editMessageCaption" and body.get("message_id") not in BotAPI.photos:
