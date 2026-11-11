@@ -2364,6 +2364,53 @@ class ShopTests(BotBase):
         self.assertIn("گزارش امروز", BotAPI.sent[-1]["text"])
         self.assertEqual(self.bot.daily_report(now=late), 0)  # once a day
 
+    def test_codes_scope_sale_and_admin_shop_screens(self):
+        ok = lambda m="", **k: (200, {"ok": True, "msg": m})
+        bad = lambda m: (200, {"ok": False, "msg": m})
+        xc.shop_action(self.app, "code_save", {"code": {"code": "FIRST", "kind": "discount", "pct": 50, "cap": 40000, "first": True}}, ok, bad)
+        xc.shop_action(self.app, "code_save", {"code": {"code": "RENEW", "kind": "discount", "pct": 10, "for": "renew"}}, ok, bad)
+        self.tap(1401, "bp:p30")
+        o = self.shop.d["orders"][-1]
+        self.assertEqual(self.shop.use_code(o, "tg:1401", "RENEW"), "این کد فقط برای تمدید است.")
+        self.assertEqual(self.shop.use_code(o, "tg:1401", "FIRST"), "")
+        self.assertEqual(o["discount"], 40000)  # 50% of 150,000, capped
+        done = self.shop.new_order("tg:1402", "tg", "1402", "buy", 150000, self.shop.plan("p30"))
+        done["status"] = "done"
+        again = self.shop.new_order("tg:1402", "tg", "1402", "buy", 150000, self.shop.plan("p30"))
+        self.assertIn("اولین خرید", self.shop.use_code(again, "tg:1402", "FIRST"))
+        # a timed sale: shown on the buttons and taken off the order
+        cfg = xc.load_config()
+        cfg.update(shop_sale_pct=20, shop_sale_until=int(time.time()) + 3600)
+        xc.save_config(cfg)
+        self.app.reload()
+        self.tap(1403, "buy")
+        self.assertIn("حراج", BotAPI.sent[-1]["text"])
+        self.assertIn("🔥", json.dumps(BotAPI.sent[-1]["reply_markup"], ensure_ascii=False))
+        self.tap(1403, "bp:p30")
+        sale_o = self.shop.d["orders"][-1]
+        self.assertEqual((sale_o["price"], sale_o.get("sale")), (120000, 20))
+        cfg.update(shop_sale_pct=0, shop_sale_until=0)
+        xc.save_config(cfg)
+        self.app.reload()
+        # the owner runs the shop from the bot
+        cfg["bot_owner"] = "42"
+        xc.save_config(cfg)
+        self.app.reload()
+        self.admin_tap(42, "a:pn")
+        self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "50 60 520000 ویژه"})
+        p = self.shop.d["plans"][-1]
+        self.assertEqual((p["gb"], p["days"], p["price"], p["name"]), (50.0, 60, 520000, "ویژه"))
+        self.admin_tap(42, "a:pp:%s" % p["id"])
+        self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "۴۹۹,۰۰۰"})
+        self.assertEqual(p["price"], 499000)
+        self.admin_tap(42, "a:cdn")
+        self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "NOWRUZ 20% 100 7"})
+        c = next(c for c in self.shop.d["codes"] if c["code"] == "NOWRUZ")
+        self.assertEqual((c["pct"], c["max"]), (20, 100))
+        for data, word in (("a:rep", "گزارش فروش"), ("a:ords:0", "سفارش‌ها"), ("a:ord:%d" % o["id"], "سفارش #"), ("a:sale", "حراج")):
+            m, _ = self.admin_tap(42, data)
+            self.assertIn(word, m.get("text", ""), data)
+
     def test_qr_cards_first_and_later(self):
         d = xc.conf_path("brand")
         os.makedirs(d, exist_ok=True)
