@@ -2285,6 +2285,85 @@ class ShopTests(BotBase):
         self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "🛒 منوی فروشگاه"})
         self.assertIn("buy", json.dumps(BotAPI.sent[-1]["reply_markup"]))
 
+    def test_wallet_history_block_reasons_rules_cards(self):
+        uid = "tg:1201"
+        self.shop.user(uid, {"id": 1201, "first_name": "Lila"})
+        xc.shop_action(self.app, "wallet", {"id": uid, "delta": 50000, "reason": "هدیه"}, lambda m="", **k: (200, {}), lambda m: (400, {}))
+        self.assertEqual(self.shop.user(uid)["wallet"], 50000)
+        self.assertIn("هدیه", BotAPI.sent[-1]["text"])  # the customer is told why
+        out = self.tap(1201, "wallet")
+        self.assertIn("۵۰٬۰۰۰ تومان", out)
+        self.assertIn("هدیه", out)  # the wallet shows its history
+        # a rejected receipt asks for a reason first
+        self.tap(1201, "bp:p30")
+        o = self.shop.d["orders"][-1]
+        self.photo(1201)
+        BotAPI.other = []
+        self.tap(100, "no:%d" % o["id"], chat=100)
+        self.assertEqual(o["status"], "review")
+        self.assertIn("nr:%d:0" % o["id"], json.dumps([b for m, b in BotAPI.other if m == "editMessageReplyMarkup"]))
+        self.tap(100, "nr:%d:0" % o["id"], chat=100)
+        self.assertEqual((o["status"], o["reason"]), ("rejected", xc.Shop.REJECT[0]))
+        # blocking
+        self.shop.user(uid)["blocked"] = True
+        self.assertIn("بسته", self.tap(1201, "buy") + json.dumps([b for m, b in BotAPI.other], ensure_ascii=False))
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 1201, "type": "private"}, "from": {"id": 1201}, "text": "/start"})
+        self.assertIn("بسته شده", BotAPI.sent[-1]["text"])
+        self.shop.user(uid)["blocked"] = False
+        # shop rules, accepted once
+        cfg = xc.load_config()
+        cfg.update(shop_rules="بعد از استفاده پول برنمی‌گرده", shop_cards="6037111122223333 | A | X\n6219861900001111 | B | Y", shop_card_rotate=True)
+        xc.save_config(cfg)
+        self.app.reload()
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 1202, "type": "private"}, "from": {"id": 1202}, "text": "/start"})
+        self.assertIn("rules_ok", json.dumps(BotAPI.sent[-1]["reply_markup"]))
+        self.tap(1202, "rules_ok")
+        self.assertTrue(self.shop.user("tg:1202").get("rules"))
+        # one card per order, in turn
+        nums = []
+        for chat in (1202, 1203):
+            self.shop.user("tg:%d" % chat)["rules"] = 1
+            text = self.tap(chat, "bp:p30")
+            nums.append("6037111122223333" in text)
+            self.assertNotEqual("6037111122223333" in text, "6219861900001111" in text)
+        self.assertEqual(sorted(nums), [False, True])
+        cfg.update(shop_rules="", shop_card_rotate=False)
+        xc.save_config(cfg)
+        self.app.reload()
+
+    def test_auto_renew_nudge_and_daily_report(self):
+        uid = "tg:1301"
+        u = self.shop.user(uid, {"id": 1301})
+        u["subs"] = ["sarasub12345"]
+        o = self.shop.new_order(uid, "tg", "1301", "buy", 150000, self.shop.plan("p30"), "sarasub12345")
+        o["status"], o["done_at"] = "done", int(time.time()) - 2 * 86400
+        self.tap(1301, "ar:sarasub12345")
+        self.assertTrue(u["auto"]["sarasub12345"])
+        real = self.bot.cached_users
+        soon = lambda: [dict(x, expiry=int(time.time() * 1000) + 3600 * 1000, used=0) if x["sub"] == "sarasub12345" else x for x in real()]
+        self.bot.cached_users = soon
+        try:
+            BotAPI.sent = []
+            self.shop.tick()  # not enough money: a warning with a top-up button
+            self.assertIn("کافی نیست", [m for m in BotAPI.sent if str(m["chat_id"]) == "1301"][0]["text"])
+            self.assertTrue(o.get("nudged"))  # 2 days, never connected: the guide went too
+            u["wallet"], u["auto_last"] = 200000, {}
+            self.shop.tick()
+            r = self.shop.d["orders"][-1]
+            self.assertEqual((r["kind"], r["status"], r["method"]), ("renew", "done", "wallet"))
+            self.assertEqual(u["wallet"], 50000)
+            self.assertEqual(self.shop.d["ledger"][-1]["kind"], "auto")
+        finally:
+            self.bot.cached_users = real
+        self.bot.st.pop("report_day", None)
+        BotAPI.sent = []
+        late = time.time() - (time.time() + xc.TEHRAN) % 86400 + 22.5 * 3600 - xc.TEHRAN + xc.TEHRAN
+        self.assertEqual(self.bot.daily_report(now=late), 1)
+        self.assertIn("گزارش امروز", BotAPI.sent[-1]["text"])
+        self.assertEqual(self.bot.daily_report(now=late), 0)  # once a day
+
     def test_qr_cards_first_and_later(self):
         d = xc.conf_path("brand")
         os.makedirs(d, exist_ok=True)
