@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.32.0"
+VERSION = "5.33.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -6021,6 +6021,104 @@ select.in{appearance:none;-webkit-appearance:none;background-image:linear-gradie
 @keyframes sk{to{background-position:-200% 0}}
 details summary{padding:6px 0;font-size:13.5px;cursor:pointer;color:var(--mut)}details[open] summary{margin-bottom:4px}
 </style>
+<style>
+/* ===== Pingo design system for the admin panel =====
+   ui-ux-pro-max: Glassmorphism (rtl: full) · dense dashboard spacing (4-32px) · contrast ≥ 4.5:1 ·
+   visible keyboard focus · 44px touch targets · reduced motion respected · sidebar on desktop, tabs on mobile.
+   Colours are the Pingo palette (Night, Glacier, Aqua, Aurora, Beak). */
+:root{--bg:#060B18;--bg2:rgba(255,255,255,.055);--card:rgba(255,255,255,.06);--card2:rgba(255,255,255,.1);--line:rgba(255,255,255,.09);--line2:rgba(255,255,255,.17);
+  --fg:#F8FAFC;--mut:#A6B4C8;--acc:#38BDF8;--acc2:#8B5CF6;--aqua:#5EEAD4;--beak:#FF8A3D;--ok:#34D399;--warn:#FBBF24;--bad:#F87171;
+  --okbg:rgba(52,211,153,.14);--warnbg:rgba(251,191,36,.13);--badbg:rgba(248,113,113,.14);--accbg:rgba(56,189,248,.15);--segbg:rgba(255,255,255,.07);
+  --r:16px;--glass:blur(18px) saturate(150%);--ring:0 0 0 3px rgba(56,189,248,.5);--grad:linear-gradient(135deg,#38BDF8 0%,#8B5CF6 100%);--side:252px}
+:root[data-theme=light]{--bg:#EEF2FA;--bg2:rgba(255,255,255,.75);--card:rgba(255,255,255,.72);--card2:rgba(255,255,255,.92);--line:rgba(11,20,48,.08);--line2:rgba(11,20,48,.15);
+  --fg:#0B1430;--mut:#4F5D78;--acc:#0369A1;--acc2:#6D28D9;--ok:#047857;--warn:#B45309;--bad:#DC2626;
+  --okbg:rgba(4,120,87,.1);--warnbg:rgba(180,83,9,.1);--badbg:rgba(220,38,38,.09);--accbg:rgba(3,105,161,.1);--segbg:rgba(11,20,48,.06);--ring:0 0 0 3px rgba(3,105,161,.35)}
+html,body{background:var(--bg)}
+body{background-image:radial-gradient(900px 620px at 88% -8%,rgba(139,92,246,.24),transparent 60%),radial-gradient(820px 620px at -12% 28%,rgba(56,189,248,.17),transparent 60%),radial-gradient(760px 520px at 55% 112%,rgba(94,234,212,.10),transparent 62%);background-attachment:fixed;font-size:15px}
+:root[data-theme=light] body{background-image:radial-gradient(900px 620px at 88% -8%,rgba(139,92,246,.12),transparent 60%),radial-gradient(820px 620px at -12% 28%,rgba(56,189,248,.12),transparent 60%)}
+/* glass surfaces */
+.card,.list,.ucard,.tile2,.mapcard,.savebar,.warnbox{background:var(--card);-webkit-backdrop-filter:var(--glass);backdrop-filter:var(--glass);border:1px solid var(--line);box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 12px 32px rgba(0,0,0,.18)}
+:root[data-theme=light] .card,:root[data-theme=light] .list,:root[data-theme=light] .ucard,:root[data-theme=light] .tile2{box-shadow:0 6px 22px rgba(11,20,48,.07)}
+.sheet{background:color-mix(in srgb,var(--bg) 82%,#121D3D);-webkit-backdrop-filter:var(--glass);backdrop-filter:var(--glass);border:1px solid var(--line2);box-shadow:0 -10px 40px rgba(0,0,0,.35)}
+:root[data-theme=light] .sheet{background:rgba(255,255,255,.95)}
+.ov{background:rgba(3,6,14,.55);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px)}
+.top{background:color-mix(in srgb,var(--bg) 66%,transparent);border-bottom:1px solid var(--line)}
+.logo{background:var(--grad);color:#fff;box-shadow:0 6px 16px rgba(56,189,248,.3)}
+img.logo{background:none;box-shadow:none;object-fit:contain}
+/* type */
+.hero h1{font-size:22px;letter-spacing:-.02em}.sec h3{font-size:12.5px;text-transform:none;color:var(--mut);font-weight:700;letter-spacing:.3px}
+.stat .v{font-size:22px;font-variant-numeric:tabular-nums}.tile2 .v{font-variant-numeric:tabular-nums}
+/* controls: 44px targets, clear focus, quick feedback */
+.btn{background:var(--grad);color:#fff;min-height:44px;border-radius:12px;box-shadow:0 8px 20px rgba(56,189,248,.22);transition:transform .12s,box-shadow .2s,opacity .2s}
+.btn:hover{box-shadow:0 10px 26px rgba(139,92,246,.3)}
+.btn.ghost{background:var(--segbg);color:var(--fg);box-shadow:none;border:1px solid var(--line)}.btn.ghost:hover{background:var(--card2)}
+.btn.danger{background:var(--badbg);color:var(--bad);box-shadow:none}
+.btn.sm{min-height:38px;border-radius:10px}
+.ibtn{width:40px;height:40px;border-radius:12px}.ibtn:hover{background:var(--segbg);border-color:transparent;color:var(--fg)}
+.abtn,.chip,.uacts button,.seg button{min-height:36px}
+.chip.on{background:var(--grad);border-color:transparent}
+.seg{background:var(--segbg);border-radius:12px;padding:3px}.seg button{border-radius:9px}.seg button.on{background:var(--card2);box-shadow:0 2px 8px rgba(0,0,0,.2)}
+.in,textarea.in{background:var(--bg2);border:1px solid var(--line2);border-radius:12px;min-height:44px}
+.in:focus{border-color:var(--acc);box-shadow:var(--ring)}
+.sw input:checked+.t{background:var(--grad)}.sw input:checked+.t::after{background:#fff}
+.check input,.tk input{accent-color:var(--acc)}
+.bar{height:6px;background:var(--segbg)}.bar i{background:var(--grad)}.bar i.warn{background:var(--warn)}.bar i.bad{background:var(--bad)}
+.tag{border-radius:8px;padding:2px 8px;font-weight:600;background:var(--segbg);border-color:transparent}
+.tag.ok{background:var(--okbg)}.tag.bad{background:var(--badbg)}.tag.warn{background:var(--warnbg)}.tag.acc{background:var(--accbg)}
+.mono{border-radius:11px;background:var(--segbg);border-color:transparent}.mono.ok{background:var(--okbg)}
+.toast{background:var(--card2);color:var(--fg);-webkit-backdrop-filter:var(--glass);backdrop-filter:var(--glass);border:1px solid var(--line2);box-shadow:0 12px 30px rgba(0,0,0,.3)}
+:root[data-theme=light] .toast{background:#0B1430;color:#fff}
+button,[data-act],.row.btn-row,.chip,.sw{cursor:pointer}
+:focus{outline:none}:focus-visible{outline:none;box-shadow:var(--ring);border-radius:10px}
+.skip{position:absolute;top:-60px;right:12px;z-index:90;background:var(--card2);color:var(--fg);padding:10px 14px;border-radius:10px}.skip:focus{top:12px}
+/* bottom tabs (mobile): five equal tabs, active one lit */
+.nav{background:color-mix(in srgb,var(--bg) 72%,transparent);-webkit-backdrop-filter:var(--glass);backdrop-filter:var(--glass);border-top:1px solid var(--line)}
+.nav .inner{grid-template-columns:repeat(5,1fr);max-width:560px}
+.nav button{min-height:52px;border-radius:12px;transition:color .15s,background .15s}
+.nav button.on{color:var(--fg)}.nav button.on .i{color:var(--acc)}
+.nav .side-only{display:none}
+/* the users table (desktop) */
+.utable{width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px}
+.utable th{text-align:right;font-weight:700;font-size:12px;color:var(--mut);padding:10px 12px;background:color-mix(in srgb,var(--bg) 85%,transparent);-webkit-backdrop-filter:var(--glass);backdrop-filter:var(--glass);border-bottom:1px solid var(--line2);white-space:nowrap}
+.utable th button{border:0;background:none;color:inherit;font:inherit;padding:0;cursor:pointer}.utable th button.on{color:var(--fg)}
+.utable td{padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
+.utable tr:hover td{background:var(--segbg)}.utable tr:last-child td{border-bottom:0}
+.utable .nm{display:flex;align-items:center;gap:10px;min-width:180px}.utable .nm b{direction:ltr;unicode-bidi:plaintext;font-weight:700}
+.utable .nm small{display:block;color:var(--mut);font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.utable .use{min-width:170px}.utable .use .bar{margin-top:6px}
+.utable .acts{display:flex;gap:6px;justify-content:flex-end}
+.utable .acts button{width:36px;height:36px;border-radius:10px;border:1px solid var(--line);background:var(--segbg);display:grid;place-items:center;color:var(--fg)}
+.utable .acts button:hover{border-color:var(--acc);color:var(--acc)}
+.utable-wrap{background:var(--card);-webkit-backdrop-filter:var(--glass);backdrop-filter:var(--glass);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin:10px 0}
+@media(max-width:1023px),(hover:none){.kbd{display:none!important}}
+.kbd{font:600 11px/1 ui-monospace,Menlo,monospace;border:1px solid var(--line2);border-bottom-width:2px;border-radius:6px;padding:3px 6px;color:var(--mut);direction:ltr;display:inline-block}
+/* desktop: a sidebar on the right, wider content, more columns */
+@media(min-width:1024px){
+  body{padding-right:var(--side)}
+  .nav{top:0;bottom:0;right:0;left:auto;width:var(--side);border-top:0;border-left:1px solid var(--line);padding:18px 14px;display:flex;flex-direction:column}
+  .nav .side-only{display:block}
+  .nav .sbrand{display:flex;align-items:center;gap:10px;padding:6px 8px 18px;border-bottom:1px solid var(--line);margin-bottom:12px}
+  .nav .sbrand b{font-size:16px}.nav .sbrand small{display:block;color:var(--mut);font-size:11.5px;direction:ltr;text-align:right}
+  .nav .inner{display:flex;flex-direction:column;gap:4px;max-width:none;margin:0}
+  .nav button{flex-direction:row;justify-content:flex-start;gap:12px;padding:10px 14px;font-size:14.5px;font-weight:600;min-height:46px;color:var(--mut)}
+  .nav button:hover{background:var(--segbg);color:var(--fg)}
+  .nav button.on{background:var(--accbg);color:var(--fg);box-shadow:inset -3px 0 0 var(--acc)}
+  .nav .sfoot{margin-top:auto;padding:12px 8px 0;border-top:1px solid var(--line);font-size:12px;color:var(--mut);line-height:2}
+  .top .brand{visibility:hidden}
+  .top .inner,.wrap{max-width:1180px}
+  .wrap{padding:8px 32px 48px}
+  .tiles{grid-template-columns:repeat(4,1fr);gap:14px}
+  .stats{gap:36px}
+  .home-grid{display:grid;grid-template-columns:1.4fr 1fr;gap:18px;align-items:start}
+  .ov{align-items:center}.sheet{max-width:640px;border-radius:20px}
+  .cols2.wide{grid-template-columns:repeat(3,1fr)}
+  .wrap[data-tab=settings]{column-count:2;column-gap:18px}
+  .wrap[data-tab=settings]>*{break-inside:avoid}
+  .wrap[data-tab=settings]>.card,.wrap[data-tab=settings]>form.card{display:inline-block;width:100%;margin:0 0 18px}
+}
+@media(min-width:1440px){.top .inner,.wrap{max-width:1320px}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+</style>
 </head>
 <body>
 <div id="app"></div>
@@ -6170,15 +6268,31 @@ function bindAuth(){
 /* layout */
 const TABS=[["home","home","خانه"],["routes","route","مسیرها"],["users","users","کاربرها"],["shop","cart","فروش"],["settings","sliders","تنظیمات"]];
 const VIEWS={};
+const WIDE=window.matchMedia("(min-width:1024px)");
+WIDE.addEventListener&&WIDE.addEventListener("change",()=>{if(S.state&&S.tab==="users")renderUserList()});
+document.addEventListener("keydown",e=>{
+  if(!S.state||e.ctrlKey||e.metaKey||e.altKey)return;
+  const typing=/^(INPUT|TEXTAREA|SELECT)$/.test((e.target||{}).tagName||"")||(e.target||{}).isContentEditable;
+  if(e.key==="Escape"){if($("#ov")){e.preventDefault();closeSheet()}return}
+  if(typing||$("#ov"))return;
+  const k=e.key.toLowerCase(),go=t=>{S.tab=t;S.fade=true;try{localStorage.setItem("xc_tab",t)}catch(x){}render();scrollTo({top:0})};
+  if(e.key==="/"){e.preventDefault();if(S.tab!=="users")go("users");setTimeout(()=>{const q=$("#q");q&&q.focus()},30)}
+  else if(k==="n"||k==="د"){e.preventDefault();addUserSheet()}
+  else if(k==="r"||k==="ق"){e.preventDefault();act(null,"state",{})}
+  else if(/^[1-5۱-۵]$/.test(e.key)){const n="12345".indexOf(e.key)+1||"۱۲۳۴۵".indexOf(e.key)+1;if(TABS[n-1]){e.preventDefault();go(TABS[n-1][0])}}
+});
 function render(){
   const app=$("#app");
   if(!S.state){app.innerHTML=S.auth?authView():`<div class="wrap"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>`;bindAuth();return}
   const dark=document.documentElement.dataset.theme==="dark";
   const keepQ=document.activeElement&&document.activeElement.id==="q";
-  app.innerHTML=`<header class="top"><div class="inner"><div class="brand"><div class="logo">EZ</div><div><b>EZ-XUI</b><small>${esc(S.state.host)}</small></div></div>
+  const title=esc(S.state.settings.title||"EZ-XUI");
+  app.innerHTML=`<a class="skip" href="#main">پرش به محتوا</a><header class="top"><div class="inner"><div class="brand"><div class="logo">EZ</div><div><b>${title}</b><small>${esc(S.state.host)}</small></div></div>
   <div class="hbtns"><button class="ibtn" data-act="refresh" title="به‌روزرسانی">${ic("refresh")}</button><button class="ibtn" data-act="theme" title="تم">${ic(dark?"sun":"moon")}</button></div></div></header>
-  <main class="wrap ${S.fade?"fade":""}" id="main">${(VIEWS[S.tab]||VIEWS.home)()}</main>
-  <nav class="nav"><div class="inner">${TABS.map(([id,icon,l])=>`<button data-act="tab" data-tab="${id}" class="${S.tab===id?"on":""}">${ic(icon)}<span>${l}</span></button>`).join("")}</div></nav>`;
+  <main class="wrap ${S.fade?"fade":""}" id="main" data-tab="${S.tab}" tabindex="-1">${(VIEWS[S.tab]||VIEWS.home)()}</main>
+  <nav class="nav" aria-label="بخش‌های پنل"><div class="sbrand side-only"><div class="logo">EZ</div><div><b>${title}</b><small>${esc(S.state.host)}</small></div></div>
+  <div class="inner">${TABS.map(([id,icon,l],k)=>`<button data-act="tab" data-tab="${id}" class="${S.tab===id?"on":""}" ${S.tab===id?'aria-current="page"':""} title="${l} (${k+1})">${ic(icon)}<span>${l}</span></button>`).join("")}</div>
+  <div class="sfoot side-only"><span class="kbd">/</span> جستجو · <span class="kbd">N</span> کاربر جدید<br><span class="kbd">1</span>–<span class="kbd">5</span> بخش‌ها · <span class="kbd">R</span> تازه‌سازی<br><span class="ltr">EZ-XUI ${esc(S.state.version||"")}</span></div></nav>`;
   S.fade=false;
   if(S.tab==="users"){renderUserList();if(keepQ){const q=$("#q");q.focus();q.setSelectionRange(q.value.length,q.value.length)}}
 }
@@ -6285,18 +6399,25 @@ VIEWS.home=()=>{
   <div class="stat"><div class="v">${st.panel.ok?fa(online):"—"}</div><div class="k">آنلاین</div></div>
   <div class="stat"><div class="v">${fa(okR)} <small>از ${fa(us.length)}</small></div><div class="k">مسیر سالم</div></div>
   <div class="stat"><div class="v">${gb(users.reduce((a,u)=>a+u.used,0))} <small>GB</small></div><div class="k">مصرف کل</div></div></div>
-  <div class="bar-btns"><button class="btn sm" data-act="add-user">${ic("plus")} کاربر جدید</button><button class="btn sm ghost" data-act="ping">${ic("wifi")} پینگ مسیرها</button></div></div>
+  <div class="bar-btns"><button class="btn sm" data-act="add-user">${ic("plus")} کاربر جدید <span class="kbd" style="color:#fff;border-color:rgba(255,255,255,.4)">N</span></button><button class="btn sm ghost" data-act="ping">${ic("wifi")} پینگ مسیرها</button></div></div>
+  ${st.shop&&st.shop.enable?`<div class="tiles">
+    <div class="tile2 acc"><div class="k">فروش امروز</div><div class="v">${tmn(st.shop.stats.today)}</div></div>
+    <div class="tile2"><div class="k">فروش ۳۰ روز</div><div class="v">${tmn(st.shop.stats.month)}</div></div>
+    <button class="tile2" style="text-align:right;color:inherit;font:inherit" data-act="tab" data-tab="shop"><div class="k">رسید منتظر</div><div class="v ${st.shop.stats.review?"warn":""}">${fa(st.shop.stats.review)}</div></button>
+    <div class="tile2"><div class="k">مشتری ربات · خریدار</div><div class="v">${fa(st.shop.stats.customers)} <small class="mut" style="font-size:13px">· ${fa(st.shop.stats.buyers)}</small></div></div></div>`:""}
   ${!st.panel.configured?`<div class="card"><h2>پنل 3x-ui وصل نیست</h2><p class="mut small">${st.settings.panel_auto&&st.settings.auto_note?esc(st.settings.auto_note):"برای ساخت و مدیریت کاربر از همین‌جا، پنل رو در تنظیمات وصل کن."}</p><button class="btn sm ghost" data-act="goto-panel">تنظیمات پنل</button></div>`:""}
   ${jobsBox()}
+  <div class="home-grid"><div>
   <div class="sec"><h3>ساب پیش‌فرض</h3><button class="lnk" data-act="seg" data-seg="templates">ساب‌ها</button></div>
   <div class="list">${blocks(rts,r=>r).slice(0,8).map((b,i)=>b.gid?groupRow(b,i,tplById("default")):routeRow(b.items[0],i)).join("")||`<div class="note">مسیری نیست. در «مسیرها» یه سرور ایران یا واسط اضافه کن.</div>`}</div>
   ${attention.length?`<div class="sec"><h3>نیاز به تمدید</h3><button class="lnk" data-act="tab" data-tab="users">همه</button></div><div class="list">${attention.map(u=>{const s=ustat(u);return `<div class="row btn-row" data-act="edit" data-sub="${esc(u.sub)}"><div class="t"><b class="ltr" style="text-align:right">${esc(u.name)}</b><small>${usage(u)}</small></div><div class="r"><span class="${STAT_CLS[s[0]]}">${s[0]==="soon"?daysText(u):s[1]}</span></div></div>`}).join("")}</div>`:""}
+  </div><div>
   <div class="sec"><h3>این سرور</h3><span class="mut xs">${sv.uptime?"روشن از "+uptime(sv.uptime):""}</span></div>
   <div class="card">
    ${load!=null?`<div class="meter"><div class="rw"><span>پردازنده</span><span class="mut">${fa(load)}٪</span></div><div class="bar"><i class="${barCls(load)}" style="width:${load}%"></i></div></div>`:""}
    ${sv.mem_total?`<div class="meter"><div class="rw"><span>رم</span><span class="mut">${gb(sv.mem_used)} از ${gb(sv.mem_total)} GB</span></div><div class="bar"><i class="${barCls(pct(sv.mem_used,sv.mem_total))}" style="width:${pct(sv.mem_used,sv.mem_total)}%"></i></div></div>`:""}
    ${sv.disk_total?`<div class="meter"><div class="rw"><span>دیسک</span><span class="mut">${gb(sv.disk_used)} از ${gb(sv.disk_total)} GB</span></div><div class="bar"><i class="${barCls(pct(sv.disk_used,sv.disk_total))}" style="width:${pct(sv.disk_used,sv.disk_total)}%"></i></div></div>`:""}
-  </div>`;
+  </div></div></div>`;
 };
 
 /* routes tab */
@@ -6949,6 +7070,7 @@ function renderUserList(){
   const el=$("#ulist");if(!el)return;const list=filtered();
   if(!S.state.users.length){el.innerHTML=`<div class="empty">${ic("users")}<p>هنوز کاربری نیست.</p><button class="btn" data-act="add-user">${ic("plus")} ساخت اولین کاربر</button></div>`;return}
   if(!list.length){el.innerHTML=`<div class="empty">${ic("search")}<p>کاربری با این فیلتر پیدا نشد.</p></div>`;return}
+  if(WIDE.matches){el.innerHTML=userTable(list);return}
   el.innerHTML=list.map(u=>{
     const s=ustat(u),p=pct(u.used,u.total);
     return `<div class="ucard u"><div class="uhead"><div class="uname">${mono(u.name.slice(0,2).toUpperCase(),u.online?"ok":"")}<b>${esc(u.name)}</b></div><span style="display:flex;gap:6px;align-items:center">${u.tpl&&u.tpl!=="default"?`<span class="tag acc">${esc(tplName(u.tpl))}</span>`:""}${u.buyer?`<span class="tag" title="از ربات">🤖</span>`:""}<span class="tag ${STAT_CLS[s[0]]}">${s[1]}</span></span></div>
@@ -6958,6 +7080,21 @@ function renderUserList(){
     <div class="umeta"><span>${usage(u)}</span><span>${daysText(u)}</span></div>
     <div class="uacts"><button data-act="share" data-sub="${esc(u.sub)}" ${u.sub?"":"disabled"}>${ic("share")}<span>لینک</span></button><button data-act="edit" data-sub="${esc(u.sub)}">${ic("edit")}<span>تمدید</span></button><button data-act="umore" data-sub="${esc(u.sub)}" aria-label="بیشتر">${ic("more")}</button></div></div>`;
   }).join("");
+}
+function userTable(list){
+  const so=S.usort||{k:"",d:1},left=u=>u.expiry>0?u.expiry:(u.expiry<0?9e15:9.9e15);
+  const keys={name:u=>u.name.toLowerCase(),use:u=>u.total?u.used/u.total:-1,days:left,devices:u=>u.devices||0};
+  if(so.k&&keys[so.k])list=[...list].sort((a,b)=>{const x=keys[so.k](a),y=keys[so.k](b);return (x>y?1:x<y?-1:0)*so.d});
+  const th=(k,l)=>k?`<th scope="col"><button data-act="usort" data-k="${k}" class="${so.k===k?"on":""}">${l}${so.k===k?(so.d>0?" ↑":" ↓"):""}</button></th>`:`<th scope="col">${l}</th>`;
+  return `<div class="utable-wrap"><table class="utable"><thead><tr>${th("name","کاربر")}${th("","وضعیت")}${th("use","مصرف")}${th("days","زمان")}${th("devices","دستگاه")}${multiLoc()?th("","خروجی"):""}<th scope="col"><span class="mut">${fa(list.length)} کاربر</span></th></tr></thead><tbody>
+  ${list.map(u=>{const s=ustat(u),p=pct(u.used,u.total),who=u.note||(u.buyer?[u.buyer.name,u.buyer.username?"@"+u.buyer.username:"",u.buyer.phone].filter(Boolean).join(" · "):"");
+    return `<tr><td><div class="nm">${mono(u.name.slice(0,2).toUpperCase(),u.online?"ok":"")}<div><b>${esc(u.name)}</b>${u.buyer?' <span class="tag" title="مشتری ربات">🤖</span>':""}${who?`<small>${u.note?"📝 ":"👤 "}${esc(who)}</small>`:""}</div></div></td>
+    <td><span class="tag ${STAT_CLS[s[0]]}">${s[1]}</span>${u.online?' <span class="tag ok">آنلاین</span>':""}</td>
+    <td class="use"><span class="mut small">${usage(u)}</span><div class="bar"><i class="${barCls(p)}" style="width:${u.total?p:4}%"></i></div></td>
+    <td class="small">${daysText(u)}</td><td class="small">${u.devices?fa(u.devices):"∞"}</td>
+    ${multiLoc()?`<td>${userLocs(u).map(l=>`<span class="tag">${esc(l.name)}</span>`).join(" ")||'<span class="mut">—</span>'}</td>`:""}
+    <td><div class="acts"><button data-act="share" data-sub="${esc(u.sub)}" ${u.sub?"":"disabled"} aria-label="لینک و QR" title="لینک و QR">${ic("share")}</button><button data-act="edit" data-sub="${esc(u.sub)}" aria-label="تمدید" title="تمدید">${ic("edit")}</button><button data-act="umore" data-sub="${esc(u.sub)}" aria-label="بیشتر" title="بیشتر">${ic("more")}</button></div></td></tr>`}).join("")}
+  </tbody></table></div>`;
 }
 document.addEventListener("input",e=>{if(e.target.id==="q"){S.q=e.target.value;renderUserList()}});
 const userBy=sub=>S.state.users.find(u=>u.sub===sub);
@@ -7381,6 +7518,7 @@ document.addEventListener("submit",async e=>{
 
 /* actions */
 const ACTS={
+  usort:b=>{const k=b.dataset.k,so=S.usort||{};S.usort={k,d:so.k===k?-so.d:1};renderUserList()},
   "user-card":b=>act(b,"user_card",{sub:b.dataset.sub}),
   "user-note":b=>{const u=userBy(b.dataset.sub);if(!u)return;
     sheet(`<h3>📝 توضیحات <span class="ltr">${esc(u.name)}</span></h3><form id="nf"><label class="f"><span>توضیحات</span><textarea class="in" name="note" maxlength="300" style="min-height:90px;font-family:inherit">${esc(u.note||"")}</textarea></label><button class="btn block">${ic("check")} ذخیره</button></form>`,el=>{
