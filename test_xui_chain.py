@@ -1994,7 +1994,9 @@ class ShopTests(BotBase):
         m, _ = self.admin_tap(42, "a:users:0")
         self.assertIn("a:u:sarasub12345", json.dumps(m["reply_markup"]))
         m, _ = self.admin_tap(42, "a:u:sarasub12345")
-        self.assertIn("sara", m["text"])
+        self.assertEqual(m["method"], "sendPhoto")  # the user card is its QR card, details under it
+        self.assertIn("sara", m["caption"])
+        self.assertIn(("deleteMessage", {"chat_id": 42, "message_id": 9}), BotAPI.other)  # the list it came from
         self.admin_tap(42, "a:ux:sarasub12345:d30")
         sub, emails, ch = self.panel.updated[-1]
         self.assertGreater(ch["expiryTime"], (time.time() + 32 * 86400) * 1000)
@@ -2099,6 +2101,7 @@ class ShopTests(BotBase):
             self.say(987, "/start")
             self.assertEqual(BotAPI.sent[-1]["photo"], "BANNER_FID")  # then sent by its file id
             BotAPI.photos = {7}
+            self.shop.photo_menus.add(("987", 7))  # the banner menu (in the bot: known by the banner's file id)
             self.tap(987, "tk")  # a plain menu from the photo menu: the banner stays, the caption changes
             self.assertEqual(BotAPI.sent[-1]["method"], "editMessageCaption")
             self.assertIn("پشتیبانی", BotAPI.sent[-1]["caption"])
@@ -2259,6 +2262,55 @@ class ShopTests(BotBase):
             cfg["digits"] = "fa"
             xc.save_config(cfg)
             self.app.reload()
+
+    def test_owner_keyboard_at_the_bottom(self):
+        cfg = xc.load_config()
+        cfg["bot_owner"] = "42"
+        xc.save_config(cfg)
+        self.app.reload()
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "/start"})
+        kb = [m for m in BotAPI.sent if "keyboard" in (m.get("reply_markup") or {})]
+        self.assertEqual(len(kb), 1)
+        self.assertIn("👥 کاربرها", json.dumps(kb[0]["reply_markup"], ensure_ascii=False))
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "/start"})
+        self.assertFalse([m for m in BotAPI.sent if "keyboard" in (m.get("reply_markup") or {})])  # once
+        self.admin_tap(42, "a:new")  # a step waiting for text...
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "👥 کاربرها"})
+        self.assertIn("a:u:", json.dumps(BotAPI.sent[-1]["reply_markup"]))  # ...is left for the user list
+        self.assertEqual(BotAPI.sent[-1]["method"], "sendMessage")
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "🛒 منوی فروشگاه"})
+        self.assertIn("buy", json.dumps(BotAPI.sent[-1]["reply_markup"]))
+
+    def test_qr_cards_first_and_later(self):
+        d = xc.conf_path("brand")
+        os.makedirs(d, exist_ok=True)
+        files = {n: os.path.join(d, n) for n in ("qr-card.png", "qr-card-plain.png")}
+        for n, f in files.items():
+            with open(f, "wb") as fh:
+                fh.write(xc.png_write(1080, 1350, bytearray((200 if "plain" in n else 50,) * (1080 * 1350 * 3))))
+        try:
+            first = xc.png_read(xc.qr_card("https://x.example/chain/abc"))[3]
+            later = xc.png_read(xc.qr_card("https://x.example/chain/abc", plain=True))[3]
+            self.assertEqual((first[0], later[0]), (50, 200))  # each from its own template
+            self.shop.user("tg:999")["subs"] = ["omidsub12345"]
+            BotAPI.sent = []
+            self.tap(999, "qr:omidsub12345")
+            m = BotAPI.sent[-1]
+            self.assertEqual(m["method"], "sendPhoto")
+            mid = len(BotAPI.sent)
+            self.assertEqual(self.shop.qr_menus.get(("999", mid)), "omidsub12345")
+            BotAPI.sent = []
+            self.shop.on_callback("tg", {"id": "q", "data": "svc", "from": {"id": 999},
+                                         "message": {"chat": {"id": 999}, "message_id": mid, "photo": [{"file_id": "QRPHOTO"}]}})
+            self.assertEqual(BotAPI.sent[-1]["method"], "sendMessage")  # the QR card was left alone
+        finally:
+            for f in files.values():
+                os.remove(f)
+            xc._BRAND_PNG.clear()
 
     def test_qr_matrix_shape(self):
         g = xc.qr_matrix("https://sub.shelbyping.com:2097/chain/neoll2tbmlb1m0mg")

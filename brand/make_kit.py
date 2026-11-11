@@ -156,6 +156,11 @@ qr = (f'<rect width="1080" height="1350" fill="url(#night)"/>'
       + pill(178, 1150, 220, 64, "Happ", glow=ICE, size=26) + pill(430, 1150, 220, 64, "v2rayNG", size=26) + pill(682, 1150, 220, 64, "Streisand", glow=AUR, size=26)
       + f'<text x="540" y="1268" font-family="{BODY}" font-weight="700" font-size="24" fill="{MIST}" letter-spacing="8" text-anchor="middle">PINGO • VPN</text>')
 write("qr-card", 1080, 1350, qr)
+# the same card without «اشتراکت آماده‌ست», for every later time the QR is shown
+qr_plain = qr.replace(f'<text x="540" y="282" font-family="{DISPLAY}" font-size="46" fill="url(#iceh)" text-anchor="middle">اشتراکت آماده‌ست</text>', "")
+qr_plain = qr_plain.replace('<text x="540" y="200" font-family="' + DISPLAY + '" font-size="104"', '<text x="540" y="250" font-family="' + DISPLAY + '" font-size="120"')
+assert qr_plain != qr
+write("qr-card-plain", 1080, 1350, qr_plain)
 logo = (f'<rect x="4" y="4" width="152" height="152" rx="40" fill="#FFFFFF"/>'
         f'<rect x="12" y="12" width="136" height="136" rx="34" fill="url(#night)"/>'
         + penguin(80, 88, .37))

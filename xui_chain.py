@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.31.0"
+VERSION = "5.32.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -5729,7 +5729,7 @@ def do_action(app, action, body, host):
                     app.bot.users_changed()
                     for acid, a in list(app.bot.admin_chats().items()):
                         if not a.get("paused"):
-                            app.bot.admin.send_card(*acid.split(":", 1), sub)
+                            app.bot.admin.send_card(*acid.split(":", 1), sub, plain=False)
                 threading.Thread(target=cards, daemon=True).start()
             return done("کاربر %s ساخته شد" % name, sub=sub)
 
@@ -8205,18 +8205,19 @@ def brand_png(name):
                 w, h, ch, px = png_read(f.read())
         except (OSError, ValueError, zlib.error):
             return None
-        if name == "qr-card.png" and ch == 4:  # the card is opaque: keep RGB
+        if name.startswith("qr-card") and ch == 4:  # the card is opaque: keep RGB
             px = bytearray(b for i in range(0, len(px), 4) for b in px[i:i + 3])
             ch = 3
         hit = _BRAND_PNG[name] = (key, (w, h, ch, px))
     return hit[1]
 
 
-def qr_card(link):
-    """The subscription as a picture: the brand card (brand/qr-card.png) with the QR on its white plate
-    and the logo (brand/qr-logo.png) in the middle; a plain white QR when there is no card. -> PNG bytes"""
+def qr_card(link, plain=False):
+    """The subscription as a picture: the brand card (brand/qr-card.png, «your subscription is ready»; or
+    brand/qr-card-plain.png for every later time) with the QR on its white plate and the logo
+    (brand/qr-logo.png) in the middle; a plain white QR when there is no card. -> PNG bytes"""
     g = qr_matrix(link)
-    card = brand_png("qr-card.png")
+    card = (plain and brand_png("qr-card-plain.png")) or brand_png("qr-card.png")
     if card and card[0] >= 600:
         w, h, _, px = card
         rgb = bytearray(px)
@@ -8522,10 +8523,15 @@ class Bot:
                     admin = self.st["admins"][cid] = {"name": name, "events": "all", "paused": False, "at": int(time.time())}
                 self.save()
                 self.app.reload()
+            if text in self.admin.QUICK:  # the owner's keyboard at the bottom of the chat
+                self.admin.wait.pop(cid, None)
+                self.shop.wait.pop(cid, None)
+                return self.admin.quick(net, chat, who, self.admin.QUICK[text])
             if self.admin.on_text(net, chat, msg):
                 return
             if cmd in ("/start", "/admin", "/panel") and not (cmd == "/start" and arg.startswith(("s_", "r_"))):
                 self.admin.wait.pop(cid, None)
+                self.admin.give_kb(net, chat)
                 return self.admin.home(net, chat)
 
         code = (arg if cmd == "/start" else text).strip().upper()
@@ -8933,7 +8939,8 @@ def shop_path():
     return conf_path("shop.json")
 
 
-BRAND_FILES = ("mark.svg", "mark.png", "avatar-640.png", "banner.png", "banner.svg", "display.ttf", "qr-card.png", "qr-logo.png")
+BRAND_FILES = ("mark.svg", "mark.png", "avatar-640.png", "banner.png", "banner.svg", "display.ttf", "qr-card.png", "qr-card-plain.png",
+               "qr-logo.png")
 
 
 def brand_file(name):
@@ -9019,6 +9026,7 @@ class Shop:
         self.app = bot.app
         self.lock = threading.RLock()
         self.photo_menus = set()  # (chat, message id) of menus under the banner: edited by caption
+        self.qr_menus = {}  # (chat, message id) of QR cards -> their sub: never written over
         self.members = {}  # Telegram user id -> when they were last seen in the channel
         self.wait = {}  # chat id -> {"what": "receipt"|"code"|"gift"|"amount", "order": id}
         self.build = {}  # chat id -> the custom plan being set up
@@ -9366,6 +9374,8 @@ class Shop:
         are photo messages; a plain menu opened from one keeps the banner as its header (caption edit)."""
         if banner and net == "tg" and len(text) <= 1024 and self.banner_photo(net):
             return self.show_banner(net, chat, text, rows, msg, effect)
+        if msg and (str(chat), msg) in self.qr_menus:
+            msg = None  # a QR card stays as it is (to forward); the next screen comes as a new message
         for attempt in (0, 1):
             payload = {"chat_id": chat, "text": text[:4000], "disable_web_page_preview": True, "parse_mode": "HTML"}
             if rows is not None:
@@ -9379,7 +9389,9 @@ class Shop:
                     except (ValueError, OSError) as e:
                         if "not modified" in str(e):
                             return None
-                        if re.search(r"no text in the message", str(e), re.I):  # a photo menu (banner)
+                        if re.search(r"no text in the message", str(e), re.I):  # a photo menu
+                            if (str(chat), msg) not in self.photo_menus:
+                                raise ValueError("send")  # not the banner (a QR card, or before a restart): keep it
                             if len(text) <= 1024:
                                 try:
                                     return self.bot.call(net, "editMessageCaption", {"chat_id": chat, "message_id": msg, "caption": text,
@@ -10311,11 +10323,20 @@ class Shop:
         if not self.send_qr(net, chat, sub, text, rows, effect="party"):
             self.show(net, chat, text, rows, effect="party")
 
-    def send_qr(self, net, chat, sub, caption, rows, effect=None):
-        """The subscription card (QR + logo) as a photo with this caption. -> True when sent."""
+    def send_qr(self, net, chat, sub, caption, rows, effect=None, plain=False):
+        """The subscription card (QR + logo) as a photo with this caption. plain: the later card, without
+        «your subscription is ready». -> True when sent."""
         link = self.bot.sub_link(sub)
-        card = brand_file("qr-card.png")
-        key = "%s:%s:%s" % (net, sub, int(os.path.getmtime(card)) if card else 0)
+        card = brand_file("qr-card-plain.png" if plain else "qr-card.png") or brand_file("qr-card.png")
+        key = "%s:%s:%s:%s" % (net, sub, "p" if plain else "f", int(os.path.getmtime(card)) if card else 0)
+
+        def keep(res):
+            mid = (res or {}).get("message_id") if isinstance(res, dict) else None
+            if mid:
+                if len(self.qr_menus) > 5000:
+                    self.qr_menus.clear()
+                self.qr_menus[(str(chat), mid)] = sub
+            return True
         payload = {"chat_id": chat, "caption": caption[:1024], "parse_mode": "HTML", "reply_markup": self.kb(rows, net)}
         if effect and net == "tg" and not str(chat).startswith("-"):
             payload["message_effect_id"] = self.EFFECT.get(effect, effect)
@@ -10323,8 +10344,8 @@ class Shop:
             try:
                 fid = (self.d.get("qr") or {}).get(key)
                 if fid:
-                    return bool(self.bot.call(net, "sendPhoto", dict(payload, photo=fid)))
-                res = self.bot.upload(net, "sendPhoto", payload, "photo", "pingo.png", qr_card(link), "image/png")
+                    return keep(self.bot.call(net, "sendPhoto", dict(payload, photo=fid)))
+                res = self.bot.upload(net, "sendPhoto", payload, "photo", "pingo.png", qr_card(link, plain), "image/png")
                 sizes = (res or {}).get("photo") or []
                 if sizes:
                     with self.lock:
@@ -10334,7 +10355,7 @@ class Shop:
                             for k in list(cache)[:200]:
                                 cache.pop(k, None)
                     self.save()
-                return True
+                return keep(res)
             except (ValueError, OSError) as e:
                 if attempt == 0 and re.search(r"effect", str(e), re.I):
                     payload.pop("message_effect_id", None)
@@ -10547,7 +10568,11 @@ class Shop:
                 except (ValueError, OSError):
                     pass
                 if msg.get("photo"):
-                    self.photo_menus.add((str(chat), mid))
+                    fid = ((self.bot.st.get("banner") or {}).get(net) or [None, None])[1]
+                    if fid and fid in [p.get("file_id") for p in msg["photo"]]:
+                        self.photo_menus.add((str(chat), mid))  # the banner menu: edited by caption
+                    elif (str(chat), mid) not in self.qr_menus:
+                        self.qr_menus[(str(chat), mid)] = ""  # some other photo (a QR card): left alone
                 self.user(uid, who)
                 head, _, rest = data.partition(":")
                 self.tell(uid, "👆 %s%s" % (self.TAPS.get(head, head), " · " + rest[:30] if rest else ""), taps=True)
@@ -10591,7 +10616,7 @@ class Shop:
                 return self.svc_menu(net, chat, uid, mid)
             link = self.bot.sub_link(rest)
             rows = ([[("📋 کپی لینک اشتراک", "copy:" + link, "success")]] if net == "tg" else []) + [[("📦 سرویس‌های من", "svc"), ("🏠 منوی اصلی", "m")]]
-            if not self.send_qr(net, chat, rest, "🔳 <b>QR اشتراکت</b>\n\n🔗 <code>%s</code>\n\nبا اپ اسکن کن یا لینک رو کپی کن." % self.esc(link), rows):
+            if not self.send_qr(net, chat, rest, "🔳 <b>QR اشتراکت</b>\n\n🔗 <code>%s</code>\n\nبا اپ اسکن کن یا لینک رو کپی کن." % self.esc(link), rows, plain=True):
                 self.show(net, chat, "⚠️ عکس ساخته نشد؛ لینک:\n<code>%s</code>" % self.esc(link), rows)
             return
         if head == "sva":
@@ -11065,15 +11090,70 @@ class AdminBot:
                 [("📝 توضیحات", "a:un:%s"), ("🔳 کارت QR", "a:uq:%s")],
                 [("⬅️ کاربرها", "a:users:0"), ("🏠 پنل", "a:home")]]
         rows = [[tuple([b[0], b[1].replace("%s", sub, 1)] + list(b[2:])) for b in row] for row in rows]
-        self.show(net, chat, text, rows, msg)
+        self.card_photo(net, chat, sub, text, rows, msg)
 
-    def send_card(self, net, chat, sub):
-        """The user's QR card in this chat, ready to forward to them."""
+    QUICK = {"🛠 پنل مدیریت": "a:home", "🧾 رسیدها": "a:rcpt", "👥 کاربرها": "a:users:0", "➕ کاربر جدید": "a:new",
+             "🧑‍💻 مشتری‌ها": "a:cus:0", "🎫 تیکت‌ها": "a:tks", "🛒 منوی فروشگاه": "m"}
+    QUICK_V = 1  # bump when the keyboard changes
+
+    def quick_kb(self):
+        return {"keyboard": [[{"text": "🛠 پنل مدیریت"}, {"text": "🧾 رسیدها"}],
+                             [{"text": "👥 کاربرها"}, {"text": "➕ کاربر جدید"}],
+                             [{"text": "🧑‍💻 مشتری‌ها"}, {"text": "🎫 تیکت‌ها"}, {"text": "🛒 منوی فروشگاه"}]],
+                "resize_keyboard": True, "is_persistent": True, "input_field_placeholder": "مدیریت از دکمه‌های پایین"}
+
+    def give_kb(self, net, chat):
+        """The owner's buttons stay at the bottom of the chat (sent once, and again when they change)."""
+        cid = "%s:%s" % (net, chat)
+        a = self.bot.st["admins"].get(cid) or {}
+        if a.get("kb") == self.QUICK_V or str(chat).startswith("-"):
+            return
+        try:
+            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "⌨️ دکمه‌های مدیریت پایین صفحه‌ست؛ دیگه لازم نیست برگردی بالا.",
+                                               "reply_markup": self.quick_kb()})
+            if cid in self.bot.st["admins"]:
+                with self.bot.lock:
+                    self.bot.st["admins"][cid]["kb"] = self.QUICK_V
+                self.bot.save()
+        except (ValueError, OSError) as e:
+            self.bot.log(net, chat, "admin", str(e)[:160])
+
+    def quick(self, net, chat, who, data):
+        """A tap on the owner's keyboard: the same screen as the inline button, as a new message."""
+        if data == "m":
+            uid = "%s:%s" % (net, who.get("id", chat))
+            self.sh.user(uid, who)
+            return self.sh.main_menu(net, chat, uid)
+        note = self.on_callback(net, chat, who, data, None)
+        if note:
+            self.show(net, chat, "ℹ️ " + self.sh.esc(note), [[("🛠 پنل", "a:home")]])
+
+    def card_photo(self, net, chat, sub, text, rows, msg):
+        """The user card as its QR card with the details under it: edited in place while it stays on this
+        user, a fresh photo otherwise. Text when the picture cannot be made."""
+        key = (str(chat), msg)
+        if msg and self.sh.qr_menus.get(key) == sub and len(text) <= 1024:
+            try:
+                return self.bot.call(net, "editMessageCaption", {"chat_id": chat, "message_id": msg, "caption": text,
+                                                                 "parse_mode": "HTML", "reply_markup": self.sh.kb(rows, net)})
+            except (ValueError, OSError) as e:
+                if "not modified" in str(e):
+                    return None
+        if msg and key not in self.sh.qr_menus:  # the list or panel it was opened from
+            try:
+                self.bot.call(net, "deleteMessage", {"chat_id": chat, "message_id": msg})
+            except (ValueError, OSError):
+                pass
+        if len(text) > 1024 or not self.sh.send_qr(net, chat, sub, text, rows, plain=True):
+            self.show(net, chat, text, rows, None if msg and key in self.sh.qr_menus else msg)
+
+    def send_card(self, net, chat, sub, plain=True):
+        """The user's QR card in this chat, ready to forward to them (the first one says «ready»)."""
         u = self.find(sub)
         link = self.bot.sub_link(sub)
         text = "🔳 <b>%s</b>\n\n🔗 <code>%s</code>\n\nهمین عکس رو برای کاربر فوروارد کن." % (self.sh.esc(u["name"] if u else sub), self.sh.esc(link))
         rows = ([[("📋 کپی لینک اشتراک", "copy:" + link, "success")]] if net == "tg" else []) + [[("👤 کارت کاربر", "a:u:%s" % sub), ("🏠 پنل", "a:home")]]
-        return self.sh.send_qr(net, chat, sub, text, rows)
+        return self.sh.send_qr(net, chat, sub, text, rows, plain=plain)
 
     def new_confirm(self, net, chat, w, msg=None):
         self.show(net, chat, "👤 <b>%s</b>\n📊 %s\n⏳ %s%s\n\nبسازم؟" % (
