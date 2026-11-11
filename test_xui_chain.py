@@ -2411,6 +2411,44 @@ class ShopTests(BotBase):
             m, _ = self.admin_tap(42, data)
             self.assertIn(word, m.get("text", ""), data)
 
+    def test_cashback_referrals_faq_cancel_and_receipt_reminder(self):
+        cfg = xc.load_config()
+        cfg.update(shop_cashback=10, shop_ref_every=True, shop_faq="سوال: چند دستگاه؟\nتا ۲ دستگاه.\n\nسوال: لینکم عوض می‌شه؟\nنه.")
+        xc.save_config(cfg)
+        self.app.reload()
+        self.shop.user("tg:1500", {"id": 1500})
+        friend = self.shop.user("tg:1501", {"id": 1501})
+        friend["ref"] = "tg:1500"
+        for _ in range(2):  # every purchase pays the friend who invited, and 10% comes back
+            self.tap(1501, "bp:p30")
+            o = self.shop.d["orders"][-1]
+            self.photo(1501)
+            self.tap(100, "ok:%d" % o["id"], chat=100)
+        self.assertEqual(friend["wallet"], 2 * 15000)
+        self.assertEqual(self.shop.user("tg:1500")["wallet"], 2 * 15000)  # shop_ref is 10% in these tests
+        self.assertIn("خرید کردن: ۱ نفر", self.tap(1500, "ref"))
+        self.assertIn("faq", json.dumps(self.tap(1500, "m") and BotAPI.sent[-1]["reply_markup"]))
+        self.assertIn("تا ۲ دستگاه", self.tap(1500, "faq"))
+        # a cancel request becomes a ticket
+        friend["subs"] = [o["sub"]]
+        self.shop.bot.cached_users = lambda: [{"sub": o["sub"], "name": "tg1501", "enable": True, "total": 0, "used": 0, "expiry": 0, "emails": ["tg1501"]}]
+        try:
+            self.tap(1501, "cxy:%s" % o["sub"])
+            self.assertTrue(self.shop.d["tickets"][-1]["subject"].startswith("درخواست لغو"))
+        finally:
+            del self.shop.bot.cached_users
+        # a receipt waiting too long reminds the admins
+        self.tap(1502, "bp:p30")
+        w = self.shop.d["orders"][-1]
+        self.photo(1502)
+        w["receipt_at"] = int(time.time()) - 20 * 60
+        BotAPI.sent = []
+        self.shop.tick()
+        self.assertTrue(any("منتظر تأییده" in (m.get("text") or "") for m in BotAPI.sent))
+        cfg.update(shop_cashback=0, shop_ref_every=False, shop_faq="")
+        xc.save_config(cfg)
+        self.app.reload()
+
     def test_qr_cards_first_and_later(self):
         d = xc.conf_path("brand")
         os.makedirs(d, exist_ok=True)

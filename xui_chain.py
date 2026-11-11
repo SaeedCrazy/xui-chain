@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.35.0"
+VERSION = "5.36.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -142,6 +142,9 @@ DEFAULTS = {
     "shop_phone": False,        # ask customers for their phone number before anything else
     "shop_sale_pct": 0,        # a timed sale: percent off every plan...
     "shop_sale_until": 0,      # ...until this unix time
+    "shop_cashback": 0,        # percent of each paid purchase back into the buyer's wallet
+    "shop_ref_every": False,   # referral reward on every purchase of the invited friend (not only the first)
+    "shop_faq": "",            # questions and answers (a question line, its answer below, a blank line between)
     "shop_rules": "",          # shop rules the customer accepts once before using the bot (empty = none)
     "shop_card_rotate": False,  # show one card per order, in turn, instead of all cards
     "notify_activity": True,    # tell admins what customers do in the bot (new user, order, payment page, cancel, trial, gift...)
@@ -4791,6 +4794,7 @@ def admin_state(app, host):
                          channel_on=bool(cfg.get("shop_channel_on", True)), phone=bool(cfg.get("shop_phone")), phone_ir=bool(cfg.get("shop_phone_ir")),
                          notify_activity=bool(cfg.get("notify_activity", True)), notify_taps=bool(cfg.get("notify_taps")),
                          rules=cfg.get("shop_rules", ""), card_rotate=bool(cfg.get("shop_card_rotate")),
+                         cashback=cfg.get("shop_cashback", ""), ref_every=bool(cfg.get("shop_ref_every")), faq=cfg.get("shop_faq", ""),
                          sms_on=bool(cfg.get("sms_on")), sms_senders=cfg.get("sms_senders", ""), sms_url=sms_url(app)),
         "routes": rts,
         "cf": cf_public(cfg),
@@ -4856,10 +4860,10 @@ def net_state(app):
             "iran": [s["id"] for s in net.servers() if s.get("role") == "iran"]}
 
 
-SETTING_BOOLS = ("shop_card_rotate", "notify_activity", "notify_taps", "sms_on", "bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
+SETTING_BOOLS = ("shop_ref_every", "shop_card_rotate", "notify_activity", "notify_taps", "sms_on", "bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
                  "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable", "shop_channel_on", "shop_phone", "shop_phone_ir",
                  "brand_font_licensed")
-SETTING_TEXTS = {"shop_rules": 3000, "digits": 2, "sub_title": 60, "sms_senders": 200, "brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
+SETTING_TEXTS = {"shop_cashback": 3, "shop_faq": 4000, "shop_rules": 3000, "digits": 2, "sub_title": 60, "sms_senders": 200, "brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
                  "shop_welcome": 1000, "shop_help": 2000, "shop_prefix": 10, "bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
@@ -7341,6 +7345,7 @@ SHOPV.set=sh=>{const s=S.state.settings,c=S.state.shop_cfg||{};
    <label class="f"><span>کارت‌ها (کارت به کارت)</span><textarea class="in ltr" name="shop_cards" style="min-height:70px" placeholder="6037-xxxx-xxxx-xxxx | نام صاحب کارت | بانک">${esc(c.cards||"")}</textarea><div class="hint">هر کارت یه خط: شماره | اسم | بانک</div></label>
    <div class="cols2">${field("shop_trial","تست رایگان (گیگ,روز)",c.trial,'class="in ltr" placeholder="1,1"',"خالی = خاموش")}${field("shop_ref","پاداش دعوت (٪)",c.ref,'class="in ltr" inputmode="numeric" placeholder="10"',"از اولین خرید دوست")}</div>
    ${field("shop_topups","مبالغ شارژ کیف پول (تومان)",c.topups,'class="in ltr" placeholder="100000,200000,500000"')}
+   <div class="cols2">${field("shop_cashback","برگشت خرید به کیف پول (٪)",c.cashback||"",'class="in ltr" inputmode="numeric" placeholder="0"',"از هر خرید کارت به کارت؛ خالی = خاموش")}<div>${sw("shop_ref_every",c.ref_every,"پاداش دعوت از هر خرید","خاموش = فقط از اولین خرید دوست")}</div></div>
    <div class="sec" style="margin:10px 2px 4px"><h3>🎛 پلن دلخواه (مشتری خودش حجم و روز رو انتخاب می‌کنه)</h3></div>
    <div class="cols2">${field("shop_gb_price","قیمت هر گیگ (تومان)",c.gb_price||"",'class="in ltr" inputmode="numeric" placeholder="10000"')}${field("shop_day_price","قیمت هر روز (تومان)",c.day_price||"",'class="in ltr" inputmode="numeric" placeholder="1000"')}</div>
    ${field("shop_custom_max","سقف (گیگ,روز)",c.custom_max||"500,365",'class="in ltr" placeholder="500,365"',"هر دو قیمت صفر = پلن دلخواه خاموش. با روشن بودنش، مشتری روی هر سرویس «➕ حجم و زمان» هم داره.")}
@@ -7369,6 +7374,7 @@ SHOPV.set=sh=>{const s=S.state.settings,c=S.state.shop_cfg||{};
    ${sw("shop_channel_on",c.channel_on,"عضویت اجباری کانال","ربات باید ادمین کانال باشه")}
    ${field("shop_channel","آیدی کانال",c.channel,'class="in ltr" placeholder="@mychannel"')}
    <div class="cols2">${field("shop_inbounds","inboundهای سرویس جدید",c.inbounds,'class="in ltr" placeholder="1,11"',"خالی = همه")}${field("shop_prefix","پیشوند اسم کاربر",c.prefix,'class="in ltr" placeholder="tg"')}</div>
+   <label class="f"><span>سوال‌های پرتکرار</span><textarea class="in" name="shop_faq" style="min-height:90px;font-family:inherit" placeholder="سوال: چند دستگاه می‌تونم وصل کنم؟&#10;تا ۲ دستگاه هم‌زمان.&#10;&#10;سوال: لینکم عوض می‌شه؟&#10;نه، بعد از تمدید فقط آپدیت کن.">${esc(c.faq||"")}</textarea><div class="hint">هر سوال یه خط، جوابش زیرش، بین سوال‌ها یه خط خالی. خالی = دکمه‌اش توی ربات نمیاد</div></label>
    <label class="f"><span>قوانین فروشگاه</span><textarea class="in" name="shop_rules" style="min-height:70px;font-family:inherit" placeholder="مثلاً: بعد از استفاده پول برنمی‌گرده · هر سرویس برای تعداد دستگاه مشخص">${esc(c.rules||"")}</textarea><div class="hint">اگه بنویسی، هر مشتری یه بار قبل از استفاده قبولش می‌کنه. خالی = بدون قوانین</div></label>
    <label class="f"><span>پیام خوش‌آمد</span><textarea class="in" name="shop_welcome" style="min-height:60px;font-family:inherit" placeholder="به فروشگاه ما خوش اومدی 🌟">${esc(c.welcome||"")}</textarea></label>
    <label class="f"><span>راهنمای اتصال</span><textarea class="in" name="shop_help" style="min-height:60px;font-family:inherit" placeholder="خالی = راهنمای پیش‌فرض (Happ و v2rayNG)">${esc(c.help||"")}</textarea></label>
@@ -9310,7 +9316,7 @@ class Shop:
     def total(self, o):
         return max(0, o["price"] - o.get("discount", 0) - o.get("cents", 0))
 
-    LEDGER = {"gift": "🎁 کد هدیه", "buy": "🛍 خرید", "topup": "💳 شارژ", "refund": "↩️ برگشت پول", "ref": "👥 پاداش دعوت",
+    LEDGER = {"cashback": "💸 برگشت خرید", "gift": "🎁 کد هدیه", "buy": "🛍 خرید", "topup": "💳 شارژ", "refund": "↩️ برگشت پول", "ref": "👥 پاداش دعوت",
               "admin": "🛠 مدیر", "auto": "🔁 تمدید خودکار"}
 
     def ledger(self, uid, delta, kind, note=""):
@@ -9685,6 +9691,8 @@ class Shop:
         rows.append([("📦 سرویس‌های من", "svc"), ("🔄 تمدید", "renew")] if svcs else [("📦 سرویس‌های من", "svc")])
         rows.append([("💰 کیف پول", "wallet"), ("🎫 پشتیبانی", "tk")])
         rows.append([("📚 راهنمای اتصال", "guide"), ("📡 وضعیت سرورها", "st")])
+        if str(cfg.get("shop_faq") or "").strip():
+            rows.append([("❓ سوال‌های پرتکرار", "faq")])
         extra = []
         if self.trial_cfg() and not u.get("trial"):
             extra.append(("🆓 تست رایگان", "trial"))
@@ -9982,7 +9990,7 @@ class Shop:
         rows.append([("📱 صفحه‌ی اشتراک و آموزش", self.bot.sub_link(sub))])
         if net == "tg":
             rows.append([("📋 کپی لینک اشتراک", "copy:" + self.bot.sub_link(sub))])
-        rows.append([("🔳 QR کد اشتراک", "qr:%s" % sub)])
+        rows.append([("🔳 QR کد اشتراک", "qr:%s" % sub), ("🙅 درخواست لغو", "cx:%s" % sub)])
         rows.append([("🗑 حذف از لیست من", "svd:%s" % sub, "danger")])
         rows.append(self.back("svc"))
         self.show(net, chat, "\n".join(lines), rows, msg)
@@ -10459,6 +10467,14 @@ class Shop:
                     continue
                 self.auto_renew(uid, u, sub, x, now)
         for o in self.d["orders"]:
+            if o["status"] == "review" and o.get("method") == "card":
+                waited = now - o.get("receipt_at", o["at"])
+                last = o.get("realert", 0)
+                if waited >= 15 * 60 and now - last >= 3600:
+                    o["realert"] = int(now)
+                    self.bot.notify_admins("shop", "⏰ رسید #%s (%s) %s دقیقه‌ست منتظر تأییده. پنل مدیریت ← 🧾 رسیدها" % (
+                        o["id"], toman(self.total(o)), fa_num(int(waited // 60))))
+        for o in self.d["orders"]:
             if o["kind"] != "buy" or o["status"] != "done" or o.get("nudged") or not o.get("sub"):
                 continue
             age = now - o.get("done_at", o["at"])
@@ -10836,10 +10852,19 @@ class Shop:
         return True
 
     def reward(self, o):
-        """The first paid order of an invited customer rewards whoever invited them."""
+        """A paid order: cashback for the buyer (shop_cashback %), and for an invited customer a reward to
+        whoever invited them: on the first purchase, or on every one with shop_ref_every."""
         u = self.user(o["uid"])
+        back = _int(self.app.cfg.get("shop_cashback"))
+        if back and o["kind"] != "topup" and o.get("method") != "wallet" and self.total(o):
+            amount = self.total(o) * back // 100
+            with self.lock:
+                u["wallet"] = u.get("wallet", 0) + amount
+            self.ledger(o["uid"], amount, "cashback", "#%s" % o["id"])
+            self.show(o["net"], o["chat"], "💸 <b>%s</b> (%s٪ خریدت) برگشت به کیف پولت برای خرید بعدی." % (toman(amount), fa_num(back)), [[("💰 کیف پول", "wallet")]])
         pct = _int(self.app.cfg.get("shop_ref"))
-        if not (pct and u.get("ref") and not u.get("ref_paid") and o["kind"] != "topup" and self.total(o)):
+        every = bool(self.app.cfg.get("shop_ref_every"))
+        if not (pct and u.get("ref") and (every or not u.get("ref_paid")) and o["kind"] != "topup" and self.total(o)):
             return
         r = self.d["users"].get(u["ref"])
         if not r:
@@ -10984,6 +11009,23 @@ class Shop:
             return self.svc_menu(net, chat, uid, mid, renew=True)
         if head == "svc":
             return self.svc_menu(net, chat, uid, mid)
+        if head in ("cx", "cxy"):
+            x = next((x for sb, x in self.services(uid, cid) if sb == rest and x), None)
+            if not x:
+                return self.svc_menu(net, chat, uid, mid)
+            if head == "cx":
+                return self.show(net, chat, "🙅 <b>درخواست لغو «%s»</b>\n\nدرخواستت برای پشتیبانی فرستاده می‌شه؛ اگه شرایطش رو داشته باشه، باقی‌مونده‌ی پولت به کیف پول برمی‌گرده. ادامه بدیم؟" % self.esc(x["name"]),
+                                 [[("✅ بله، بفرست", "cxy:%s" % rest, "danger")], [("⬅️ نه", "sv:%s" % rest)]], mid)
+            left = self.left_line(x)
+            with self.lock:
+                self.d["tseq"] += 1
+                t = {"id": self.d["tseq"], "uid": uid, "net": net, "chat": str(chat), "subject": "درخواست لغو %s" % x["name"][:40], "status": "open",
+                     "at": int(time.time()), "updated": int(time.time()),
+                     "msgs": [{"by": "user", "at": int(time.time()), "text": "لطفاً سرویس %s رو لغو کنید (باقی‌مونده: %s)." % (x["name"], left)}]}
+                self.d["tickets"].append(t)
+            self.save()
+            self.ticket_alert(t, "🙅 درخواست لغو سرویس")
+            return self.show(net, chat, "✅ درخواستت ثبت شد (تیکت #%s). جواب پشتیبانی همین‌جا میاد." % fa_num(t["id"]), [[("🎫 تیکت‌ها", "tk")], self.back("svc")], mid)
         if head == "ar":
             if rest not in [sb for sb, _ in self.services(uid, cid)]:
                 return self.svc_menu(net, chat, uid, mid)
@@ -11073,10 +11115,21 @@ class Shop:
         if head == "ref":
             me = (self.bot.me.get(net) or {}).get("username", "")
             u = self.user(uid)
-            invited = sum(1 for x in self.d["users"].values() if x.get("ref") == uid)
+            mine = [k for k, x in self.d["users"].items() if x.get("ref") == uid]
+            bought = sum(1 for k in mine if any(o["uid"] == k and o["status"] == "done" and o["kind"] != "topup" for o in self.d["orders"]))
             link = "https://%s/%s?start=r_%s" % ("t.me" if net == "tg" else "ble.ir", me, uid.split(":", 1)[1])
-            return self.show(net, chat, "👥 <b>دعوت دوستان</b>\n\nدوستت با لینک زیر وارد ربات بشه، از اولین خریدش <b>%s٪</b> به کیف پولت اضافه می‌شه.\n\n<code>%s</code>\n\n👤 دعوت‌شده‌ها: %s\n💰 درآمد تا الان: %s" % (
-                fa_num(_int(self.app.cfg.get("shop_ref"))), self.esc(link), fa_num(invited), toman(u.get("ref_earned", 0))), [self.back()], mid)
+            rows = ([[("📋 کپی لینک دعوت", "copy:" + link, "success")]] if net == "tg" else []) + [self.back()]
+            return self.show(net, chat, "👥 <b>دعوت دوستان</b>\n\nدوستت با لینک زیر وارد ربات بشه، از %s خریدش <b>%s٪</b> به کیف پولت اضافه می‌شه.\n\n<code>%s</code>\n\n"
+                             "👤 دعوت کردی: %s نفر\n🛍 خرید کردن: %s نفر\n💰 درآمدت تا الان: %s" % (
+                "هر" if self.app.cfg.get("shop_ref_every") else "اولین", fa_num(_int(self.app.cfg.get("shop_ref"))), self.esc(link), fa_num(len(mine)),
+                fa_num(bought), toman(u.get("ref_earned", 0))), rows, mid)
+        if head == "faq":
+            faq = str(self.app.cfg.get("shop_faq") or "").strip()
+            blocks = [b.strip() for b in re.split(r"\n\s*\n", faq) if b.strip()]
+            text = "❓ <b>سوال‌های پرتکرار</b>\n\n" + "\n\n".join(
+                "<b>%s</b>\n%s" % (self.esc(b.split("\n", 1)[0].lstrip("سؤس:؟ ").strip()), self.esc(b.split("\n", 1)[1].strip()) if "\n" in b else "")
+                for b in blocks[:15])
+            return self.show(net, chat, text[:4000], [[("🎫 جوابم رو پیدا نکردم", "tk:new")], self.back()], mid)
         if head == "help":
             return self.show(net, chat, "💬 پشتیبانی: %s" % self.esc(support_link(self.app.cfg)), [self.back()], mid)
         if head == "guide":
