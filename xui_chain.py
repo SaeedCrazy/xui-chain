@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.29.1"
+VERSION = "5.30.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -105,7 +105,8 @@ DEFAULTS = {
     "info_format": "👤 {name} | 📊 {left} | ⏳ {days}",
     "user_page": True,         # subscription link opened in a browser shows the user's account page
     "support_url": "",         # support / renewal link on the user page (e.g. https://t.me/...)
-    "announce": "",            # message shown on every user page
+    "announce": "",            # message shown on every user page (and under the subscription in Happ)
+    "sub_title": "",           # the subscription's name in apps; empty = title (e.g. "پینگو | @mybot" so people remember the bot)
     "locations": {},           # node address -> display name, refreshed from the panel
     "label_main": "Main",       # names of the routes in the apps
     "label_deco": "واسط",       # واسط ۱، واسط ۲ ... (the upstreams); a Latin label gives Deco1, Deco2
@@ -2099,7 +2100,7 @@ def build_subscription(sub_id, fmt, rt, app=None):
     if not own:
         return 404, {}, "no configs for this subscription\n"
     ups = UPSTREAMS.nodes()
-    title = (ded.get("name") if ded else rt.get("title")) or NAME
+    title = (ded.get("name") if ded else (rt.get("sub_title") or "").strip() or rt.get("title")) or NAME
     rts = view_routes(rt, live_routes(app, rt, ups) if app else routes(rt, ups), None if ded else sub_id, ups, view=ded)
     info = info_line(rt, base, own, hdrs, app) if rt.get("info_config", True) else None
     try:
@@ -2125,6 +2126,13 @@ def build_subscription(sub_id, fmt, rt, app=None):
     }
     if "subscription-userinfo" in hdrs:
         out["Subscription-Userinfo"] = hdrs["subscription-userinfo"]
+    bot = ((app.bot.me.get("tg") or {}).get("username") or "") if app and not ded else ""
+    if bot:  # apps that read them (Happ, Hiddify) show a support button and a line under the profile
+        out["Support-Url"] = "https://t.me/" + bot
+        note = (rt.get("announce") or "").strip() or "🤖 خرید، تمدید و پشتیبانی: @" + bot
+        out["Announce"] = "base64:" + base64.b64encode(note[:200].encode()).decode()
+    if app and not ded:
+        out["Profile-Web-Page-Url"] = link_base(rt, rt.get("public_host") or "") + sub_id + "?page=1"
     return 200, out, text
 
 
@@ -4727,7 +4735,7 @@ def admin_state(app, host):
         "server": server_stats(),
         "settings": {
             "direct_first": cfg.get("direct_first", True), "iran_direct": cfg.get("iran_direct", True),
-            "title": cfg.get("title", ""), "label_main": label(cfg, "label_main"),
+            "title": cfg.get("title", ""), "sub_title": cfg.get("sub_title", ""), "label_main": label(cfg, "label_main"),
             "main_location": cfg.get("main_location", ""),
             "show_auto": cfg.get("show_auto", True), "show_main": cfg.get("show_main", True),
             "auto_mode": cfg.get("auto_mode") or "priority", "probe_url": cfg.get("probe_url", ""),
@@ -4831,7 +4839,7 @@ def net_state(app):
 SETTING_BOOLS = ("notify_activity", "notify_taps", "sms_on", "bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
                  "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable", "shop_channel_on", "shop_phone", "shop_phone_ir",
                  "brand_font_licensed")
-SETTING_TEXTS = {"sms_senders": 200, "brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
+SETTING_TEXTS = {"sub_title": 60, "sms_senders": 200, "brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
                  "shop_welcome": 1000, "shop_help": 2000, "shop_prefix": 10, "bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
@@ -7042,7 +7050,8 @@ VIEWS.settings=()=>{
   return `
   <form class="card" data-sec="conn"><h2>اتصال</h2>
    ${sw("iran_direct",s.iran_direct,"سایت‌های ‎.ir بدون تونل","سایت‌های ایرانی مستقیم باز می‌شن")}
-   ${field("title","اسم پروفایل در اپ",s.title,'placeholder="EZ-XUI"')}
+   ${field("title","اسم برند",s.title,'placeholder="EZ-XUI"',"توی ربات، مینی‌اپ و صفحه‌ی اشتراک")}
+   ${field("sub_title","اسم اشتراک توی اپ‌ها",s.sub_title||"",'placeholder="مثلاً: پینگو | @mybot"',"خالی = همون اسم برند. آیدی ربات رو بذار تا مشتری یادش بمونه از کجا تمدید کنه")}
    ${sw("info_config",s.info_config,"کانفیگ اطلاعات اول ساب","اسم کاربر، حجم و روز باقی‌مونده رو نشون می‌ده؛ انتخابش هم وصل می‌شه (پشتش اولین مسیر، معمولاً خودکار، هست)")}
    ${field("info_format","متن کانفیگ اطلاعات",s.info_format,'placeholder="👤 {name} | 📊 {left} | ⏳ {days}" maxlength="80"',"{name} اسم، {left} حجم مانده، {days} روز مانده، {used} مصرف، {total} کل حجم")}
    ${field("probe_url","لینک تست سرعت از ایران",s.probe_url,'class="in ltr" placeholder="https://speed.cloudflare.com/__down?bytes=10000000"',"فایلی که برای اندازه‌گیری سرعت دانلود می‌شه")}

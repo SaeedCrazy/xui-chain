@@ -714,6 +714,25 @@ class EndToEnd(unittest.TestCase):
             xc.save_config(cfg)
             self.app.reload()
 
+    def test_subscription_name_and_bot_headers(self):
+        cfg = xc.load_config()
+        cfg.update(title="Pingo", sub_title="پینگو | @pingoshop1bot")
+        xc.save_config(cfg)
+        self.app.reload()
+        self.app.bot.me = {"tg": {"username": "pingoshop1bot"}}
+        try:
+            status, h, _ = self.get("/chain/abc", ua="Happ/3.0")
+            title = base64.b64decode(h["Profile-Title"].split(":", 1)[1]).decode()
+            self.assertEqual(title, "پینگو | @pingoshop1bot")
+            self.assertEqual(h["Support-Url"], "https://t.me/pingoshop1bot")
+            self.assertIn("@pingoshop1bot", base64.b64decode(h["Announce"].split(":", 1)[1]).decode())
+            self.assertTrue(h["Profile-Web-Page-Url"].endswith("/abc?page=1"))
+        finally:
+            self.app.bot.me = {}
+            cfg.update(title="", sub_title="")
+            xc.save_config(cfg)
+            self.app.reload()
+
     def test_auto_detects_panel_sub(self):
         self.assertEqual(self.app.rt["xui_sub_url"], "http://127.0.0.1:%d/s3cret/" % self.panel.server_address[1])
 
