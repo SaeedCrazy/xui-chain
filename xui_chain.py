@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.30.0"
+VERSION = "5.31.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -106,6 +106,7 @@ DEFAULTS = {
     "user_page": True,         # subscription link opened in a browser shows the user's account page
     "support_url": "",         # support / renewal link on the user page (e.g. https://t.me/...)
     "announce": "",            # message shown on every user page (and under the subscription in Happ)
+    "digits": "en",            # digits in bot messages: "en" (1234) or "fa" (۱۲۳۴)
     "sub_title": "",           # the subscription's name in apps; empty = title (e.g. "پینگو | @mybot" so people remember the bot)
     "locations": {},           # node address -> display name, refreshed from the panel
     "label_main": "Main",       # names of the routes in the apps
@@ -994,7 +995,21 @@ def route_cost(r):
     return price / (r.get("quota_gb") or DEFAULT_MONTH_GB)
 
 
-FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+FA_TABLE = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+
+class _Digits(dict):
+    """The digits bot messages use: English (default) or Persian ("digits": "fa" in the settings).
+    Used as a str.translate table, so every text.translate(FA_DIGITS) follows the setting."""
+    fa = False
+
+    def __missing__(self, key):
+        if self.fa and key in FA_TABLE:
+            return FA_TABLE[key]
+        raise LookupError(key)  # str.translate: leave this character as it is
+
+
+FA_DIGITS = _Digits()
 EN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 PERSIAN = re.compile(r"[\u0600-\u06FF]")
 
@@ -4735,7 +4750,7 @@ def admin_state(app, host):
         "server": server_stats(),
         "settings": {
             "direct_first": cfg.get("direct_first", True), "iran_direct": cfg.get("iran_direct", True),
-            "title": cfg.get("title", ""), "sub_title": cfg.get("sub_title", ""), "label_main": label(cfg, "label_main"),
+            "title": cfg.get("title", ""), "sub_title": cfg.get("sub_title", ""), "digits": cfg.get("digits") or "en", "label_main": label(cfg, "label_main"),
             "main_location": cfg.get("main_location", ""),
             "show_auto": cfg.get("show_auto", True), "show_main": cfg.get("show_main", True),
             "auto_mode": cfg.get("auto_mode") or "priority", "probe_url": cfg.get("probe_url", ""),
@@ -4839,7 +4854,7 @@ def net_state(app):
 SETTING_BOOLS = ("notify_activity", "notify_taps", "sms_on", "bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
                  "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable", "shop_channel_on", "shop_phone", "shop_phone_ir",
                  "brand_font_licensed")
-SETTING_TEXTS = {"sub_title": 60, "sms_senders": 200, "brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
+SETTING_TEXTS = {"digits": 2, "sub_title": 60, "sms_senders": 200, "brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
                  "shop_welcome": 1000, "shop_help": 2000, "shop_prefix": 10, "bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
@@ -5696,8 +5711,8 @@ def do_action(app, action, body, host):
             name = str(body.get("name", "")).strip()
             if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", name):
                 return fail("اسم فقط حروف انگلیسی، عدد و - _ . @ باشد")
-            if any(c["email"] == name for c in all_clients()):
-                return fail("کاربری با این اسم هست")
+            if any(c["email"].lower() == name.lower() for c in all_clients()):
+                return fail("کاربری با این اسم هست (بزرگی و کوچکی حروف فرقی نمی‌کنه)")
             tpl = str(body.get("template") or "default")
             if tpl != "default" and not template_by_id(load_config(), tpl):
                 return fail("این تمپلیت پیدا نشد")
@@ -7052,6 +7067,7 @@ VIEWS.settings=()=>{
    ${sw("iran_direct",s.iran_direct,"سایت‌های ‎.ir بدون تونل","سایت‌های ایرانی مستقیم باز می‌شن")}
    ${field("title","اسم برند",s.title,'placeholder="EZ-XUI"',"توی ربات، مینی‌اپ و صفحه‌ی اشتراک")}
    ${field("sub_title","اسم اشتراک توی اپ‌ها",s.sub_title||"",'placeholder="مثلاً: پینگو | @mybot"',"خالی = همون اسم برند. آیدی ربات رو بذار تا مشتری یادش بمونه از کجا تمدید کنه")}
+   <label class="f"><span>اعداد توی ربات</span><select class="in" name="digits"><option value="en" ${s.digits!=="fa"?"selected":""}>انگلیسی (1234) · منظم‌تر کنار متن فارسی</option><option value="fa" ${s.digits==="fa"?"selected":""}>فارسی (۱۲۳۴)</option></select></label>
    ${sw("info_config",s.info_config,"کانفیگ اطلاعات اول ساب","اسم کاربر، حجم و روز باقی‌مونده رو نشون می‌ده؛ انتخابش هم وصل می‌شه (پشتش اولین مسیر، معمولاً خودکار، هست)")}
    ${field("info_format","متن کانفیگ اطلاعات",s.info_format,'placeholder="👤 {name} | 📊 {left} | ⏳ {days}" maxlength="80"',"{name} اسم، {left} حجم مانده، {days} روز مانده، {used} مصرف، {total} کل حجم")}
    ${field("probe_url","لینک تست سرعت از ایران",s.probe_url,'class="in ltr" placeholder="https://speed.cloudflare.com/__down?bytes=10000000"',"فایلی که برای اندازه‌گیری سرعت دانلود می‌شه")}
@@ -7517,6 +7533,7 @@ class App:
         self.cfg = load_config()
         self.rt = resolve_runtime(self.cfg, self.db_path)
         UPSTREAMS.hidden = set(self.cfg.get("deco_hidden") or [])
+        FA_DIGITS.fa = self.cfg.get("digits") == "fa"
 
     @property
     def panel(self):
@@ -7805,6 +7822,41 @@ def support_link(cfg):
 
 
 SUB_RE = re.compile(r"(?:/[A-Za-z0-9_.-]+/|^s_?|^)([A-Za-z0-9_-]{8,64})/?$")
+RLM = "\u200f"
+_FA_LETTER = re.compile(r"[\u0600-\u06ff]")
+
+
+def digits_out(text):
+    """Persian digits written into texts and buttons follow the digits setting too."""
+    return text if FA_DIGITS.fa or not text else text.translate(EN_DIGITS)
+
+
+def rtl_text(text):
+    """Telegram picks each line's direction from its first letter, so a Persian line that starts with a
+    number, a name or a link came out left-to-right and jumbled. A right-to-left mark first keeps it in order."""
+    text = digits_out(text)
+    if not text or not _FA_LETTER.search(text):
+        return text
+    return "\n".join(RLM + l if l.strip() and not l.startswith(RLM) else l for l in text.split("\n"))
+
+
+RTL_METHODS = ("sendMessage", "editMessageText", "sendPhoto", "editMessageCaption", "sendDocument", "sendAnimation")
+
+
+def rtl_payload(payload, method="sendMessage"):
+    if not payload or method not in RTL_METHODS or payload.get("entities") or payload.get("caption_entities"):
+        return payload
+    out = None
+    for k in ("text", "caption"):
+        v = payload.get(k)
+        if isinstance(v, str):
+            w = rtl_text(v)
+            if w is not v:
+                out = out or dict(payload)
+                out[k] = w
+    return out or payload
+
+
 def fast_connect(host, port, timeout):
     """A TCP connection that tries IPv4 first with a short connect timeout. On some hosts IPv6 to
     Telegram drops now and then, and a plain connect sat out the whole timeout before trying IPv4."""
@@ -8290,6 +8342,7 @@ class Bot:
         base, token = self.nets().get(net, (None, None))
         if not token:
             raise ValueError("bot is off")
+        payload = rtl_payload(payload, method)
         status, raw = api_post("%s/bot%s/%s" % (base, token, method), json.dumps(payload or {}).encode(), "application/json", timeout)
         return self.api_result(status, raw)
 
@@ -8308,6 +8361,7 @@ class Bot:
         base, token = self.nets().get(net, (None, None))
         if not token:
             raise ValueError("bot is off")
+        fields = rtl_payload(fields, method)
         boundary = "ezxui" + secrets.token_hex(12)
         parts = [('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (
             boundary, k, json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v)).encode() for k, v in fields.items()]
@@ -8405,25 +8459,24 @@ class Bot:
         return next((u for u in users if u.get("sub") == sub), None)
 
     def user_text(self, u, link=False):
+        """A user's status, one labelled line each (the label first keeps every line right-to-left)."""
         now = time.time() * 1000
-        lines = ["👤 %s" % u["name"]]
-        if not u.get("enable", True):
-            lines.append("⛔ غیرفعال")
+        num = lambda v: re.sub(r"\.0+$", "", str(v)).translate(FA_DIGITS)
+        lines = ["👤 کاربر: %s" % u["name"], "%s وضعیت: %s" % (("🟢", "فعال") if u.get("enable", True) else ("⛔", "غیرفعال"))]
         if u.get("total"):
             left = max(0, u["total"] - u["used"])
-            lines.append("📊 %s GB از %s GB مانده" % (fmt_gb(left), fmt_gb(u["total"])))
+            lines.append("📊 حجم مانده: %s از %s گیگ" % (num(fmt_gb(left)), num(fmt_gb(u["total"]))))
         else:
-            lines.append("📊 حجم نامحدود (%s GB مصرف)" % fmt_gb(u["used"]))
+            lines.append("📊 حجم: نامحدود (%s گیگ مصرف)" % num(fmt_gb(u["used"])))
         exp = u.get("expiry") or 0
         if exp > 0:
             days = math.ceil((exp - now) / 86400000)
-            lines.append("⏳ %s" % ("منقضی شده" if days <= 0 else "%d روز مانده" % days))
+            lines.append("⏳ زمان مانده: %s" % ("منقضی شده" if days <= 0 else "%s روز" % num(days)))
         elif exp < 0:
-            lines.append("⏳ %d روز، از اولین اتصال" % round(-exp / 86400000))
+            lines.append("⏳ زمان: %s روز از اولین اتصال" % num(round(-exp / 86400000)))
         else:
-            lines.append("⏳ بدون محدودیت زمان")
-        text = "\n".join(lines[:1] + [l.translate(FA_DIGITS) for l in lines[1:]])
-        return text + ("\n\n🔗 %s" % self.sub_link(u["sub"]) if link else "")
+            lines.append("⏳ زمان: بدون محدودیت")
+        return "\n".join(lines) + ("\n\n🔗 لینک اشتراک:\n%s" % self.sub_link(u["sub"]) if link else "")
 
     def sub_link(self, sub):
         return link_base(self.app.rt, self.st.get("host") or "localhost") + sub
@@ -8858,12 +8911,12 @@ class Bot:
 # referral rewards and a channel to join first. Fulfilment goes through the panel's own API.
 
 def toman(n):
-    return ("{:,}".format(int(round(n or 0))).replace(",", "٬") + " تومان").translate(FA_DIGITS)
+    return ("{:,}".format(int(round(n or 0))).replace(",", "٬" if FA_DIGITS.fa else ",") + " تومان").translate(FA_DIGITS)
 
 
 def rial(toman_amount):
     """What to type in a bank app: the amount in rial."""
-    return ("{:,}".format(int(round(toman_amount or 0)) * 10).replace(",", "٬") + " ریال").translate(FA_DIGITS)
+    return ("{:,}".format(int(round(toman_amount or 0)) * 10).replace(",", "٬" if FA_DIGITS.fa else ",") + " ریال").translate(FA_DIGITS)
 
 
 def fa_num(n):
@@ -9219,7 +9272,7 @@ class Shop:
         colour = net == "tg" and not getattr(self, "plain", False)
 
         def btn(item):
-            t, d = item[0], item[1]
+            t, d = digits_out(item[0]), item[1]
             if d.startswith("copy:"):
                 b = {"text": t, "copy_text": {"text": d[5:]}}
             elif d.startswith("app:"):
@@ -9642,7 +9695,7 @@ class Shop:
     @staticmethod
     def gb_fa(b):
         """Bytes as Persian gigabytes: «۱٫۵», «۱۰»."""
-        return fa_num(re.sub(r"\.0+$", "", str(fmt_gb(b)))).replace(".", "٫")
+        return fa_num(re.sub(r"\.0+$", "", str(fmt_gb(b)))).replace(".", "٫" if FA_DIGITS.fa else ".")
 
     def left_line(self, x):
         """«۸٫۵ گیگ · ۱۲ روز» left on a service."""
@@ -11204,8 +11257,10 @@ class AdminBot:
             if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", text):
                 self.show(net, chat, "اسم فقط حروف انگلیسی، عدد و - _ . @ باشه. دوباره بفرست:", [[("✖️ انصراف", "a:home", "danger")]])
                 return True
-            if any(c["email"] == text for c in clients_of(self.app)):
-                self.show(net, chat, "این اسم هست؛ یه اسم دیگه بفرست:", [[("✖️ انصراف", "a:home", "danger")]])
+            same = next((c for c in clients_of(self.app) if c["email"].lower() == text.lower()), None)
+            if same:  # 3x-ui does not tell AMIR from Amir
+                self.show(net, chat, "کاربری به اسم <b>%s</b> هست؛ یه اسم دیگه بفرست:" % self.sh.esc(same["email"]),
+                          [[("👤 دیدن همین کاربر", "a:u:%s" % same["sub"])] if same.get("sub") else [], [("✖️ انصراف", "a:home", "danger")]])
                 return True
             self.wait[cid] = {"what": "new", "name": text}
             rows = [[("%s گیگ" % fa_num(g) if g else "♾ نامحدود", "a:ng:%d" % g) for g in r] for r in ((10, 20, 30), (50, 100, 0))]

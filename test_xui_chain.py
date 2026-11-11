@@ -32,6 +32,8 @@ os.environ["XUI_MAIN_FOLDER"] = os.path.join(TMP, "no-xui")
 
 import xui_chain as xc  # noqa: E402
 
+xc.DEFAULTS["digits"] = "fa"  # most expectations below were written with Persian digits
+
 try:
     import yaml
 except ImportError:
@@ -2188,7 +2190,7 @@ class ShopTests(BotBase):
         to_admin = [m.get("text", "") for m in BotAPI.sent if str(m.get("chat_id")) == "100"]
         self.assertTrue(any("کاربر جدید" in t and "@sara_k" in t and "996" in t for t in to_admin), to_admin)
         self.assertTrue(any("سفارش #" in t for t in to_admin))
-        self.assertFalse(any(t.startswith("👆") for t in to_admin))  # every tap only when asked for
+        self.assertFalse(any(t.lstrip(xc.RLM).startswith("👆") for t in to_admin))  # every tap only when asked for
         cfg = xc.load_config()
         cfg["notify_taps"] = True
         xc.save_config(cfg)
@@ -2196,7 +2198,7 @@ class ShopTests(BotBase):
         BotAPI.sent = []
         self.tap(996, "svc")
         time.sleep(0.5)
-        self.assertTrue(any(m.get("text", "").startswith("👆 سرویس‌های من") for m in BotAPI.sent if str(m.get("chat_id")) == "100"))
+        self.assertTrue(any(m.get("text", "").lstrip(xc.RLM).startswith("👆 سرویس‌های من") for m in BotAPI.sent if str(m.get("chat_id")) == "100"))
         cfg.update(notify_taps=False, notify_activity=False)
         xc.save_config(cfg)
         self.app.reload()
@@ -2231,6 +2233,32 @@ class ShopTests(BotBase):
         BotAPI.sent = []
         self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "سلام، سرویست تمدید شد"})
         self.assertTrue(any(str(m["chat_id"]) == "997" and "سرویست تمدید شد" in m["text"] for m in BotAPI.sent))
+
+    def test_english_digits_and_right_to_left_lines(self):
+        cfg = xc.load_config()
+        cfg.update(digits="en", shop_gb_price=10000, shop_day_price=1000)
+        xc.save_config(cfg)
+        self.app.reload()
+        try:
+            self.assertEqual(xc.toman(130000), "130,000 تومان")
+            self.assertEqual(xc.fa_num(24), "24")
+            self.assertEqual(xc.Shop.gb_fa(int(24.7 * 1024 ** 3)), "24.7")
+            BotAPI.sent = []
+            self.tap(998, "bp:p30")
+            text = BotAPI.sent[-1]["text"]
+            self.assertIn("150,000", text)
+            for line in text.split("\n"):
+                if line.strip() and re.search(r"[\u0600-\u06ff]", text):
+                    self.assertTrue(line.startswith(xc.RLM), line)  # every line keeps right-to-left order
+            self.assertEqual(xc.rtl_text("hello\nworld"), "hello\nworld")  # English-only text untouched
+            self.tap(998, "cbo:buy:")
+            labels = json.dumps([b["text"] for row in BotAPI.sent[-1]["reply_markup"]["inline_keyboard"] for b in row], ensure_ascii=False)
+            self.assertIn("➕ 5", labels)
+            self.assertFalse(re.search("[۰-۹]", labels + BotAPI.sent[-1]["text"]))  # no Persian digits anywhere
+        finally:
+            cfg["digits"] = "fa"
+            xc.save_config(cfg)
+            self.app.reload()
 
     def test_qr_matrix_shape(self):
         g = xc.qr_matrix("https://sub.shelbyping.com:2097/chain/neoll2tbmlb1m0mg")
