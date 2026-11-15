@@ -8,6 +8,10 @@
 #                                               that point at this server all go to NEW_IP
 #   ez-xui move back    root@NEW_IP [ssh-key]   undo a switch (domains, tunnel and EZ come back here)
 #
+# MOVE_PORTS="443=8443" moves inbounds to other ports on the new server (when something there already holds
+# the port): the copied 3x-ui inbounds and EZ's tunnels change, and at the switch the Iran side forwards the
+# old port to the new one, so customers keep connecting on the old port through the tunnel.
+#
 # Customers keep their links: configs name domains, not IPs, and the subscription link stays the same.
 # This server keeps running until you delete it, so connections still open here finish normally.
 set -euo pipefail
@@ -42,6 +46,55 @@ EOF
 }
 
 old_ip() { curl -fs4 --max-time 5 https://api.ipify.org || hostname -I | awk '{print $1}'; }
+
+remap_target() { # MOVE_PORTS on the new server: 3x-ui inbound ports and EZ's tunnel ports
+  [ -n "${MOVE_PORTS:-}" ] || return 0
+  say "ports moved on the new server: $MOVE_PORTS"
+  r "python3 -I - '$MOVE_PORTS'" <<'PYEOF'
+import json, re, sqlite3, sys
+pairs = [tuple(int(x) for x in p.split("=")) for p in re.split(r"[,\s]+", sys.argv[1]) if "=" in p]
+db = sqlite3.connect("/etc/x-ui/x-ui.db")
+for old, new in pairs:
+    n = db.execute("update inbounds set port=? where port=?", (new, old)).rowcount
+    print("   3x-ui: %d inbound(s) %d -> %d" % (n, old, new))
+db.commit(); db.close()
+p = "/etc/xui-chain/config.json"
+c = json.load(open(p))
+for t in c.get("tunnels") or []:
+    items = []
+    for item in [x for x in re.split(r"[,\s]+", t.get("ports", "")) if x]:
+        entry, _, exit_ = item.partition("=")
+        exit_ = exit_ or entry
+        for old, new in pairs:
+            if exit_ == str(old):
+                exit_ = str(new)
+        items.append(entry if exit_ == entry else "%s=%s" % (entry, exit_))
+    t["ports"] = ", ".join(items)
+    print("   EZ tunnel %s: %s" % (t.get("id"), t["ports"]))
+json.dump(c, open(p, "w"), ensure_ascii=False, indent=2)
+PYEOF
+}
+
+iran_ports() { # iran_ports forward|back : the Iran side of each tunnel forwards an old port to its new one (or back)
+  [ -n "${MOVE_PORTS:-}" ] || return 0
+  local how="$1" conf remote host id sedexpr pair old new
+  for conf in /usr/local/ez-xui/conf/ez-*.toml; do
+    [ -e "$conf" ] || continue
+    remote=$(grep -oE 'remote_addr *= *"[^"]+"' "$conf" | sed 's/.*"\(.*\)"/\1/'); host="${remote%:*}"; id=$(basename "$conf" .toml)
+    [ -n "$host" ] || continue
+    sedexpr=""
+    for pair in ${MOVE_PORTS//,/ }; do
+      old="${pair%=*}"; new="${pair#*=}"
+      if [ "$how" = forward ]; then sedexpr+="s/\"$old\"/\"$old=$new\"/g;"; else sedexpr+="s/\"$old=$new\"/\"$old\"/g;"; fi
+    done
+    say "Iran side of $id ($host): ports $how"
+    ssh -n -i /etc/xui-chain/id_ed25519 -o UserKnownHostsFile=/etc/xui-chain/known_hosts -o StrictHostKeyChecking=accept-new \
+        -o BatchMode=yes -o ConnectTimeout=15 "root@$host" \
+        "sed -i -E '/^ports/ { $sedexpr }' /usr/local/ez-xui/conf/$id.toml && grep '^ports' /usr/local/ez-xui/conf/$id.toml && systemctl restart $id && systemctl is-active $id" \
+      || echo "   could not update $host: change its ports by hand"
+  done
+}
+
 
 snapshot_db() { # a consistent copy of the 3x-ui database while it runs
   python3 -I - "$1" <<'EOF'
@@ -147,16 +200,20 @@ sync_data() {
   put "$STATE/x-ui.db" /etc/x-ui
   rm -f "$STATE/x-ui.db"
   r "chmod 600 /etc/x-ui/x-ui.db"
-  [ "$was" = active ] && r "systemctl start x-ui"
   put "$CONF" /etc
   r "chmod 700 /etc/xui-chain; chmod 600 /etc/xui-chain/*"
+  remap_target
+  [ "$was" = active ] && r "systemctl start x-ui"
+  return 0
 }
 
 test_copy() {
   say "testing $NEW_IP"
   local fail=0
   r "systemctl is-active x-ui xui-chain" | paste -sd' ' | sed 's/^/   services: /'
-  for p in 1080 443; do
+  local reality=443 pair
+  for pair in ${MOVE_PORTS//,/ }; do [ "${pair%=*}" = 443 ] && reality="${pair#*=}"; done
+  for p in 1080 $reality; do
     if timeout 6 bash -c "echo > /dev/tcp/$NEW_IP/$p" 2>/dev/null; then echo "   port $p open"; else echo "   port $p CLOSED"; fail=1; fi
   done
   local code; code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 --resolve "sub.shelbyping.com:2097:$NEW_IP" -A Happ "https://sub.shelbyping.com:2097/" || true)
@@ -199,6 +256,10 @@ row = db.execute("select id, port, stream_settings from inbounds where protocol=
 if not row:
     print("   no REALITY inbound to test"); sys.exit(0)
 iid, port, st = row; rs = json.loads(st)["realitySettings"]
+import re as _re
+for pair in _re.split(r"[,\s]+", os.environ.get("MOVE_PORTS", "")):  # the new server listens on the moved port
+    if "=" in pair and int(pair.split("=")[0]) == port:
+        port = int(pair.split("=")[1])
 cl = db.execute("select c.uuid, c.flow from clients c join client_inbounds ci on ci.client_id=c.id where ci.inbound_id=? and c.enable=1 limit 1", (iid,)).fetchone()
 if not cl:
     print("   no client on the REALITY inbound"); sys.exit(0)
@@ -241,6 +302,7 @@ switch() {
     systemctl disable --now "$n" >/dev/null 2>&1 || true
     r "systemctl enable --now $n >/dev/null 2>&1 && systemctl is-active $n"
   done
+  iran_ports forward
   local pub; pub=$(python3 -I -c "import json;c=json.load(open('/etc/xui-chain/config.json'));print(c.get('public_host') or '')")
   if [ -n "$pub" ]; then
     sleep 8
@@ -249,6 +311,7 @@ switch() {
     if [ "$code" != 200 ]; then
       echo "   not answering: the tunnel goes back here, and EZ's port is relayed to the new server meanwhile"
       for u in /etc/systemd/system/ez-*.service; do [ -e "$u" ] || continue; n=$(basename "$u"); r "systemctl disable --now $n" >/dev/null 2>&1 || true; systemctl enable --now "$n"; done
+      iran_ports back
       local port; port=$(python3 -I -c "import json;print(json.load(open('/etc/xui-chain/config.json')).get('port',2097))")
       command -v socat >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq socat >/dev/null 2>&1
       systemd-run --unit=ez-relay-$port --property=Restart=always socat TCP-LISTEN:$port,fork,reuseaddr TCP:$NEW_IP:$port >/dev/null 2>&1 || true
@@ -271,6 +334,7 @@ back() {
     [ -e "$u" ] || continue
     n=$(basename "$u"); r "systemctl disable --now $n" >/dev/null 2>&1 || true; systemctl enable --now "$n"
   done
+  iran_ports back
   # EZ's latest state (wallets, orders) comes back from there
   tmp=$(mktemp -d); r "tar -C /etc -czf - xui-chain" | tar -C "$tmp" -xzf - && cp -a "$tmp/xui-chain/." /etc/xui-chain/; rm -rf "$tmp"
   systemctl start xui-chain
