@@ -3282,6 +3282,49 @@ class ReadClientsTests(unittest.TestCase):
         xc.set_password("secret1")
 
 
+class SniTests(unittest.TestCase):
+    def test_each_domain_gets_its_certificate(self):
+        d = tempfile.mkdtemp()
+        def cert(name):
+            os.makedirs(os.path.join(d, name), exist_ok=True)
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1",
+                            "-subj", "/CN=" + name, "-keyout", os.path.join(d, name, "privkey.pem"), "-out", os.path.join(d, name, "fullchain.pem")],
+                           check=True, capture_output=True)
+        cert("sub.test")
+        cert("panel.test")
+        keep = xc.SNI_DIRS
+        xc.SNI_DIRS = (d + "/%s/fullchain.pem", d + "/%s/privkey.pem")
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(os.path.join(d, "sub.test", "fullchain.pem"), os.path.join(d, "sub.test", "privkey.pem"))
+            xc.sni_contexts(ctx)
+            srv = socket.socket()
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(5)
+            port = srv.getsockname()[1]
+
+            def accept():
+                for _ in range(3):
+                    c, _ = srv.accept()
+                    try:
+                        ctx.wrap_socket(c, server_side=True).close()
+                    except (ssl.SSLError, OSError):
+                        pass
+            threading.Thread(target=accept, daemon=True).start()
+
+            def cn(name):
+                cli = ssl.create_default_context()
+                cli.check_hostname, cli.verify_mode = False, ssl.CERT_NONE
+                with cli.wrap_socket(socket.create_connection(("127.0.0.1", port)), server_hostname=name) as s:
+                    der = s.getpeercert(binary_form=True)
+                return subprocess.run(["openssl", "x509", "-inform", "DER", "-noout", "-subject"], input=der, capture_output=True).stdout.decode()
+            self.assertIn("panel.test", cn("panel.test"))
+            self.assertIn("sub.test", cn("sub.test"))
+            self.assertIn("sub.test", cn("unknown.test"))  # unknown names: the main certificate
+        finally:
+            xc.SNI_DIRS = keep
+
+
 class ConfigTests(unittest.TestCase):
     def test_old_deco_label_migrates_once(self):
         path = xc.conf_path("config.json")

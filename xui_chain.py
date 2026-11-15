@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.36.1"
+VERSION = "5.36.2"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -66,6 +66,7 @@ DEFAULTS = {
     "cert_file": "auto",       # "auto" = reuse the 3x-ui subscription certificate
     "key_file": "auto",
     "public_host": "",         # host shown in user links; empty = host the admin page was opened with
+    "admin_host": "",          # host of the admin page's own link (e.g. panel.example.com); empty = public_host
     "direct_first": True,      # try your own IP directly before the chain
     "iran_direct": True,       # Iranian sites and apps (.ir and Iranian IPs) go direct, not through the tunnel
     "update_hours": 3,         # how often apps refresh the subscription
@@ -4863,7 +4864,7 @@ def net_state(app):
 SETTING_BOOLS = ("shop_ref_every", "shop_card_rotate", "notify_activity", "notify_taps", "sms_on", "bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
                  "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable", "shop_channel_on", "shop_phone", "shop_phone_ir",
                  "brand_font_licensed")
-SETTING_TEXTS = {"shop_cashback": 3, "shop_faq": 4000, "shop_rules": 3000, "digits": 2, "sub_title": 60, "sms_senders": 200, "brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
+SETTING_TEXTS = {"admin_host": 100, "shop_cashback": 3, "shop_faq": 4000, "shop_rules": 3000, "digits": 2, "sub_title": 60, "sms_senders": 200, "brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
                  "shop_welcome": 1000, "shop_help": 2000, "shop_prefix": 10, "bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
@@ -13194,6 +13195,37 @@ def watch_cert(ctx, cert, key):
                 print("certificate reload failed: %s" % e, flush=True)
 
 
+SNI_DIRS = ("/root/cert/%s/fullchain.pem", "/root/cert/%s/privkey.pem")
+
+
+def sni_contexts(main_ctx):
+    """One port, several domains: a browser asking for panel.example.com gets that domain's certificate
+    (from /root/cert/<domain>/, where acme.sh puts them) instead of the main one. Unknown names get the main one."""
+    cache = {}
+
+    def pick(sock, name, _ctx):
+        name = (name or "").lower().strip(".")
+        if not name or not re.fullmatch(r"[a-z0-9.-]{1,253}", name):
+            return None
+        cert, key = SNI_DIRS[0] % name, SNI_DIRS[1] % name
+        try:
+            stamp = (os.path.getmtime(cert), os.path.getmtime(key))
+        except OSError:
+            return None
+        hit = cache.get(name)
+        if not hit or hit[0] != stamp:
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(cert, key)
+            except (OSError, ssl.SSLError):
+                return None
+            hit = cache[name] = (stamp, ctx)
+        sock.context = hit[1]
+        return None
+    main_ctx.sni_callback = pick
+    return main_ctx
+
+
 def serve(app):
     rt = app.rt
     httpd = Server((rt["listen"], int(rt["port"])), make_handler(app))
@@ -13201,6 +13233,7 @@ def serve(app):
     if rt.get("cert_file") and rt.get("key_file"):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(rt["cert_file"], rt["key_file"])
+        sni_contexts(ctx)
         httpd.tls = ctx
         threading.Thread(target=watch_cert, args=(ctx, rt["cert_file"], rt["key_file"]), daemon=True).start()
         scheme = "https"
@@ -13242,7 +13275,7 @@ def main(argv):
         rt = app.rt
         scheme = "https" if rt.get("cert_file") else "http"
         host = rt.get("public_host") or "<server-ip>"
-        print("admin page : %s://%s:%s/%s/" % (scheme, host, rt["port"], rt["admin_path"]))
+        print("admin page : %s://%s:%s/%s/" % (scheme, rt.get("admin_host") or host, rt["port"], rt["admin_path"]))
         print("password   : %s" % ("set (change it with: ez-xui password)" if app.cfg.get("admin_pass")
                                    else "not set yet, choose one on the admin page"))
         print("user links : %s://%s:%s/%s/<subId>" % (scheme, host, rt["port"], rt["sub_path"]))
