@@ -46,11 +46,11 @@ body += glass(48, 48, 984, 984, 72)
 body += '<circle cx="540" cy="600" r="330" fill="url(#halo)"/>'
 # falling clovers, coins and sparkles (abundance)
 for x, y, s, r, op in [(150, 380, .55, -20, .9), (930, 330, .5, 25, .85), (220, 760, .42, 40, .8), (880, 720, .6, -35, .9),
-                       (330, 210, .32, 10, .55), (770, 230, .36, -15, .6), (110, 600, .3, 30, .5), (975, 560, .3, -10, .5)]:
+                       (330, 330, .32, 10, .55), (770, 320, .36, -15, .6), (110, 600, .3, 30, .5), (975, 560, .3, -10, .5)]:
     body += clover(x, y, s, r, fill="url(#leaf2)", stem=False, op=op)
 for x, y, r, rot in [(300, 880, 34, -12), (790, 885, 30, 14), (205, 520, 24, 8), (870, 470, 26, -10), (120, 860, 22, 5), (960, 680, 24, -6)]:
     body += coin(x, y, r, rot)
-for x, y, r in [(260, 300, 18), (820, 400, 22), (180, 690, 14), (930, 820, 16), (420, 160, 12), (650, 140, 16), (540, 260, 10), (980, 260, 12), (100, 470, 12)]:
+for x, y, r in [(260, 300, 18), (820, 400, 22), (180, 690, 14), (930, 820, 16), (420, 300, 12), (650, 310, 16), (980, 260, 12), (100, 470, 12)]:
     body += sparkle(x, y, r)
 # the mascot, its ping turned gold, holding a big clover
 p = penguin(540, 640, 1.25).replace("url(#iceh)", "url(#goldh)").replace('fill="url(#ice)"', 'fill="url(#gold)"')
@@ -58,7 +58,16 @@ body += p
 body += clover(668, 588, .95, 14)
 body += sparkle(770, 470, 26) + sparkle(640, 470, 14)
 # words
-body += f'<text x="540" y="182" font-family="{DISPLAY}" font-size="118" fill="url(#goldh)" text-anchor="middle">برکت خریدت</text>'
+# title on a dark glass plate, so it reads on any part of the rays
+body += f'<rect x="196" y="78" width="688" height="196" rx="98" fill="{GOLD}" opacity=".30" filter="url(#blur30)"/>'
+body += f'<rect x="196" y="78" width="688" height="196" rx="98" fill="#021A11" opacity=".74"/>'
+body += glass(196, 78, 688, 196, 98)
+body += f'<rect x="197.5" y="79.5" width="685" height="193" rx="96.5" fill="none" stroke="url(#goldh)" stroke-opacity=".75" stroke-width="3"/>'
+body += f'<text x="540" y="196" font-family="{DISPLAY}" font-size="112" fill="#000" opacity=".35" text-anchor="middle" filter="url(#soft)">برکت خریدت</text>'
+body += f'<text x="540" y="190" font-family="{DISPLAY}" font-size="112" fill="url(#goldh)" text-anchor="middle">برکت خریدت</text>'
+body += f'<text x="540" y="246" font-family="{BODY}" font-weight="700" font-size="30" fill="#ECFDF5" text-anchor="middle">یه هدیه از طرف پینگو</text>'
+body += clover(214, 176, .5, -18) + clover(866, 176, .5, 18)
+body += sparkle(250, 92, 16) + sparkle(838, 262, 14) + sparkle(820, 96, 10)
 body += pill(360, 866, 360, 88, "", fill="#FFFFFF", size=34)
 body += f'<text x="612" y="923" font-family="{BODY}" font-weight="800" font-size="36" fill="#065F46" text-anchor="middle">حجم هدیه</text>'
 body += f'<text x="454" y="924" font-family="{BODY}" font-weight="800" font-size="38" fill="#D97706" text-anchor="middle" direction="ltr">+10%</text>' 

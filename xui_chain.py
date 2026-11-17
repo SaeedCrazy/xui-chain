@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.37.0"
+VERSION = "5.37.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -10244,7 +10244,13 @@ class Shop:
                       self.card_rows(o, net) if o else [[("🏠 منوی اصلی", "m")]])
             return True
         if msg.get("photo") or msg.get("document"):
-            self.show(net, chat, "اول از منو سفارشت رو ثبت کن، بعد رسید رو بفرست 🙏", [[("🏠 منوی اصلی", "m")]])
+            o = next((o for o in reversed(self.d["orders"]) if o["uid"] == uid and o["status"] in ("new", "receipt")
+                      and time.time() - o["at"] < 48 * 3600), None)
+            if o:
+                with self.lock:
+                    o["method"] = o.get("method") or "card"
+                return self.got_receipt(net, chat, uid, o["id"], msg)
+            self.show(net, chat, "اول از منو سفارشت رو ثبت کن، بعد رسید رو بفرست 🙏", [[("🛒 خرید سرویس", "buy"), ("🏠 منوی اصلی", "m")]])
             return True
         if w and text and not text.startswith("/"):
             self.wait.pop(cid, None)
@@ -10282,6 +10288,8 @@ class Shop:
             fuid = msg["document"].get("file_unique_id", "")
         dup = next((x for x in self.d["orders"] if fuid and x.get("receipt_uid") == fuid and x["id"] != o["id"]), None)
         o["receipt_uid"] = fuid
+        o["receipt_mid"] = msg.get("message_id")
+        self.react(net, chat, o["receipt_mid"], "👀")  # «we are looking at it»
         code_err = self.take_code(o)
         with self.lock:
             o["status"], o["receipt"], o["receipt_at"] = "review", media[2], int(time.time())
@@ -10987,6 +10995,17 @@ class Shop:
         self.barakat_send(net, chat, self.barakat_text("مشتری", 10, "نمونه") + "\n\n<i>(پیش‌نمایش؛ چیزی اضافه نشد · برکت: %s%s)</i>" % (
             state, " · %s٪" % fa_num(pct) if pct else ""), [[("📦 سرویس‌های من", "svc"), ("🏠 منوی اصلی", "m")]])
 
+    def react(self, net, chat, mid, emoji):
+        """A reaction on the customer's own message (a receipt): 👀 while it is checked, ❤ once approved;
+        "" takes it away. Telegram only; never in the way of anything else."""
+        if net != "tg" or not mid:
+            return
+        try:
+            self.bot.call(net, "setMessageReaction", {"chat_id": chat, "message_id": mid,
+                                                      "reaction": [{"type": "emoji", "emoji": emoji}] if emoji else []})
+        except (ValueError, OSError):
+            pass
+
     REJECT = ("مبلغ واریزی درست نیست", "رسید خوانا نیست", "این رسید قبلاً استفاده شده", "واریزی به حساب نرسیده", "بدون دلیل")
 
     def review(self, oid, approve, who="", reason=""):
@@ -10998,6 +11017,7 @@ class Shop:
             if o["status"] != "review" or o.get("method") == "wallet":
                 return "این سفارش قبلاً %s" % self.STATUS.get(o["status"], o["status"])
             o["status"], o["reviewed_by"] = ("approving" if approve else "rejected"), who
+        self.react(o["net"], o["chat"], o.get("receipt_mid"), "❤" if approve else "")
         if approve:
             ok = self.fulfil(o, by="کارت به کارت")
             res = "✅ تأیید شد" if ok else "⚠️ تأیید شد ولی انجام نشد (پول به کیف پول برگشت)"
@@ -11235,11 +11255,14 @@ class Shop:
             faq = str(self.app.cfg.get("shop_faq") or "").strip()
             blocks = [b.strip() for b in re.split(r"\n\s*\n", faq) if b.strip()]
             text = "❓ <b>سوال‌های پرتکرار</b>\n\n" + "\n\n".join(
-                "<b>%s</b>\n%s" % (self.esc(b.split("\n", 1)[0].lstrip("سؤس:؟ ").strip()), self.esc(b.split("\n", 1)[1].strip()) if "\n" in b else "")
+                "<b>%s</b>\n%s" % (self.esc(re.sub(r"^\s*(?:سؤال|سوال|س)\s*[:：]\s*", "", b.split("\n", 1)[0]).strip()), self.esc(b.split("\n", 1)[1].strip()) if "\n" in b else "")
                 for b in blocks[:15])
             return self.show(net, chat, text[:4000], [[("🎫 جوابم رو پیدا نکردم", "tk:new")], self.back()], mid)
         if head == "help":
-            return self.show(net, chat, "💬 پشتیبانی: %s" % self.esc(support_link(self.app.cfg)), [self.back()], mid)
+            sup = support_link(self.app.cfg)
+            if not sup:
+                return self.show(net, chat, "💬 <b>پشتیبانی</b>\nسؤالت رو با یه تیکت بفرست؛ همین‌جا جواب می‌گیری.", [[("🎫 تیکت تازه", "tk:new")], self.back()], mid)
+            return self.show(net, chat, "💬 پشتیبانی: %s" % self.esc(sup), [self.back()], mid)
         if head == "guide":
             g = self.app.cfg.get("shop_help") or ("📚 <b>راهنمای اتصال</b>\n\n1️⃣ اپ <b>Happ</b> (اندروید و آیفون) یا v2rayNG رو نصب کن.\n"
                                                   "2️⃣ از «📦 سرویس‌های من» لینک اشتراک رو کپی کن.\n3️⃣ توی اپ «+» بزن و «از کلیپ‌بورد» رو انتخاب کن.\n"

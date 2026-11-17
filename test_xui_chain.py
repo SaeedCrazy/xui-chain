@@ -2505,6 +2505,32 @@ class ShopTests(BotBase):
             xc.save_config(cfg)
             self.app.reload()
 
+    def test_receipt_before_card_tap_reactions_and_faq(self):
+        self.tap(1701, "bp:p30")  # the invoice is open, «کارت به کارت» never tapped
+        o = self.shop.d["orders"][-1]
+        BotAPI.other = []
+        BotAPI.sent = []
+        self.bot.handle("tg", {"chat": {"id": 1701, "type": "private"}, "from": {"id": 1701}, "message_id": 55, "photo": [{"file_id": "F9"}]})
+        self.assertEqual(o["status"], "review")  # taken as that invoice's receipt
+        self.tap(100, "ok:%d" % o["id"], chat=100)
+        reacts = [b["reaction"] for m, b in BotAPI.other if m == "setMessageReaction" and b["message_id"] == 55]
+        self.assertEqual(reacts, [[{"type": "emoji", "emoji": "👀"}], [{"type": "emoji", "emoji": "❤"}]])
+        self.assertEqual(o["status"], "done")
+        self.assertEqual(o["receipt_mid"], 55)
+        cfg = xc.load_config()
+        cfg.update(shop_faq="سوال: چند دستگاه؟\nتا ۲ دستگاه.\n\nسؤال: واقعاً؟\nآره.")
+        xc.save_config(cfg)
+        self.app.reload()
+        try:
+            faq = self.tap(1701, "faq")
+            self.assertIn("<b>چند دستگاه؟</b>", faq)
+            self.assertIn("<b>واقعاً؟</b>", faq)
+            self.assertNotIn("وال", faq.replace("سوال‌های", ""))
+        finally:
+            cfg.update(shop_faq="")
+            xc.save_config(cfg)
+            self.app.reload()
+
     def test_qr_cards_first_and_later(self):
         d = xc.conf_path("brand")
         os.makedirs(d, exist_ok=True)
