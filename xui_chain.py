@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.37.1"
+VERSION = "5.37.2"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -10992,7 +10992,8 @@ class Shop:
         """/barakat for the owner: the message as a customer sees it (nothing is added)."""
         pct = _int(self.app.cfg.get("shop_barakat"))
         state = ("خاموش" if not pct else "روشن برای همه" if self.app.cfg.get("shop_barakat_all") else "حالت تست")
-        self.barakat_send(net, chat, self.barakat_text("مشتری", 10, "نمونه") + "\n\n<i>(پیش‌نمایش؛ چیزی اضافه نشد · برکت: %s%s)</i>" % (
+        gift = round(30 * (pct or 10) / 100, 1)  # a sample 30 GB plan, worked out like a real order
+        self.barakat_send(net, chat, self.barakat_text("مشتری", int(gift) if gift == int(gift) else gift, "نمونه · ۳۰ گیگ") + "\n\n<i>(پیش‌نمایش؛ چیزی اضافه نشد · برکت: %s%s)</i>" % (
             state, " · %s٪" % fa_num(pct) if pct else ""), [[("📦 سرویس‌های من", "svc"), ("🏠 منوی اصلی", "m")]])
 
     def react(self, net, chat, mid, emoji):

@@ -2498,6 +2498,7 @@ class ShopTests(BotBase):
                 self.assertEqual((prev["method"], prev["photo"]), ("sendPhoto", "<upload>"))  # under the barakat picture
                 self.assertIn("پیش‌نمایش", prev["caption"])
                 self.assertIn("روشن برای همه", prev["caption"])
+                self.assertIn("<b>۳ گیگ</b>", prev["caption"])  # 10% of the sample 30 GB
             finally:
                 os.remove(pic)
         finally:

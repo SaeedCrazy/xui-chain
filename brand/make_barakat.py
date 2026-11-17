@@ -65,7 +65,7 @@ body += glass(196, 78, 688, 196, 98)
 body += f'<rect x="197.5" y="79.5" width="685" height="193" rx="96.5" fill="none" stroke="url(#goldh)" stroke-opacity=".75" stroke-width="3"/>'
 body += f'<text x="540" y="196" font-family="{DISPLAY}" font-size="112" fill="#000" opacity=".35" text-anchor="middle" filter="url(#soft)">برکت خریدت</text>'
 body += f'<text x="540" y="190" font-family="{DISPLAY}" font-size="112" fill="url(#goldh)" text-anchor="middle">برکت خریدت</text>'
-body += f'<text x="540" y="246" font-family="{BODY}" font-weight="700" font-size="30" fill="#ECFDF5" text-anchor="middle">یه هدیه از طرف پینگو</text>'
+body += f'<text x="540" y="244" font-family="{BODY}" font-weight="700" font-size="24" fill="#ECFDF5" opacity=".92" text-anchor="middle">یه هدیه از طرف پینگو</text>'
 body += clover(214, 176, .5, -18) + clover(866, 176, .5, 18)
 body += sparkle(250, 92, 16) + sparkle(838, 262, 14) + sparkle(820, 96, 10)
 body += pill(360, 866, 360, 88, "", fill="#FFFFFF", size=34)
