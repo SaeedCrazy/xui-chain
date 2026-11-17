@@ -2449,6 +2449,62 @@ class ShopTests(BotBase):
         xc.save_config(cfg)
         self.app.reload()
 
+    def test_barakat_gift_after_purchase(self):
+        cfg = xc.load_config()
+        cfg.update(shop_barakat=10, shop_barakat_all=False, shop_barakat_testers="1601", shop_barakat_delay=10)
+        xc.save_config(cfg)
+        self.app.reload()
+        try:
+            def buy(user):
+                self.tap(user, "bp:p30")
+                o = self.shop.d["orders"][-1]
+                self.photo(user)
+                self.tap(100, "ok:%d" % o["id"], chat=100)
+                return o
+            tester, other = buy(1601), buy(1602)
+            self.assertEqual((tester["barakat_gb"], other.get("barakat_gb")), (3, None))  # trial: only the testers
+            live = {"sub": tester["sub"], "name": "tg1601", "enable": True, "total": 30 * xc.GB_BYTES, "used": 0, "expiry": 0, "emails": ["tg1601"]}
+            self.shop.bot.cached_users = lambda: [live]
+            try:
+                BotAPI.sent, self.panel.updated = [], []
+                self.shop.tick(now=time.time() + 60)  # not yet
+                self.assertEqual(self.panel.updated, [])
+                self.shop.tick(now=time.time() + 11 * 60)
+                self.assertEqual(self.panel.updated, [(tester["sub"], ["tg1601"], {"totalGB": 33 * xc.GB_BYTES})])
+                msg = [m for m in BotAPI.sent if str(m.get("chat_id")) == "1601"][-1]
+                self.assertIn("برکت خریدت", msg.get("text") or msg.get("caption"))
+                self.assertIn("۳ گیگ", msg.get("text") or msg.get("caption"))
+                self.shop.tick(now=time.time() + 30 * 60)  # given once
+                self.assertEqual(len(self.panel.updated), 1)
+            finally:
+                del self.shop.bot.cached_users
+            cfg.update(shop_barakat_all=True)  # for everyone; renewals too, unlimited plans get none
+            xc.save_config(cfg)
+            self.app.reload()
+            self.assertEqual(self.shop.barakat_gb({"kind": "renew", "gb": 25, "uid": "tg:9"}), 2.5)
+            self.assertEqual(self.shop.barakat_gb({"kind": "buy", "gb": 0, "uid": "tg:9"}), 0)
+            self.assertEqual(self.shop.barakat_gb({"kind": "topup", "gb": 0, "uid": "tg:9"}), 0)
+            cfg["bot_owner"] = "42"
+            xc.save_config(cfg)
+            self.app.reload()
+            pic = os.path.join(xc.conf_path("brand"), "barakat.png")
+            os.makedirs(os.path.dirname(pic), exist_ok=True)
+            with open(pic, "wb") as fh:
+                fh.write(xc.png_write(8, 8, bytearray(8 * 8 * 3)))
+            try:
+                BotAPI.sent = []
+                self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "/barakat"})
+                prev = BotAPI.sent[-1]
+                self.assertEqual((prev["method"], prev["photo"]), ("sendPhoto", "<upload>"))  # under the barakat picture
+                self.assertIn("پیش‌نمایش", prev["caption"])
+                self.assertIn("روشن برای همه", prev["caption"])
+            finally:
+                os.remove(pic)
+        finally:
+            cfg.update(shop_barakat=0, shop_barakat_all=False, shop_barakat_testers="", bot_owner="")
+            xc.save_config(cfg)
+            self.app.reload()
+
     def test_qr_cards_first_and_later(self):
         d = xc.conf_path("brand")
         os.makedirs(d, exist_ok=True)

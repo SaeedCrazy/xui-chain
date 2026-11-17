@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.36.2"
+VERSION = "5.37.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -145,6 +145,10 @@ DEFAULTS = {
     "shop_sale_until": 0,      # ...until this unix time
     "shop_cashback": 0,        # percent of each paid purchase back into the buyer's wallet
     "shop_ref_every": False,   # referral reward on every purchase of the invited friend (not only the first)
+    "shop_barakat": 0,         # «برکت»: percent of each bought or renewed volume given as a gift a little after the purchase
+    "shop_barakat_all": False,  # off = trial: only for shop_barakat_testers (or the owner)
+    "shop_barakat_testers": "",  # Telegram ids that get the barakat while on trial (empty = the owner)
+    "shop_barakat_delay": 10,  # minutes after the purchase
     "shop_faq": "",            # questions and answers (a question line, its answer below, a blank line between)
     "shop_rules": "",          # shop rules the customer accepts once before using the bot (empty = none)
     "shop_card_rotate": False,  # show one card per order, in turn, instead of all cards
@@ -4796,6 +4800,8 @@ def admin_state(app, host):
                          notify_activity=bool(cfg.get("notify_activity", True)), notify_taps=bool(cfg.get("notify_taps")),
                          rules=cfg.get("shop_rules", ""), card_rotate=bool(cfg.get("shop_card_rotate")),
                          cashback=cfg.get("shop_cashback", ""), ref_every=bool(cfg.get("shop_ref_every")), faq=cfg.get("shop_faq", ""),
+                         barakat=cfg.get("shop_barakat", ""), barakat_all=bool(cfg.get("shop_barakat_all")),
+                         barakat_testers=cfg.get("shop_barakat_testers", ""), barakat_delay=cfg.get("shop_barakat_delay", ""),
                          sms_on=bool(cfg.get("sms_on")), sms_senders=cfg.get("sms_senders", ""), sms_url=sms_url(app)),
         "routes": rts,
         "cf": cf_public(cfg),
@@ -4861,10 +4867,10 @@ def net_state(app):
             "iran": [s["id"] for s in net.servers() if s.get("role") == "iran"]}
 
 
-SETTING_BOOLS = ("shop_ref_every", "shop_card_rotate", "notify_activity", "notify_taps", "sms_on", "bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
+SETTING_BOOLS = ("shop_ref_every", "shop_barakat_all", "shop_card_rotate", "notify_activity", "notify_taps", "sms_on", "bk_tg", "bk_bale", "bk_xui", "direct_first", "iran_direct", "tg_enable", "panel_auto", "user_page", "show_auto", "skip_down",
                  "skip_exhausted", "info_config", "bot_enable", "bot_bale", "shop_enable", "shop_channel_on", "shop_phone", "shop_phone_ir",
                  "brand_font_licensed")
-SETTING_TEXTS = {"admin_host": 100, "shop_cashback": 3, "shop_faq": 4000, "shop_rules": 3000, "digits": 2, "sub_title": 60, "sms_senders": 200, "brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
+SETTING_TEXTS = {"admin_host": 100, "shop_cashback": 3, "shop_barakat": 3, "shop_barakat_testers": 200, "shop_barakat_delay": 4, "shop_faq": 4000, "shop_rules": 3000, "digits": 2, "sub_title": 60, "sms_senders": 200, "brand_banner_url": 300, "brand_color": 7, "brand_accent": 7, "shop_gb_price": 12, "shop_day_price": 12, "shop_custom_max": 20, "bot_owner": 100, "bot_emoji": 3000, "shop_cards": 1000, "shop_trial": 20, "shop_channel": 100, "shop_ref": 3, "shop_topups": 100, "shop_inbounds": 100,
                  "shop_welcome": 1000, "shop_help": 2000, "shop_prefix": 10, "bot_days": 20, "bot_pcts": 20, "bot_quiet": 5, "bale_chat": 200, "info_format": 80, "title": 60, "main_location": 40, "support_url": 300, "announce": 500, "probe_url": 300, "auto_mode": 10, "order_mode": 10, "label_main": 30, "label_deco": 30, "label_auto": 30, "xui_sub_url": 300,
                  "public_host": 200, "tg_chat": 200, "panel_user": 100, "panel_url": 300, "test_sub_id": 64}
 SETTING_SECRETS = ("bale_token", "tg_token", "panel_token", "panel_pass", "bot_token")
@@ -7347,6 +7353,8 @@ SHOPV.set=sh=>{const s=S.state.settings,c=S.state.shop_cfg||{};
    <div class="cols2">${field("shop_trial","تست رایگان (گیگ,روز)",c.trial,'class="in ltr" placeholder="1,1"',"خالی = خاموش")}${field("shop_ref","پاداش دعوت (٪)",c.ref,'class="in ltr" inputmode="numeric" placeholder="10"',"از اولین خرید دوست")}</div>
    ${field("shop_topups","مبالغ شارژ کیف پول (تومان)",c.topups,'class="in ltr" placeholder="100000,200000,500000"')}
    <div class="cols2">${field("shop_cashback","برگشت خرید به کیف پول (٪)",c.cashback||"",'class="in ltr" inputmode="numeric" placeholder="0"',"از هر خرید کارت به کارت؛ خالی = خاموش")}<div>${sw("shop_ref_every",c.ref_every,"پاداش دعوت از هر خرید","خاموش = فقط از اولین خرید دوست")}</div></div>
+   <div class="cols2">${field("shop_barakat","🍀 برکت خرید (٪ حجم هدیه)",c.barakat||"",'class="in ltr" inputmode="numeric" placeholder="0"',"کمی بعد از هر خرید و تمدید، این درصد از حجمش هدیه اضافه می‌شه؛ خالی = خاموش")}<div>${sw("shop_barakat_all",c.barakat_all,"برکت برای همه‌ی مشتری‌ها","خاموش = حالت تست: فقط آیدی‌های تست")}</div></div>
+   <div class="cols2">${field("shop_barakat_testers","آیدی‌های تست برکت",c.barakat_testers||"",'class="in ltr" placeholder="خالی = خود مالک"',"آیدی عددی تلگرام؛ با کاما جدا کن")}${field("shop_barakat_delay","فاصله تا برکت (دقیقه)",c.barakat_delay||"",'class="in ltr" inputmode="numeric" placeholder="10"',"پیش‌نمایش پیام: در ربات بزن /barakat")}</div>
    <div class="sec" style="margin:10px 2px 4px"><h3>🎛 پلن دلخواه (مشتری خودش حجم و روز رو انتخاب می‌کنه)</h3></div>
    <div class="cols2">${field("shop_gb_price","قیمت هر گیگ (تومان)",c.gb_price||"",'class="in ltr" inputmode="numeric" placeholder="10000"')}${field("shop_day_price","قیمت هر روز (تومان)",c.day_price||"",'class="in ltr" inputmode="numeric" placeholder="1000"')}</div>
    ${field("shop_custom_max","سقف (گیگ,روز)",c.custom_max||"500,365",'class="in ltr" placeholder="500,365"',"هر دو قیمت صفر = پلن دلخواه خاموش. با روشن بودنش، مشتری روی هر سرویس «➕ حجم و زمان» هم داره.")}
@@ -8689,6 +8697,8 @@ class Bot:
                 return self.admin.quick(net, chat, who, self.admin.QUICK[text])
             if self.admin.on_text(net, chat, msg):
                 return
+            if cmd == "/barakat":
+                return self.shop.barakat_preview(net, chat)
             if cmd in ("/start", "/admin", "/panel") and not (cmd == "/start" and arg.startswith(("s_", "r_"))):
                 self.admin.wait.pop(cid, None)
                 self.admin.give_kb(net, chat)
@@ -9129,7 +9139,7 @@ def shop_path():
 
 
 BRAND_FILES = ("mark.svg", "mark.png", "avatar-640.png", "banner.png", "banner.svg", "display.ttf", "qr-card.png", "qr-card-plain.png",
-               "qr-logo.png")
+               "qr-logo.png", "barakat.png")
 
 
 def brand_file(name):
@@ -10468,6 +10478,9 @@ class Shop:
                     continue
                 self.auto_renew(uid, u, sub, x, now)
         for o in self.d["orders"]:
+            if o.get("barakat_due") and not o.get("barakat_at") and not o.get("barakat_off") and now >= o["barakat_due"]:
+                self.barakat_give(o, users.get(o.get("sub")), now)
+        for o in self.d["orders"]:
             if o["status"] == "review" and o.get("method") == "card":
                 waited = now - o.get("receipt_at", o["at"])
                 last = o.get("realert", 0)
@@ -10856,6 +10869,12 @@ class Shop:
         """A paid order: cashback for the buyer (shop_cashback %), and for an invited customer a reward to
         whoever invited them: on the first purchase, or on every one with shop_ref_every."""
         u = self.user(o["uid"])
+        gift = self.barakat_gb(o)
+        if gift:
+            with self.lock:
+                o["barakat_gb"] = gift
+                wait = str(self.app.cfg.get("shop_barakat_delay", "")).strip()
+                o["barakat_due"] = int(time.time() + 60 * (max(0, _int(wait)) if wait else 10))
         back = _int(self.app.cfg.get("shop_cashback"))
         if back and o["kind"] != "topup" and o.get("method") != "wallet" and self.total(o):
             amount = self.total(o) * back // 100
@@ -10879,6 +10898,94 @@ class Shop:
             u["ref_paid"] = True
         net, chat = u["ref"].split(":", 1)
         self.show(net, chat, "🎉 یکی از دوستانت خرید کرد و <b>%s</b> به کیف پولت اضافه شد!" % toman(amount), [[("💰 کیف پول", "wallet")]])
+
+    # «برکت»: a gift of extra volume a little after each purchase -------------------------------------------
+    def barakat_gb(self, o):
+        """The gift volume (GB) an order earns, 0 when none: bought or renewed volume, barakat on, and while on
+        trial only for the testers (or the owner)."""
+        pct = _int(self.app.cfg.get("shop_barakat"))
+        if not pct or o["kind"] not in ("buy", "renew") or not float(o.get("gb") or 0):
+            return 0
+        if not self.app.cfg.get("shop_barakat_all"):
+            testers = set(re.split(r"[,\s]+", str(self.app.cfg.get("shop_barakat_testers") or ""))) - {""} or self.bot.admin.owners()
+            if o["uid"].split(":", 1)[-1] not in testers:
+                return 0
+        gift = round(float(o["gb"]) * pct / 100, 1)
+        return int(gift) if gift == int(gift) else gift
+
+    def barakat_text(self, name, gb, sname):
+        return ("🍀 <b>برکت خریدت رسید!</b>\n\n"
+                "%s عزیز، <b>%s گیگ</b> به‌عنوان برکت خریدت به اشتراک «%s» اضافه شد. 🎁\n\n"
+                "✨ این هدیه از طرف پینگوئه؛ پرسرعت وصل باش و لذتش رو ببر.\n"
+                "🌾 خیر و برکت همیشه همراهت 💚") % (self.esc(name or "دوست"), fa_num(_fmt_num(gb)), self.esc(sname))
+
+    def barakat_give(self, o, x, now):
+        """Add the gift volume to the order's service and tell the buyer. Claimed before the panel call, so it
+        is never given twice; a failure is retried on the next ticks, then left to the admins."""
+        with self.lock:
+            if o.get("barakat_at"):
+                return False
+            o["barakat_at"] = int(now)
+        gb = o["barakat_gb"]
+        if not x or not x.get("total"):  # gone, or unlimited volume: nothing to add
+            with self.lock:
+                o["barakat_off"] = "unlimited" if x else "missing"
+            self.save()
+            return False
+        ch = {"totalGB": int(x["total"] + float(gb) * GB_BYTES)}
+        if not x.get("enable") and x.get("used", 0) >= x["total"]:
+            ch["enable"] = True  # it had run out: the gift brings it back
+        try:
+            self.app.panel.update_user(o["sub"], x["emails"], ch)
+        except Exception as e:
+            with self.lock:
+                o.pop("barakat_at", None)
+                o["barakat_tries"] = o.get("barakat_tries", 0) + 1
+                if o["barakat_tries"] >= 3:
+                    o["barakat_off"] = "failed"
+            self.save()
+            if o.get("barakat_off"):
+                self.bot.notify_admins("shop", "⚠️ برکت سفارش #%s اضافه نشد: %s" % (o["id"], str(e)[:120]))
+            return False
+        self.save()
+        self.bot.users_changed()
+        u = self.user(o["uid"])
+        self.barakat_send(o["net"], o["chat"], self.barakat_text(u.get("name"), gb, x.get("name") or o["sub"]),
+                          [[("📦 سرویس‌های من", "sv:%s" % o["sub"]), ("🏠 منوی اصلی", "m")]])
+        self.tell(o["uid"], "🍀 برکت: %s گیگ به %s اضافه شد (سفارش #%s)" % (fa_num(_fmt_num(gb)), x.get("name") or o["sub"], o["id"]))
+        return True
+
+    def barakat_send(self, net, chat, caption, rows):
+        """The barakat message under its picture (brand/barakat.png, uploaded once then sent by file id);
+        a plain message when there is no picture or the upload fails."""
+        p = brand_file("barakat.png")
+        if p and len(caption) <= 1024:
+            key = "%d:%d" % (int(os.path.getmtime(p)), os.path.getsize(p))
+            payload = {"chat_id": chat, "caption": caption, "parse_mode": "HTML", "reply_markup": self.kb(rows, net)}
+            if str(chat).isdigit():
+                payload["message_effect_id"] = self.EFFECT["party"]
+            fid = (self.bot.st.get("barakat_photo") or {}).get(net) or []
+            try:
+                if len(fid) == 2 and fid[0] == key:
+                    return self.bot.call(net, "sendPhoto", dict(payload, photo=fid[1]))
+                with open(p, "rb") as f:
+                    res = self.bot.upload(net, "sendPhoto", payload, "photo", "barakat.png", f.read(), "image/png")
+                sizes = (res or {}).get("photo") or []
+                if sizes:
+                    with self.bot.lock:
+                        self.bot.st.setdefault("barakat_photo", {})[net] = [key, sizes[-1]["file_id"]]
+                    self.bot.save()
+                return res
+            except (ValueError, OSError) as e:
+                self.bot.log(net, chat, "barakat", str(e)[:160])
+        return self.show(net, chat, caption, rows, effect="party")
+
+    def barakat_preview(self, net, chat):
+        """/barakat for the owner: the message as a customer sees it (nothing is added)."""
+        pct = _int(self.app.cfg.get("shop_barakat"))
+        state = ("خاموش" if not pct else "روشن برای همه" if self.app.cfg.get("shop_barakat_all") else "حالت تست")
+        self.barakat_send(net, chat, self.barakat_text("مشتری", 10, "نمونه") + "\n\n<i>(پیش‌نمایش؛ چیزی اضافه نشد · برکت: %s%s)</i>" % (
+            state, " · %s٪" % fa_num(pct) if pct else ""), [[("📦 سرویس‌های من", "svc"), ("🏠 منوی اصلی", "m")]])
 
     REJECT = ("مبلغ واریزی درست نیست", "رسید خوانا نیست", "این رسید قبلاً استفاده شده", "واریزی به حساب نرسیده", "بدون دلیل")
 
