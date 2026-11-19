@@ -2186,6 +2186,13 @@ class ShopTests(BotBase):
         self.assertEqual(self.shop.got_sms(sms)["note"], "تکراری")  # the same SMS twice counts once
         self.assertEqual(o2["status"], "receipt")
         self.assertEqual(self.shop.got_sms("+%s" % "{:,}".format(self.shop.total(o2) * 10), sender="999")["matched"], [o2["id"]])
+        # banks often write Arabic letters: «واريز … ريال» is still a deposit in rial
+        self.tap(991, "bp:p30")
+        o3 = self.shop.d["orders"][-1]
+        arabic = "بانك پارسيان\nواريز به حساب 47000123456\nمبلغ:%s ريال\nمانده:35,000,000\n1404/08/25-14:57" % "{:,}".format(self.shop.total(o3) * 10)
+        self.assertEqual(self.shop.got_sms(arabic)["matched"], [o3["id"]])
+        self.shop.got_sms("رمز پويا 4471 حساب 47000123456")  # nothing found: kept masked for a look later
+        self.assertEqual(self.shop.d["sms_log"][-1]["sample"], "رمز پويا 4471 حساب 47•••56")
         cfg["sms_senders"] = "9830006060"
         xc.save_config(cfg)
         self.app.reload()

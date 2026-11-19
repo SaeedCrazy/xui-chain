@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.38.0"
+VERSION = "5.38.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -1023,6 +1023,7 @@ class _Digits(dict):
 
 FA_DIGITS = _Digits()
 EN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+AR_LETTERS = str.maketrans("يىكۀة", "ییکهه")  # banks often write Arabic ي/ك: «واريز» is «واریز»
 PERSIAN = re.compile(r"[\u0600-\u06FF]")
 
 
@@ -9528,7 +9529,7 @@ class Shop:
     def sms_amounts(self, text):
         """Deposit amounts in a bank SMS, in toman (banks write rial unless they say تومان).
         An amount is a number on a deposit SMS (or with a +), not a balance, fee, account or card number."""
-        t = str(text or "").translate(EN_DIGITS).replace("\u200f", "").replace("\u200e", "")
+        t = str(text or "").translate(EN_DIGITS).translate(AR_LETTERS).replace("\u200f", "").replace("\u200e", "")
         deposit_sms = bool(self.SMS_DEPOSIT.search(t)) and not self.SMS_OUT.search(t)
         toman_unit = "تومان" in t and "ریال" not in t
         out = []
@@ -9611,8 +9612,10 @@ class Shop:
                 notes.append("سفارشی با این مبلغ نیست")
                 self.bot.notify_admins("shop", "💸 واریز %s رسید ولی سفارشی با این مبلغ پیدا نشد." % toman(a))
         with self.lock:
-            self.d["sms_log"] = (self.d["sms_log"] + [{"at": int(now), "amounts": amounts, "orders": matched,
-                                                         "note": "؛ ".join(notes) or "مبلغ واریزی پیدا نشد"}])[-30:]
+            entry = {"at": int(now), "amounts": amounts, "orders": matched, "note": "؛ ".join(notes) or "مبلغ واریزی پیدا نشد"}
+            if not amounts:  # account and card numbers masked; the layout is what matters
+                entry["sample"] = re.sub(r"\d{6,}", lambda m: m.group(0)[:2] + "•••" + m.group(0)[-2:], text.translate(EN_DIGITS))[:300]
+            self.d["sms_log"] = (self.d["sms_log"] + [entry])[-30:]
         self.save()
         return {"matched": matched, "amounts": amounts, "note": "؛ ".join(notes) or "مبلغ واریزی پیدا نشد"}
 
