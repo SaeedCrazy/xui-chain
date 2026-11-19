@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.37.2"
+VERSION = "5.38.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -2553,6 +2553,102 @@ def auto_panel_credentials(db_path=XUI_DB, xui_bin=None):
     return None, "این نسخه‌ی پنل توکن API ندارد و رمزش قابل خواندن نیست؛ نام کاربری و رمز را دستی بگذار"
 
 
+ACTOR = threading.local()
+
+
+class acting:
+    """with acting("پنل مدیریت"): changes to users made inside are written down under that name."""
+    def __init__(self, who):
+        self.who = who
+
+    def __enter__(self):
+        self.prev, ACTOR.who = getattr(ACTOR, "who", ""), self.who
+
+    def __exit__(self, *exc):
+        ACTOR.who = self.prev
+
+
+def jalali_time(ts):
+    """1405/08/28 · 14:32, Tehran time."""
+    t = time.gmtime(ts + TEHRAN)
+    return "%04d/%02d/%02d · %02d:%02d" % (g2j(t.tm_year, t.tm_mon, t.tm_mday) + (t.tm_hour, t.tm_min))
+
+
+def expiry_text(ms):
+    if not ms:
+        return "بدون انقضا"
+    if ms < 0:
+        return "%s روز از اولین اتصال" % _int(-ms / 86400000)
+    return jalali_time(ms / 1000).split(" · ")[0]
+
+
+class LoggedPanel:
+    """The users' panel as EZ uses it, writing down every change to a user (who, when, what) and counting
+    the traffic a reset is about to zero into that user's lifetime total."""
+
+    def __init__(self, app, inner):
+        object.__setattr__(self, "app", app)
+        object.__setattr__(self, "inner", inner)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def __setattr__(self, name, value):  # the panel's own state (cookies, cached version) lives on the panel
+        setattr(self.inner, name, value)
+
+    def _user(self, sub):
+        try:
+            return next((u for u in group_users(clients_of(self.app)) if u["sub"] == sub), None)
+        except Exception:
+            return None
+
+    def _log(self, sub, what):
+        try:
+            self.app.usage.event(sub, getattr(ACTOR, "who", "") or "سیستم", what)
+        except Exception as e:
+            print("user log error: %s" % e, flush=True)
+
+    def add_client(self, name, gb, days, devices, first_use, inbound_ids, note="", tg_id=0):
+        sub = self.inner.add_client(name, gb, days, devices, first_use, inbound_ids, note=note, tg_id=tg_id)
+        self._log(sub, "ساخته شد · %s · %s%s" % ("%s گیگ" % gb_text(float(gb) * GB_BYTES) if gb else "حجم نامحدود",
+                                                 ("%s روز%s" % (days, " از اولین اتصال" if first_use else "")) if days else "بدون انقضا",
+                                                 " · %s دستگاه" % devices if devices else ""))
+        return sub
+
+    def update_user(self, sub, emails, changes):
+        before = self._user(sub) or {}
+        self.inner.update_user(sub, emails, changes)
+        parts = []
+        vol = lambda b: gb_text(b) + " گیگ" if b else "نامحدود"
+        if "totalGB" in changes and changes["totalGB"] != before.get("total"):
+            parts.append("حجم از %s به %s" % (vol(before["total"]), vol(changes["totalGB"])) if before else "حجم: %s" % vol(changes["totalGB"]))
+        if "expiryTime" in changes and changes["expiryTime"] != before.get("expiry"):
+            parts.append("انقضا از %s به %s" % (expiry_text(before["expiry"]), expiry_text(changes["expiryTime"])) if before
+                         else "انقضا: %s" % expiry_text(changes["expiryTime"]))
+        if "limitIp" in changes and changes["limitIp"] != before.get("devices"):
+            parts.append("دستگاه: %s" % (changes["limitIp"] or "نامحدود"))
+        if "enable" in changes and bool(changes["enable"]) != bool(before.get("enable", not changes["enable"])):
+            parts.append("فعال شد" if changes["enable"] else "غیرفعال شد")
+        if "comment" in changes and len(changes) == 1:
+            parts.append("توضیحات عوض شد")
+        if parts:
+            self._log(sub, " · ".join(parts))
+
+    def reset_user(self, sub, emails):
+        before = self._user(sub)
+        if before:
+            try:
+                self.app.usage.before_reset(sub, before["used"])
+            except Exception as e:
+                print("usage before reset: %s" % e, flush=True)
+        self.inner.reset_user(sub, emails)
+        self._log(sub, "مصرف صفر شد%s" % (" (مصرف این دوره: %s گیگ)" % gb_text(before["used"]) if before else ""))
+
+    def delete_user(self, sub, emails):
+        self.inner.delete_user(sub, emails)
+        self._log(sub, "حذف شد · مصرف کل: %s گیگ" % gb_text(self.app.usage.life(sub)[0]))
+
+
 class PanelError(Exception):
     pass
 
@@ -4754,6 +4850,7 @@ def admin_state(app, host):
     users = group_users(clients, onlines)
     users.reverse()  # newest first
     buyers = app.bot.shop.buyers()
+    lives = app.usage.life()
     return {
         "version": VERSION,
         "now": int(time.time() * 1000),
@@ -4826,6 +4923,7 @@ def admin_state(app, host):
             for n in panel.get("nodes") or []],
         "users": [dict({k: u[k] for k in ("sub", "name", "emails", "enable", "used", "total", "expiry", "devices",
                                           "inbounds", "online")}, note=note_of(u), buyer=buyers.get(u["sub"]),
+                       life=max(lives.get(u["sub"], 0), u["used"]),
                        **user_sub_public(cfg, u["sub"])) for u in users],
         "templates": templates_public(cfg, live, users),
         "users_source": source,
@@ -5804,6 +5902,12 @@ def do_action(app, action, body, host):
                 if not a.get("paused") and app.bot.admin.send_card(anet, achat, u["sub"]):
                     sent += 1
             return done("کارت QR توی ربات فرستاده شد؛ برای کاربر فورواردش کن") if sent else fail("ربات وصل نیست یا چت مدیری نداره")
+
+        if action == "user_history":
+            u = find_user(str(body.get("sub", "")))
+            life, since = app.usage.life(u["sub"])
+            return 200, {"ok": True, "life": max(life, u["used"]), "since": since * 1000,
+                         "events": [{"at": ts * 1000, "who": who, "what": what} for ts, who, what in app.usage.events(u["sub"], 100)]}
 
         if action == "user_note":
             u = find_user(str(body.get("sub", "")))
@@ -7117,8 +7221,17 @@ const userBy=sub=>S.state.users.find(u=>u.sub===sub);
 const locOfInbound=id=>{const ib=S.state.inbounds.find(x=>x.id===id);if(!ib)return null;return S.state.locations.find(l=>l.main?!ib.node:l.id===ib.node)||null};
 const userLocs=u=>{const out=[];u.inbounds.forEach(id=>{const l=locOfInbound(id);if(l&&!out.includes(l))out.push(l)});return out};
 const multiLoc=()=>S.state.locations.length>1;
+async function historySheet(sub){
+  const u=userBy(sub);const j=await api("user_history",{sub});if(!j||!j.ok)return;
+  const when=ms=>{const d=new Date(ms);return d.toLocaleDateString("fa-IR-u-nu-latn",{timeZone:"Asia/Tehran"})+" · "+d.toLocaleTimeString("fa-IR-u-nu-latn",{timeZone:"Asia/Tehran",hour:"2-digit",minute:"2-digit"})};
+  sheet(`<h3>${ic("clock")} تاریخچه‌ی <span class="ltr">${esc(u?u.name:sub)}</span></h3>
+  <div class="card" style="margin:8px 0;padding:10px 12px"><div class="kv"><span>📊 مصرف کل</span><b>${gb(j.life)} GB</b></div>
+  <div class="kv"><span>این دوره</span><span>${u?usage(u):"—"}</span></div>${j.since?`<div class="kv"><span>شمارش از</span><span class="mut small">${when(j.since)}</span></div>`:""}</div>
+  ${j.events.length?`<ol class="hist" style="list-style:none;padding:0;margin:0">${j.events.map(e=>`<li style="padding:9px 2px;border-bottom:1px solid var(--line,rgba(255,255,255,.08))"><div>${esc(e.what)}</div><div class="mut xs" style="margin-top:3px">${when(e.at)} · ${esc(e.who)}</div></li>`).join("")}</ol>`:'<div class="mut small">هنوز تغییری ثبت نشده. از این به بعد هر تغییر (ساخت، تمدید، صفر کردن مصرف، حجم، فعال/غیرفعال…) با ساعت و دقیقه اینجا میاد.</div>'}`);
+}
 function buyerBox(u){const b=u.buyer;
   return `<div class="card" style="margin:10px 0;padding:10px 12px">
+   <div class="kv"><span>📊 مصرف کل</span><span>${gb(u.life||u.used)} GB <button type="button" class="lnk" data-act="u-hist" data-sub="${esc(u.sub)}">تاریخچه</button></span></div>
    <div class="kv"><span>📝 توضیحات</span><span style="max-width:65%;text-align:left;white-space:pre-wrap">${u.note?esc(u.note):'<span class="mut">—</span>'} <button type="button" class="lnk" data-act="user-note" data-sub="${esc(u.sub)}">ویرایش</button></span></div>
    ${b?`<div class="kv"><span>🤖 مشتری ربات</span><span>${esc(b.name||"—")}</span></div>
    ${b.username?`<div class="kv"><span>یوزرنیم</span><a class="ltr" href="https://t.me/${esc(b.username)}" target="_blank" rel="noopener">@${esc(b.username)}</a></div>`:""}
@@ -7193,6 +7306,7 @@ function moreSheet(u){
   <button data-act="edit" data-sub="${esc(u.sub)}">${ic("edit")} تمدید و ویرایش</button>
   <button data-act="u-enable" data-sub="${esc(u.sub)}" data-v="${u.enable?0:1}">${ic("power")} ${u.enable?"غیرفعال کردن":"فعال کردن"}</button>
   <button data-act="u-reset" data-sub="${esc(u.sub)}">${ic("refresh")} صفر کردن مصرف</button>
+  <button data-act="u-hist" data-sub="${esc(u.sub)}">${ic("clock")} تاریخچه و مصرف کل <span class="mut small">${gb(u.life||u.used)} GB</span></button>
   <button class="danger" data-act="u-del" data-sub="${esc(u.sub)}">${ic("trash")} حذف کاربر</button></div>`);
 }
 
@@ -7583,6 +7697,7 @@ const ACTS={
   share:b=>{const u=userBy(b.dataset.sub);if(u)shareSheet(u)},
   edit:b=>{const u=userBy(b.dataset.sub);if(u)editSheet(u)},
   umore:b=>{const u=userBy(b.dataset.sub);if(u)moreSheet(u)},
+  "u-hist":b=>historySheet(b.dataset.sub),
   copy:b=>copy(b.dataset.text),
   nshare:b=>navigator.share({text:b.dataset.text}).catch(()=>{}),
   "u-enable":b=>{closeSheet();act(null,"user_enable",{sub:b.dataset.sub,enable:b.dataset.v==="1"})},
@@ -7705,8 +7820,8 @@ class App:
 
     @property
     def panel(self):
-        """The users' panel: NX when EZ sits on it, else 3x-ui."""
-        return self.nx_panel if self.rt.get("backend") == "nx" else self.xui_panel
+        """The users' panel: NX when EZ sits on it, else 3x-ui; every change to a user is written down."""
+        return LoggedPanel(self, self.nx_panel if self.rt.get("backend") == "nx" else self.xui_panel)
 
     @panel.setter
     def panel(self, value):
@@ -7750,6 +7865,9 @@ class UsageStore:
         con = sqlite3.connect(self.path, timeout=10)
         con.execute("CREATE TABLE IF NOT EXISTS daily (sub TEXT, day TEXT, bytes INTEGER, PRIMARY KEY (sub, day))")
         con.execute("CREATE TABLE IF NOT EXISTS last (sub TEXT PRIMARY KEY, used INTEGER, ts INTEGER)")
+        con.execute("CREATE TABLE IF NOT EXISTS life (sub TEXT PRIMARY KEY, bytes INTEGER, since INTEGER)")
+        con.execute("CREATE TABLE IF NOT EXISTS events (sub TEXT, ts INTEGER, who TEXT, what TEXT)")
+        con.execute("CREATE INDEX IF NOT EXISTS events_sub ON events (sub, ts)")
         return con
 
     def record(self, used_by_sub, now=None):
@@ -7768,8 +7886,61 @@ class UsageStore:
                         con.execute("INSERT INTO daily (sub, day, bytes) VALUES (?, ?, ?) ON CONFLICT (sub, day) "
                                     "DO UPDATE SET bytes = bytes + excluded.bytes", (sub, day, delta))
                     con.execute("INSERT OR REPLACE INTO last (sub, used, ts) VALUES (?, ?, ?)", (sub, used, int(now)))
+                    if sub.startswith("srv:"):
+                        continue
+                    if prev and used < prev:  # zeroed somewhere else (3x-ui itself): EZ's own resets set last to 0 first
+                        con.execute("INSERT INTO events (sub, ts, who, what) VALUES (?, ?, ?, ?)",
+                                    (sub, int(now), "بیرون از EZ", "مصرف صفر شد (مصرف قبلی %s گیگ)" % gb_text(prev)))
+                    if con.execute("UPDATE life SET bytes = bytes + ? WHERE sub = ?", (delta, sub)).rowcount == 0:
+                        seen = con.execute("SELECT COALESCE(SUM(bytes), 0) FROM daily WHERE sub = ?", (sub,)).fetchone()[0]
+                        con.execute("INSERT INTO life (sub, bytes, since) VALUES (?, ?, ?)", (sub, max(used, seen), int(now)))
                 con.execute("DELETE FROM daily WHERE day < ?", (tehran_day(now - self.KEEP_DAYS * 86400),))
                 con.commit()
+            finally:
+                con.close()
+
+    def before_reset(self, sub, used, now=None):
+        """EZ is about to zero a subscription's counter: count what it used up to now, then start again from 0
+        (so the sampler neither loses the last minutes nor takes the drop for an outside reset)."""
+        self.record({sub: used}, now)
+        with self.lock:
+            con = self._con()
+            try:
+                con.execute("UPDATE last SET used = 0 WHERE sub = ?", (sub,))
+                con.commit()
+            finally:
+                con.close()
+
+    def life(self, sub=None):
+        """All the traffic counted for one subscription since EZ began counting (bytes), or {sub: bytes} for all."""
+        with self.lock:
+            con = self._con()
+            try:
+                if sub is not None:
+                    row = con.execute("SELECT bytes, since FROM life WHERE sub = ?", (sub,)).fetchone()
+                    return (int(row[0]), int(row[1])) if row else (0, 0)
+                return {k: int(v) for k, v in con.execute("SELECT sub, bytes FROM life")}
+            finally:
+                con.close()
+
+    def event(self, sub, who, what, now=None):
+        if not sub:
+            return
+        with self.lock:
+            con = self._con()
+            try:
+                con.execute("INSERT INTO events (sub, ts, who, what) VALUES (?, ?, ?, ?)", (sub, int(now or time.time()), who, what[:300]))
+                con.execute("DELETE FROM events WHERE sub = ? AND ts < ?", (sub, int((now or time.time()) - 400 * 86400)))
+                con.commit()
+            finally:
+                con.close()
+
+    def events(self, sub, limit=50):
+        """[(ts, who, what)] newest first."""
+        with self.lock:
+            con = self._con()
+            try:
+                return con.execute("SELECT ts, who, what FROM events WHERE sub = ? ORDER BY ts DESC, rowid DESC LIMIT ?", (sub, limit)).fetchall()
             finally:
                 con.close()
 
@@ -8816,7 +8987,10 @@ class Bot:
         chat = (src.get("chat") or {}).get("id")
         with self.lock:
             lk = self.chat_locks.setdefault("%s:%s" % (net, chat), threading.Lock())
-        with lk:
+        who = (up.get("message") or up.get("callback_query") or {}).get("from") or {}
+        name = "ربات مدیر" if self.admin.is_owner(net, who.get("id")) else "مشتری %s" % (
+            " ".join(x for x in (who.get("first_name"), who.get("last_name")) if x) or who.get("username") or who.get("id") or "")
+        with lk, acting(name.strip()):
             try:
                 if up.get("message"):
                     self.handle(net, up["message"])
@@ -10796,6 +10970,10 @@ class Shop:
                 and ib.get("protocol") in ("vless", "vmess", "trojan", "shadowsocks")]
 
     def fulfil(self, o, by="", msg=None):
+        with acting("%s #%s%s" % (self.KINDS.get(o["kind"], o["kind"]), o["id"], " · " + by if by else "")):
+            return self._fulfil(o, by, msg)
+
+    def _fulfil(self, o, by="", msg=None):
         """Carry out a paid order. On a panel error the money goes to the wallet."""
         uid, net, chat = o["uid"], o["net"], o["chat"]
         u = self.user(uid)
@@ -10944,7 +11122,8 @@ class Shop:
         if not x.get("enable") and x.get("used", 0) >= x["total"]:
             ch["enable"] = True  # it had run out: the gift brings it back
         try:
-            self.app.panel.update_user(o["sub"], x["emails"], ch)
+            with acting("🍀 برکت سفارش #%s" % o["id"]):
+                self.app.panel.update_user(o["sub"], x["emails"], ch)
         except Exception as e:
             with self.lock:
                 o.pop("barakat_at", None)
@@ -11658,6 +11837,7 @@ class AdminBot:
         if not u:
             return self.show(net, chat, "این کاربر پیدا نشد.", [[("⬅️ کاربرها", "a:users:0")]], msg)
         text = self.sh.esc(self.bot.user_text(u, link=True))
+        text += "\n📊 مصرف کل: <b>%s گیگ</b>" % fa_num(gb_text(max(self.app.usage.life(sub)[0], u["used"])))
         if note_of(u):
             text += "\n\n📝 " + self.sh.esc(note_of(u))
         b = self.sh.buyers().get(sub)
@@ -11672,10 +11852,26 @@ class AdminBot:
                 [("🔄 تمدید ۳۰ روزه", "a:ux:%s:renew", "success"), ("♻️ صفر کردن مصرف", "a:ux:%s:reset")],
                 [("⏸ خاموش کن" if on else "▶️ روشن کن", "a:ux:%s:%s" % ("%s", "off" if on else "on"), "danger" if on else "success"),
                  ("🗑 حذف", "a:del:%s")],
-                [("📝 توضیحات", "a:un:%s"), ("🔳 کارت QR", "a:uq:%s")],
+                [("📝 توضیحات", "a:un:%s"), ("🔳 کارت QR", "a:uq:%s"), ("📜 تاریخچه", "a:uh:%s")],
                 [("⬅️ کاربرها", "a:users:0"), ("🏠 پنل", "a:home")]]
         rows = [[tuple([b[0], b[1].replace("%s", sub, 1)] + list(b[2:])) for b in row] for row in rows]
         self.card_photo(net, chat, sub, text, rows, msg)
+
+    def user_history(self, net, chat, sub, msg):
+        """Lifetime traffic and the last changes to one user, newest first."""
+        u = self.find(sub)
+        life, since = self.app.usage.life(sub)
+        lines = ["📜 <b>تاریخچه‌ی %s</b>" % self.sh.esc(u["name"] if u else sub), "",
+                 "📊 مصرف کل: <b>%s گیگ</b>" % fa_num(gb_text(max(life, u["used"] if u else 0)))]
+        if u:
+            lines.append("📦 این دوره: %s گیگ%s" % (fa_num(gb_text(u["used"])), " از %s" % fa_num(gb_text(u["total"])) if u["total"] else ""))
+        if since:
+            lines.append("🕰 شمارش از: %s" % fa_num(jalali_time(since)))
+        ev = self.app.usage.events(sub, 20)
+        lines.append("")
+        lines += ["▫️ %s\n     <i>%s · %s</i>" % (self.sh.esc(what), fa_num(jalali_time(ts)), self.sh.esc(who)) for ts, who, what in ev] or \
+                 ["هنوز تغییری ثبت نشده؛ از این به بعد هر تغییر با تاریخ و ساعت اینجا میاد."]
+        self.show(net, chat, "\n".join(lines)[:4000], [[("⬅️ کارت کاربر", "a:u:%s" % sub), ("🏠 پنل", "a:home")]], msg)
 
     QUICK = {"🛠 پنل مدیریت": "a:home", "🧾 رسیدها": "a:rcpt", "👥 کاربرها": "a:users:0", "➕ کاربر جدید": "a:new",
              "🧑‍💻 مشتری‌ها": "a:cus:0", "🎫 تیکت‌ها": "a:tks", "🛒 منوی فروشگاه": "m"}
@@ -12128,6 +12324,8 @@ class AdminBot:
         elif head == "ux":
             self.user_act(net, chat, parts[2], parts[3], mid)
             return "انجام شد"
+        elif head == "uh":
+            self.user_history(net, chat, parts[2], mid)
         elif head == "del":
             u = self.find(parts[2])
             self.show(net, chat, "🗑 <b>%s</b> برای همیشه حذف بشه؟" % self.sh.esc(u["name"] if u else parts[2]),
@@ -13278,7 +13476,8 @@ def make_handler(app):
                 return self.json(401, {"ok": False, "auth": "login"})
             if action == "logout":
                 return self.json(200, {"ok": True}, self.session_cookie("", 0))
-            status, out = do_action(app, action, body, self.host())
+            with acting("پنل مدیریت"):
+                status, out = do_action(app, action, body, self.host())
             cookie = self.session_cookie(app.auth.issue(), Auth.DAYS * 86400) if out.pop("renew", False) else None
             self.json(status, out, cookie)
 

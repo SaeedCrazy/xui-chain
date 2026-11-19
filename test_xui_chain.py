@@ -2004,6 +2004,16 @@ class ShopTests(BotBase):
         self.assertEqual(self.panel.updated[-1][2]["totalGB"], 20 * GB)
         self.admin_tap(42, "a:ux:sarasub12345:off")
         self.assertEqual(self.panel.updated[-1][2], {"enable": False})
+        m, _ = self.admin_tap(42, "a:uh:sarasub12345")  # lifetime traffic and every change, newest first
+        text = m.get("text") or m.get("caption") or ""
+        self.assertIn("📊 مصرف کل", text)
+        self.assertIn("غیرفعال شد", text)
+        self.assertLess(text.index("غیرفعال شد"), text.index("حجم"))
+        self.assertIn("a:u:sarasub12345", json.dumps(m["reply_markup"]))
+        with xc.acting("پنل مدیریت"):
+            self.app.panel.reset_user("sarasub12345", ["sara"])
+        self.assertEqual(self.app.usage.events("sarasub12345", 1)[0][1:], ("پنل مدیریت", self.app.usage.events("sarasub12345", 1)[0][2]))
+        self.assertTrue(self.app.usage.events("sarasub12345", 1)[0][2].startswith("مصرف صفر شد"))
         self.admin_tap(42, "a:ux:sarasub12345:delete")
         self.assertEqual(self.panel.deleted, ["sarasub12345"])
         # create a user step by step
@@ -3441,6 +3451,24 @@ class ConfigTests(unittest.TestCase):
 
 
 class UsageTests(unittest.TestCase):
+    def test_lifetime_total_and_change_log(self):
+        store = xc.UsageStore(os.path.join(tempfile.mkdtemp(), "u.db"))
+        t = 1_700_000_000
+        store.record({"s": 100, "srv:1:rx": 5}, now=t)
+        self.assertEqual(store.life("s"), (100, t))  # what the counter already held when counting began
+        store.record({"s": 300}, now=t + 600)
+        store.record({"s": 50}, now=t + 1200)        # zeroed in 3x-ui itself: written down, nothing lost
+        self.assertEqual(store.life("s")[0], 350)
+        self.assertIn("بیرون از EZ", [w for _, w, _ in store.events("s")])
+        store.before_reset("s", 80, now=t + 1800)   # EZ zeroes it: the last minutes count, no outside-reset entry
+        store.record({"s": 10}, now=t + 2400)
+        self.assertEqual(store.life("s")[0], 390)
+        self.assertEqual([w for _, w, _ in store.events("s")].count("بیرون از EZ"), 1)
+        store.event("s", "پنل مدیریت", "حجم از ۳۰ گیگ به ۵۰ گیگ", now=t + 3000)
+        self.assertEqual(store.events("s", 1)[0], (t + 3000, "پنل مدیریت", "حجم از ۳۰ گیگ به ۵۰ گیگ"))
+        self.assertEqual(store.life(), {"s": 390})  # server counters have no lifetime entry
+        self.assertEqual(xc.jalali_time(1763368200), "1404/08/26 · 12:00")
+
     def test_daily_usage_with_reset(self):
         store = xc.UsageStore(os.path.join(tempfile.mkdtemp(), "u.db"))
         day = 86400
