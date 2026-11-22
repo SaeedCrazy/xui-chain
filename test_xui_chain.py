@@ -274,24 +274,24 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual((rts[1]["entry"]["type"], rts[1]["entry"]["ip"], rts[1]["exit"]["id"]), ("server", "5.6.7.8", "main"))
         prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])
         by = {p["name"]: p for p in prof["proxies"]}
-        self.assertEqual((by["تانل ۱ · user1-reality"]["server"], by["تانل ۱ · user1-reality"]["port"]), ("5.6.7.8", 443))
-        self.assertEqual((by["تانل ۱ · user1-ws"]["server"], by["تانل ۱ · user1-ws"]["port"]), ("5.6.7.8", 2053))  # mapped port
-        self.assertEqual(by["تانل ۱ · user1-ws"]["servername"], "cdn.example.com")  # TLS name unchanged
-        self.assertFalse(any("تانل ۲" in n for n in by))  # down tunnel left out
+        self.assertEqual((by["T1 · user1-reality"]["server"], by["T1 · user1-reality"]["port"]), ("5.6.7.8", 443))
+        self.assertEqual((by["T1 · user1-ws"]["server"], by["T1 · user1-ws"]["port"]), ("5.6.7.8", 2053))  # mapped port
+        self.assertEqual(by["T1 · user1-ws"]["servername"], "cdn.example.com")  # TLS name unchanged
+        self.assertFalse(any(n.startswith("T2") for n in by))  # down tunnel left out
         groups = {g["name"]: g for g in prof["proxy-groups"]}
-        self.assertEqual(groups["⚡ Auto"]["proxies"][:4], ["Main · user1-reality", "Main · user1-ws", "تانل ۱ · user1-reality", "تانل ۱ · user1-ws"])
+        self.assertEqual(groups["⚡ Auto"]["proxies"][:4], ["Main · user1-reality", "Main · user1-ws", "T1 · user1-reality", "T1 · user1-ws"])
         confs = json.loads(xc.build_xray(own, ups, cfg, "t")[0])
         self.assertEqual([o["tag"] for o in confs[0]["outbounds"]][:4], ["me-direct-1", "me-direct-2", "me-tun-t1-1", "me-tun-t1-2"])
         tun = next(o for o in confs[0]["outbounds"] if o["tag"] == "me-tun-t1-2")
         self.assertEqual((tun["settings"]["vnext"][0]["address"], tun["settings"]["vnext"][0]["port"]), ("5.6.7.8", 2053))
-        self.assertIn("تانل ۱ · user1-ws", [c["remarks"] for c in confs])
+        self.assertIn("T1 · user1-ws", [c["remarks"] for c in confs])
         # skip_down off: the down tunnel is offered anyway (the app's own fallback handles it)
         prof = yaml.safe_load(xc.build_mihomo(own, ups, dict(cfg, skip_down=False))[0])
-        self.assertIn("تانل ۲", [p["name"] for p in prof["proxies"]])  # one config fits its single port, so no suffix
+        self.assertIn("T2", [p["name"] for p in prof["proxies"]])  # one config fits its single port, so no suffix
         # the user's configs live on another exit: the tunnel to this server carries nothing for them
         prof = yaml.safe_load(xc.build_mihomo(own, ups, dict(cfg, locations={"203.0.113.10": "DE"}))[0])
         names = [p["name"] for p in prof["proxies"]]
-        self.assertFalse(any("تانل" in n or n.startswith("Main") for n in names))
+        self.assertFalse(any(n.startswith(("T1 ", "T2 ")) or n.startswith("Main") for n in names))
         self.assertIn("DE · user1-reality", names)
         # a tunnel to a server that is not an exit yet
         de = {"id": "de1", "name": "DE", "host": "9.9.9.9", "role": "foreign", "facts": {"ip": "9.9.9.9"}}
@@ -304,7 +304,7 @@ class ProfileTests(unittest.TestCase):
         r = next(x for x in xc.routes(cfg4, []) if x["kind"] == "tunnel")
         self.assertEqual(r["exit"]["name"], "🇩🇪 آلمان")
         items = xc.route_items(r, own_de, cfg4)
-        self.assertEqual((items[0]["name"], items[0]["target"]["server"]), ("تانل ۱", "5.6.7.8"))
+        self.assertEqual((items[0]["name"], items[0]["target"]["server"]), ("T1 · 🇩🇪 آلمان", "5.6.7.8"))
         self.assertEqual(xc.route_items(r, own, cfg4), [])
         # a tunnel that does not carry the config's port gives nothing for it
         r = xc.routes(dict(cfg, tunnels=[dict(tunnels[0], ports="443")]), [])[1]
@@ -361,7 +361,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual((tun["remaining"], tun["exhausted"], tun["skip"]), (20 * xc.GB_BYTES, False, False))
         prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])
         groups = {g["name"]: g for g in prof["proxy-groups"]}
-        self.assertEqual(groups["⚡ Auto"]["proxies"], ["Main", "Deco1", "friend-b", "Deco2", "تانل"])  # cheapest first
+        self.assertEqual(groups["⚡ Auto"]["proxies"], ["Main", "Deco1", "friend-b", "Deco2", "T1"])  # cheapest first
         confs = json.loads(xc.build_xray(own, ups, cfg, "t")[0])
         self.assertEqual([o["tag"] for o in confs[0]["outbounds"] if o["tag"].startswith("me-")],
                          ["me-direct-1", "me-via-1-1", "me-own-2-1", "me-via-2-1", "me-tun-t1-1"])
@@ -371,8 +371,8 @@ class ProfileTests(unittest.TestCase):
         rts = xc.routes(cfg, ups, usage={"srv:ir1": 1001 * xc.GB_BYTES})
         tun = next(r for r in rts if r["key"] == "tun:t1")
         self.assertEqual((tun["remaining"], tun["exhausted"], tun["skip"]), (0, True, True))
-        self.assertIn("تانل", [p["name"] for p in yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])["proxies"]])  # no usage known
-        self.assertNotIn("تانل", [p["name"] for p in yaml.safe_load(xc.build_mihomo(own, ups, cfg, rts)[0])["proxies"]])
+        self.assertIn("T1", [p["name"] for p in yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])["proxies"]])  # no usage known
+        self.assertNotIn("T1", [p["name"] for p in yaml.safe_load(xc.build_mihomo(own, ups, cfg, rts)[0])["proxies"]])
         rts = xc.routes(dict(cfg, skip_exhausted=False), ups, usage={"srv:ir1": 1001 * xc.GB_BYTES})
         self.assertFalse(next(r for r in rts if r["key"] == "tun:t1")["skip"])
         # manual order with explicit positions; the rest keep their default place

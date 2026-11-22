@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.38.1"
+VERSION = "5.38.2"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -1106,6 +1106,7 @@ def routes(cfg, ups, usage=None, statuses=None, deco_down=None, nodes=None):
         order = (0 if cfg.get("direct_first", True) else 10 ** 6) + j
         r = add("direct>" + e["id"], "direct", name, order, direct, None, e, price=0 if main else None, exit_id=e["id"])
         r["used"] = used_of("srv:main", r) if main else None
+    irans = [x["id"] for x in cfg.get("servers") or [] if x.get("role") == "iran"]
     for k, t in enumerate(cfg.get("tunnels") or [], 1):
         if t.get("status") in ("failed", "setting-up"):
             continue
@@ -1116,8 +1117,9 @@ def routes(cfg, ups, usage=None, statuses=None, deco_down=None, nodes=None):
                  "host": (entry_srv or {}).get("domain") or ip}
         via = {"type": "deco", "name": t["via_name"]} if t.get("via_name") else None
         exit_ = exit_by.get(exit_id) or {"id": exit_id or "", "name": "؟"}
-        r = add("tun:" + t["id"], "tunnel", t.get("name") or entry["name"], 100 + k, entry, via, exit_, tunnel=t,
-                exit_id=exit_id, port_map=tunnel_port_map(t), server_id=t.get("entry"))
+        t_idx = irans.index(t.get("entry")) + 1 if t.get("entry") in irans else k
+        r = add("tun:" + t["id"], "tunnel", "T%d" % t_idx + ("" if exit_.get("id") == "main" else name_sep(cfg) + exit_["name"]),
+                100 + k, entry, via, exit_, tunnel=t, t_idx=t_idx, exit_id=exit_id, port_map=tunnel_port_map(t), server_id=t.get("entry"))
         r["down"] = statuses.get(t["id"], t.get("status")) == "down"
         r["used"] = used_of("srv:%s" % t.get("entry"), r)
         if not exit_id:
@@ -1240,7 +1242,7 @@ def routes_public(rts, pings=None):
     """Routes for the admin page (no node or tunnel objects)."""
     keep = ("key", "kind", "idx", "name", "show", "auto", "price", "unit", "quota_gb", "bill_day", "count", "order",
             "used", "remaining", "down", "exhausted", "skip", "cost", "quota_from_sub", "server_id", "exit_id", "note", "group",
-            "auto_name", "default_order", "entry_id", "entry_rank", "price_from_entry")
+            "auto_name", "default_order", "entry_id", "entry_rank", "price_from_entry", "t_idx")
     out = []
     for r in rts:
         d = {k: r.get(k) for k in keep}
@@ -3979,7 +3981,7 @@ def tunnel_status_script(t):
             "echo \"since=$(systemctl show %s -p ActiveEnterTimestamp --value 2>/dev/null)\"\n"
             "L=$(ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -u | tr '\\n' ' ')\n"
             "ok=0; for p in %s; do echo \" $L \" | grep -q \" $p \" && ok=$((ok+1)); done; echo \"listening=$ok/%d\"\n"
-            "echo \"log=$(journalctl -u %s -n 3 --no-pager -o cat 2>/dev/null | tail -c 300 | tr '\\n' ' ')\"\n"
+            "echo \"log=$(timeout 6 journalctl -u %s -n 3 --no-pager -o cat 2>/dev/null | tail -c 300 | tr '\\n' ' ')\"\n"
             % (unit, unit, listen, len(ports), unit))
 
 
@@ -4460,7 +4462,7 @@ class Net:
         for side in ("entry", "exit"):
             srv = self.server(t[side])
             try:
-                rc, out, err = Remote(srv).run(tunnel_status_script(t), 30)
+                rc, out, err = Remote(srv).run(tunnel_status_script(t), 60)
                 kv = parse_kv(out)
                 res[side] = {"active": kv.get("active", ""), "listening": kv.get("listening", ""), "log": kv.get("log", ""), "since": kv.get("since", "")}
             except SSHError as e:
@@ -6444,8 +6446,8 @@ const portsText=l=>`<span class="ltr">${l.join(", ")}</span>`;
 const lab=()=>S.state.settings.label_deco;
 const decoName=i=>isFa(lab())?lab()+" "+fa(i):lab()+i;
 const decoMono=(i,own)=>(own?"C":isFa(lab())?"V":lab().slice(0,1).toUpperCase())+i;
-const KIND={direct:"⌂",tunnel:"IR",custom:"⇄"};
-const routeMono=(r,lg)=>mono(r.kind==="deco"?decoMono(r.idx):r.kind==="own"?decoMono(r.idx,true):KIND[r.kind]||"•",r.down||r.exhausted?"bad":r.skip||!(r.show||r.auto)?"":r.kind==="direct"?"on":"",lg);
+const KIND={direct:"⌂",tunnel:"T",custom:"⇄"};
+const routeMono=(r,lg)=>mono(r.kind==="deco"?decoMono(r.idx):r.kind==="own"?decoMono(r.idx,true):r.kind==="tunnel"?"T"+(r.t_idx||""):KIND[r.kind]||"•",r.down||r.exhausted?"bad":r.skip||!(r.show||r.auto)?"":r.kind==="direct"?"on":"",lg);
 function hopName(h){if(!h)return "";if(h.type==="direct")return "مستقیم";if(h.type==="server")return h.name;return h.idx?decoName(h.idx):h.name}
 function chainText(r){
   const parts=[hopName(r.entry)];

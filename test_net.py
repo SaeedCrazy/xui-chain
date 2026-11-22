@@ -463,7 +463,7 @@ class NetTests(unittest.TestCase):
                               "ports": "443", "cport": 4000, "created": 1, "status": "up"})
         status, hdrs, text = xc.build_subscription("abc", "clash", self.app.rt, self.app)
         self.assertEqual(status, 200, text)
-        self.assertIn('name: "تانل ایران"', text)
+        self.assertIn('name: "T1"', text)  # tunnels are named T1, T2 … by their Iran server
         self.assertIn('server: "5.6.7.8"', text)
         self.assertNotIn('name: "DE1"', text)  # a Deco's own config that is neither shown nor in Auto is not sent
         self.net.drop_tunnel("tt1")
