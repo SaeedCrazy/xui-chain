@@ -364,6 +364,18 @@ class NetTests(unittest.TestCase):
         self.assertEqual((j["result"]["down_mbps"], j["result"]["up_mbps"], j["result"]["connect_ms"]), (91.5, 20.5, 38))
         self.assertTrue(any('"5201"' in s for s in scripts("iran.example")))  # bench port added to the tunnel
         self.assertTrue(any("iperf3 -s -p 5201" in s for s in scripts("de.example")))
+        # another engine for the same tunnel: same id and ports, the old one taken down first
+        clear()
+        j = self.job("change", lambda log: self.net.change_tunnel(t["id"], "gost", "tls", log))
+        self.assertEqual(j["status"], "done", j)
+        t2 = next(x for x in self.net.tunnels() if x["id"] == t["id"])
+        self.assertEqual((t2["engine"], t2["transport"], t2["ports"], t2["status"], t2["name"]), ("gost", "tls", "443, 2053=8443", "up", "اصلی"))
+        self.assertIn("EZ_REMOVE_OK", scripts("iran.example")[0])  # the Backhaul server went first
+        self.assertTrue(any("gost" in s for s in scripts("iran.example")))
+        self.assertEqual(len(self.net.tunnels()), 1)
+        j = self.job("change", lambda log: self.net.change_tunnel(t["id"], "gost", "nope", log))
+        self.assertIn("ترنسپورت", j["error"])
+        self.assertTrue(any('connection_pool = 16' in s for s in dd))  # more parallel connections through Backhaul
         clear()
         j = self.job("remove", lambda log: self.net.remove_tunnel(t["id"], log))
         self.assertEqual(j["status"], "done", j)

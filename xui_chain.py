@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.39.2"
+VERSION = "5.40.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -3662,12 +3662,12 @@ cat > /etc/sysctl.d/99-ez-xui.conf <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.ip_forward = 1
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
 net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_rmem = 4096 131072 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
@@ -3869,14 +3869,14 @@ def tunnel_scripts(t, entry, exit_, tunnel_ip):
         tls = tr in ("wss", "wssmux")
         plist = ", ".join('"%s=%s"' % (e, x) if e != x else '"%s"' % e for e, x in ports)
         server = ('[server]\nbind_addr = "0.0.0.0:%d"\ntransport = "%s"\ntoken = "%s"\nkeepalive_period = 75\nnodelay = true\n'
-                  'heartbeat = 40\nchannel_size = 2048\naccept_udp = %s\nsniffer = false\nweb_port = 0\nlog_level = "warn"\n'
+                  'heartbeat = 40\nchannel_size = 4096\naccept_udp = %s\nsniffer = false\nweb_port = 0\nlog_level = "warn"\n'
                   % (cport, tr, token, "true" if (tr == "tcp" and t.get("udp")) else "false"))
         if mux:
             server += "mux_con = 8\nmux_version = 1\nmux_framesize = 32768\nmux_recievebuffer = 4194304\nmux_streambuffer = 65536\n"
         if tls:
             server += 'tls_cert = "%s/conf/%s.crt"\ntls_key = "%s/conf/%s.key"\n' % (EZ_DIR, name, EZ_DIR, name)
         server += "ports = [%s]\n" % plist
-        client = ('[client]\nremote_addr = "%s:%d"\ntransport = "%s"\ntoken = "%s"\nconnection_pool = 8\naggressive_pool = false\n'
+        client = ('[client]\nremote_addr = "%s:%d"\ntransport = "%s"\ntoken = "%s"\nconnection_pool = 16\naggressive_pool = false\n'
                   'keepalive_period = 75\ndial_timeout = 10\nnodelay = true\nretry_interval = 3\nsniffer = false\nweb_port = 0\nlog_level = "warn"\n'
                   % (entry_ip, cport, tr, token))
         if mux:
@@ -4589,6 +4589,55 @@ class Net:
             log("پاک شد، با خطا: " + "؛ ".join(errors))
         return errors
 
+    TUNNEL_KEYS = ("priv", "pub", "uuid", "sid", "wg_entry_priv", "wg_entry_pub", "wg_exit_priv", "wg_exit_pub", "token",
+                   "bench", "bench_result", "check", "error")
+
+    def change_tunnel(self, tid, engine, transport, log):
+        """Another engine (or transport) for a working tunnel, same id, ports and route: the old one is taken
+        down, the new one set up; when the new one does not come up, the old one is put back."""
+        old = next((x for x in self.tunnels() if x["id"] == tid), None)
+        if not old:
+            raise PanelError("تانل پیدا نشد")
+        if engine not in ENGINES:
+            raise PanelError("نوع تانل نامعتبر")
+        transport = transport or (ENGINES[engine][2][0] if ENGINES[engine][2] else "")
+        if ENGINES[engine][2] and transport not in ENGINES[engine][2]:
+            raise PanelError("ترنسپورت نامعتبر")
+        entry, exit_ = self.facts_ok(self.server(old["entry"])), self.facts_ok(self.server(old["exit"]))
+        try:
+            gone = tunnel_scripts(old, entry, exit_, self._tunnel_ip(old))
+        except Exception:
+            gone = {}
+        log("پاک کردن تانل فعلی (%s %s)…" % (old["engine"], old.get("transport") or ""))
+        for side, srv in (("entry", entry), ("exit", exit_)):
+            if gone.get(side + "_remove"):
+                try:
+                    Remote(srv).check(gone[side + "_remove"], 120, "remove")
+                except SSHError as e:
+                    log("⚠️ %s: %s" % (srv["name"], e))
+        new = {k: v for k, v in old.items() if k not in self.TUNNEL_KEYS}
+        new.update(engine=engine, transport=transport, status="setting-up", cport=random.randint(20000, 60000),
+                   name=ENGINES[engine][0] if old.get("name") in (ENGINES.get(old["engine"], ("",))[0], "", None) else old["name"])
+        self.save_tunnel(new)
+        try:
+            self.apply_tunnel(new, log)
+            if next((x for x in self.tunnels() if x["id"] == tid), {}).get("status") != "up":
+                raise PanelError("تانل تازه بالا نیومد")
+            return {k: v for k, v in new.items() if k not in ("priv", "token")}
+        except Exception as e:
+            log("✗ %s — برگردوندن تانل قبلی…" % str(e)[:200])
+            try:
+                bad = tunnel_scripts(new, entry, exit_, self._tunnel_ip(new))
+                for side, srv in (("entry", entry), ("exit", exit_)):
+                    if bad.get(side + "_remove"):
+                        Remote(srv).run(bad[side + "_remove"], 120)
+            except Exception:
+                pass
+            back = dict(old, status="setting-up")
+            self.save_tunnel(back)
+            self.apply_tunnel(back, log)
+            raise PanelError("نوع تازه بالا نیومد؛ تانل قبلی برگشت (%s)" % str(e)[:160])
+
     def path_test(self, entry_id, exit_id, log):
         entry, exit_ = self.facts_ok(self.server(entry_id)), self.facts_ok(self.server(exit_id))
         ports = sorted({22, 443, 2053, int(exit_["facts"].get("xui_port") or 0) or 443, 8443})
@@ -5154,6 +5203,10 @@ def net_action(app, action, body, host, done, fail):
         t["ports"] = fmt_ports(ports)
         net.save_tunnel(t)
         return job("پورت‌های تانل %s" % t.get("name", ""), lambda log: net.apply_tunnel(t, log) and "ok")
+    if action == "tunnel_change":
+        tid, eng, tr = str(body.get("id", "")), str(body.get("engine", "")), str(body.get("transport", "") or "")
+        return job("تغییر نوع تانل به %s %s" % (ENGINES.get(eng, ("?",))[0], tr),
+                   lambda log: net.change_tunnel(tid, eng, tr, log))
     if action == "tunnel_bench":
         return job("بنچمارک تانل", lambda log: net.benchmark(str(body.get("id", "")), log))
     if action == "path_test":
@@ -6828,7 +6881,7 @@ function routeSheet(r){
    ${t.check&&t.check.exit&&t.check.exit.active&&t.check.exit.active!=="active"&&t.engine!=="direct"?`<div class="err">خروجی: ${esc(t.check.exit.active)} ${esc((t.check.exit.log||t.check.exit.error||"").slice(0,120))}</div>`:""}
    <div class="cols2" style="align-items:end"><label class="f" style="margin:6px 0"><span>پورت‌ها (ایران ← خارج)</span><input class="in ltr" data-tports value="${esc(t.ports)}" autocomplete="off"></label><button type="button" class="btn sm ghost" style="margin:6px 0" data-act="tun-ports" data-id="${t.id}">${ic("check")} ذخیره‌ی پورت‌ها</button></div>
    ${(r.need_ports||[]).length?`<div class="hint">inboundهای ${esc(r.exit.name)}: ${portsText(r.need_ports)}</div>`:""}
-   <div class="bar-btns"><button type="button" class="btn sm ghost" data-act="tun-status" data-id="${t.id}">${ic("refresh")} وضعیت</button><button type="button" class="btn sm ghost" data-act="tun-bench" data-id="${t.id}">${ic("chart")} سرعت</button><button type="button" class="btn sm ghost" data-act="tun-apply" data-id="${t.id}">${ic("zap")} راه‌اندازی دوباره</button><button type="button" class="btn sm danger" data-act="tun-del" data-id="${t.id}">${ic("trash")}</button></div></details>`:""}
+   <div class="bar-btns"><button type="button" class="btn sm ghost" data-act="tun-status" data-id="${t.id}">${ic("refresh")} وضعیت</button><button type="button" class="btn sm ghost" data-act="tun-bench" data-id="${t.id}">${ic("chart")} سرعت</button><button type="button" class="btn sm ghost" data-act="tun-type" data-id="${t.id}">${ic("zap")} نوع تانل</button><button type="button" class="btn sm ghost" data-act="tun-apply" data-id="${t.id}">${ic("zap")} راه‌اندازی دوباره</button><button type="button" class="btn sm danger" data-act="tun-del" data-id="${t.id}">${ic("trash")}</button></div></details>`:""}
   <div class="bar-btns"><button class="btn">${ic("check")} ذخیره</button><button type="button" class="btn ghost icon" data-act="ping" title="پینگ">${ic("wifi")}</button>${r.kind==="custom"?`<button type="button" class="btn danger icon" data-act="route-del" data-key="${esc(r.key)}" title="حذف">${ic("trash")}</button>`:""}</div>
   </form>`,el=>{
     const f=$("#rf",el);
@@ -7136,6 +7189,19 @@ function srvAddSheet(role){
     f.onsubmit=async e=>{e.preventDefault();const j=await act($("button.btn",f),"net_server_add",{name:f.sname.value.trim(),host:f.shost.value.trim(),port:f.sport.value,user:f.suser.value.trim(),password:f.spass.value,role});if(j.ok){closeSheet();watchJob(j.job)}};
   });
 }
+function tunSheet(t){
+  const E=S.state.net.engines||{},r=(S.state.routes||[]).find(x=>x.tunnel&&x.tunnel.id===t.id),b=t.bench_result;
+  const opts=Object.entries(E).flatMap(([k,e])=>(e.transports.length?e.transports:[""]).map(tr=>[k,tr,e.name+(tr?" · "+tr:"")]));
+  const tr=(S.state.net.trials||{})[t.entry+"|"+t.exit];
+  sheet(`<h3>${ic("zap")} نوع تانل ${r?esc(r.name):""}</h3>
+  <div class="kv"><span>الان</span><b class="ltr">${esc(t.engine)}${t.transport?" "+esc(t.transport):""}</b></div>
+  <div class="kv"><span>سرعت آخرین تست</span><span>${b&&b.down_mbps>0?`↓ ${mb(b.down_mbps)} · ↑ ${mb(b.up_mbps)} <span class="mut xs">${ago(b.at)}</span>`:'<span class="mut">تست نشده</span>'}</span></div>
+  ${tr&&tr.results?`<div class="sec"><h3>مقایسه‌ی روش‌ها</h3><span class="mut xs">${ago(tr.at)}</span></div><table class="tbl"><tr><th>روش</th><th>دانلود</th><th>آپلود</th></tr>${tr.results.map(x=>`<tr class="${tr.best&&x.label===tr.best.label?"best":""} ${x.ok?"":"off"}"><td>${esc(x.label)}${tr.best&&x.label===tr.best.label?" ★":""}</td><td class="ltr">${x.ok?mb(x.down_mbps):"—"}</td><td class="ltr">${x.ok?mb(x.up_mbps):esc((x.error||"").slice(0,40))}</td></tr>`).join("")}</table>`:""}
+  <label class="f"><span>نوع تازه</span><select class="in" id="tun-new">${opts.map(([k,trn,l])=>`<option value="${k}|${trn}" ${k===t.engine&&trn===(t.transport||"")?"selected":""}>${esc(l)}</option>`).join("")}</select></label>
+  <div class="hint">${esc((E[t.engine]||{}).note||"")} — موقع تغییر، تانل چند ثانیه قطع می‌شه؛ اگه نوع تازه بالا نیاد، قبلی خودکار برمی‌گرده.</div>
+  <div class="bar-btns"><button type="button" class="btn" data-act="tun-change" data-id="${t.id}">${ic("check")} تغییر نوع</button><button type="button" class="btn ghost" data-act="tun-bench" data-id="${t.id}">${ic("chart")} تست سرعت</button></div>
+  <button type="button" class="btn ghost block" style="margin-top:8px" data-act="tun-trial" data-id="${t.id}">${ic("zap")} مقایسه‌ی سرعت همه‌ی روش‌ها (بدون قطعی)</button>`);
+}
 function srvMoreSheet(s){
   const f=s.facts||{},tuned=f.cc==="bbr";const p=S.state.panel;
   const tools=Object.entries(f.tools||{}).filter(([k,v])=>v).map(([k])=>k);
@@ -7148,6 +7214,7 @@ function srvMoreSheet(s){
   <div class="menu">
   <button data-act="srv-refresh" data-id="${s.id}">${ic("refresh")} به‌روزرسانی مشخصات</button>
   ${!tuned?`<button data-act="srv-tune" data-id="${s.id}">${ic("zap")} بهینه‌سازی شبکه (BBR، بافرها)</button>`:""}
+  ${s.role==="iran"?(S.state.net.tunnels||[]).filter(t=>t.entry===s.id&&t.name!=="trial").map(t=>{const rt=(S.state.routes||[]).find(x=>x.tunnel&&x.tunnel.id===t.id);return `<button data-act="tun-type" data-id="${t.id}">${ic("zap")} تانل ${esc(rt?rt.name:t.name)}: <span class="ltr">${esc(t.engine)}${t.transport?" "+esc(t.transport):""}</span> <span class="mut small">تغییر نوع و سرعت</span></button>`}).join(""):""}
   ${s.role==="iran"?`<button data-act="route-add">${ic("plus")} تانل از این سرور (مسیر جدید)</button><button data-act="path" data-id="${s.id}">${ic("zap")} تست مسیر تا خروجی</button><button data-act="probe-pick" data-id="${s.id}">${ic("wifi")} تست کانفیگ‌ها از این سرور</button>`:""}
   ${!s.local?`<button data-act="srv-role" data-id="${s.id}" data-role="${s.role==="iran"?"foreign":"iran"}">${ic("globe")} تغییر نقش به ${s.role==="iran"?"خارج":"ایران"}</button>`:""}
   ${p.ok&&p.version===3&&!s.node_id&&!s.local&&s.role!=="iran"?`<button data-act="srv-node" data-id="${s.id}">${ic("plus")} تبدیل به خروجی (نود 3x-ui)</button>`:""}
@@ -7818,6 +7885,13 @@ const ACTS={
     const inp=box&&$("[data-tports]",box);const ports=b.dataset.ports||(inp?inp.value.trim():"");if(!ports)return;
     if(!await confirmSheet("پورت‌های تانل","تانل «"+esc(t.name)+"» با پورت‌های <span class=\"ltr\">"+esc(ports)+"</span> روی هر دو سرور دوباره راه‌اندازی می‌شه (چند ثانیه قطعی).","انجام بده"))return;
     const j=await act(null,"net_tunnel_ports",{id:t.id,ports});if(j.ok)watchJob(j.job)},
+  "tun-type":b=>{const t=(S.state.net.tunnels||[]).find(x=>x.id===b.dataset.id);if(t)tunSheet(t)},
+  "tun-change":async b=>{const t=(S.state.net.tunnels||[]).find(x=>x.id===b.dataset.id);const v=($("#tun-new")||{}).value||"";if(!t||!v)return;const [engine,transport]=v.split("|");
+    if(engine===t.engine&&transport===(t.transport||""))return toast("همین الان همینه");
+    if(!await confirmSheet("تغییر نوع تانل","تانل چند ثانیه قطع می‌شه و با نوع تازه بالا میاد. اگه بالا نیاد، قبلی برمی‌گرده.","تغییر بده"))return;
+    closeSheet();const j=await act(null,"net_tunnel_change",{id:t.id,engine,transport});if(j.ok)watchJob(j.job)},
+  "tun-trial":b=>{const t=(S.state.net.tunnels||[]).find(x=>x.id===b.dataset.id);if(!t)return;closeSheet();
+    act(b,"net_trial",{entry:t.entry,exit:t.exit,combos:[]}).then(j=>j.ok&&watchJob(j.job))},
   "tun-apply":b=>{closeSheet();act(b,"net_tunnel_apply",{id:b.dataset.id}).then(j=>j.ok&&watchJob(j.job))},
   "tun-del":async b=>{const t=S.state.net.tunnels.find(x=>x.id===b.dataset.id);if(t&&await confirmSheet("حذف تانل و مسیر",esc(t.name)+" از هر دو سرور پاک می‌شه.","حذف کن",true)){closeSheet();const j=await act(null,"net_tunnel_delete",{id:t.id});if(j.ok)watchJob(j.job)}},
   trial:()=>trialSheet(),
