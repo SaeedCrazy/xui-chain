@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.39.0"
+VERSION = "5.39.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -10232,10 +10232,28 @@ class Shop:
         rows = [[(self.plan_label(p), "tp:%s:%s" % (sub, p["id"]))] for p in sorted(ps, key=lambda p: float(p.get("gb") or 0))]
         self.show(net, chat, "➕ <b>حجم اضافه</b>\nبه حجم فعلیت اضافه می‌شه و روزها عوض نمی‌شن.", rows + [self.back("sv:%s" % sub)], msg)
 
+    TOPUP_MIN, TOPUP_MAX = 10000, 50000000  # toman
+
+    def custom_topup(self, net, chat, uid, text):
+        """A wallet top-up of the amount the customer typed («۱۵۰ هزار»، «150,000 تومان»)."""
+        t = str(text).translate(EN_DIGITS).replace("٬", "").replace(",", "").replace("،", "")
+        m = re.search(r"\d+(?:\.\d+)?", t)
+        amount = int(float(m.group(0)) * (1000 if "هزار" in t else 1000000 if "میلیون" in t else 1)) if m else 0
+        if "ریال" in t.translate(AR_LETTERS):
+            amount //= 10
+        if not self.TOPUP_MIN <= amount <= self.TOPUP_MAX:
+            self.wait["%s:%s" % (net, chat)] = {"what": "topup"}
+            return self.show(net, chat, "🔢 مبلغ رو به تومان و بین %s تا %s بفرست؛ مثلاً <code>150000</code>" % (
+                toman(self.TOPUP_MIN), toman(self.TOPUP_MAX)), [self.back("wallet")])
+        o = self.new_order(uid, net, chat, "topup", amount)
+        self.tell(uid, "✏️ شارژ دلخواه %s" % toman(amount))
+        return self.invoice(net, chat, o, None)
+
     def wallet_menu(self, net, chat, uid, msg):
         u = self.user(uid)
         amounts = [_int(a) for a in str(self.app.cfg.get("shop_topups") or "100000,200000,500000").split(",") if _int(a) > 0][:6]
         rows = [[(toman(a), "tu:%d" % a) for a in amounts[i:i + 2]] for i in range(0, len(amounts), 2)]
+        rows.append([("✏️ مبلغ دلخواه", "tuc", "primary")])
         mine = [x for x in self.d["ledger"] if x["uid"] == uid][-8:]
         hist = "".join("\n%s %s · %s%s · %s" % ("➕" if x["amount"] > 0 else "➖", toman(abs(x["amount"])), self.LEDGER.get(x["kind"], x["kind"]),
                                                " (%s)" % self.esc(x["note"]) if x.get("note") else "",
@@ -10481,6 +10499,8 @@ class Shop:
                 return self.apply_code(net, chat, uid, w["order"], text)
             if w["what"] == "gift":
                 return self.redeem(net, chat, uid, text)
+            if w["what"] == "topup":
+                return self.custom_topup(net, chat, uid, text)
             if w["what"] == "addsub":
                 return self.add_sub(net, chat, uid, text) or True
         cmd, _, arg = text.partition(" ")
@@ -11435,6 +11455,10 @@ class Shop:
                 return self.show(net, chat, "این سرویس مال تو نیست.", [self.back()], mid)
             o = self.new_order(uid, net, chat, {"bp": "buy", "rp": "renew", "tp": "traffic"}[head], p["price"], p, sub)
             return self.invoice(net, chat, o, mid)
+        if head == "tuc":
+            self.wait[cid] = {"what": "topup"}
+            return self.show(net, chat, "✏️ <b>شارژ با مبلغ دلخواه</b>\nمبلغ رو به <b>تومان</b> بفرست؛ مثلاً <code>150000</code>\n(از %s تا %s)" % (
+                toman(self.TOPUP_MIN), toman(self.TOPUP_MAX)), [self.back("wallet")], mid)
         if head == "tu":
             amount = _int(rest)
             ok = [_int(a) for a in str(self.app.cfg.get("shop_topups") or "100000,200000,500000").split(",")]

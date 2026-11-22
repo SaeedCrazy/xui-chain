@@ -2579,6 +2579,21 @@ class ShopTests(BotBase):
         start()
         self.assertTrue([m for m in BotAPI.sent if "keyboard" in (m.get("reply_markup") or {})])
 
+    def test_wallet_custom_amount(self):
+        self.assertIn("tuc", json.dumps(self.tap(1901, "wallet") and BotAPI.sent[-1]["reply_markup"]))
+        self.assertIn("تومان", self.tap(1901, "tuc"))
+        say = lambda text: self.bot.handle("tg", {"chat": {"id": 1901, "type": "private"}, "from": {"id": 1901}, "text": text})
+        BotAPI.sent = []
+        say("۵۰۰")  # too little: asked again
+        self.assertIn("بین", BotAPI.sent[-1]["text"])
+        n = len(self.shop.d["orders"])
+        say("۱۵۰ هزار")
+        o = self.shop.d["orders"][-1]
+        self.assertEqual((len(self.shop.d["orders"]), o["kind"], o["price"]), (n + 1, "topup", 150000))
+        self.tap(1901, "tuc")
+        say("2,500,000 ریال")
+        self.assertEqual(self.shop.d["orders"][-1]["price"], 250000)
+
     def test_qr_cards_first_and_later(self):
         d = xc.conf_path("brand")
         os.makedirs(d, exist_ok=True)
