@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.38.2"
+VERSION = "5.38.3"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -1208,7 +1208,12 @@ def route_items(r, own, cfg):
         else:
             m, hops = n, []
         items.append({"name": r["name"], "target": m, "hops": hops, "own": n})
-    if len(items) > 1:  # two inbounds on one exit: keep their remarks apart
+    if len(items) > 1 and r["name"] != r.get("auto_name", r["name"]):
+        # a name the owner typed shows exactly as typed; the configs differ only by invisible marks, so apps
+        # that need unique names (Clash) still tell them apart, and each shows its protocol under the name
+        for i, it in enumerate(items):
+            it["name"] = r["name"] + "\u200b" * i
+    elif len(items) > 1:  # two inbounds on one exit: keep their remarks apart
         for it, extra in zip(items, distinct_remarks([it["own"]["name"] for it in items])):
             it["name"] = "%s · %s" % (r["name"], extra) if extra and extra != r["name"] else r["name"]
     return items

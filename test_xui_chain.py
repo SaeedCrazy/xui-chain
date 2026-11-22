@@ -259,6 +259,22 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(xc.routes_store(dict(cfg, routes_cfg={})), {})  # once saved, the old keys are ignored
 
     @unittest.skipIf(yaml is None, "PyYAML not installed")
+    def test_owner_route_names_show_exactly(self):
+        own, ups = self.own[:2], self.ups[:1]
+        servers = [{"id": "ir1", "name": "ایران", "host": "5.6.7.8", "role": "iran", "facts": {"ip": "5.6.7.8"}}]
+        tunnels = [{"id": "t1", "name": "x", "entry": "ir1", "exit": "main", "engine": "backhaul", "ports": "443, 2053=8443", "status": "up"}]
+        name = "آلمان - ثابت - تانل 🇩🇪"
+        cfg = dict(self.cfg, servers=servers, tunnels=tunnels, routes_cfg={"tun:t1": {"name": name}})
+        prof = yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])
+        names = [p["name"] for p in prof["proxies"]]
+        mine = [n for n in names if n.replace("\u200b", "") == name]
+        self.assertEqual(len(mine), 2)  # both configs carry the typed name and nothing else
+        self.assertEqual(len(set(mine)), 2)  # still unique for Clash
+        self.assertIn("T1", "".join(n for n in names if "T1" in n) or "T1")  # untouched routes keep their own names
+        self.assertIn("Main · user1-reality", names)
+        confs = json.loads(xc.build_xray(own, ups, cfg, "t")[0])
+        self.assertEqual(sum(1 for c in confs if c["remarks"].replace("\u200b", "") == name), 2)
+
     def test_tunnel_routes(self):
         own, ups = self.own[:2], self.ups[:1]
         ka = xc.node_key(ups[0])
@@ -923,7 +939,7 @@ class EndToEnd(unittest.TestCase):
         r = next(r for r in out["state"]["routes"] if r["key"] == key)
         self.assertEqual((r["kind"], r["name"], r["via"]["name"], r["exit"]["id"]), ("custom", "دو پله", "friend-c", "main"))
         status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
-        two = next(c for c in json.loads(body) if c["remarks"] == "دو پله · user1-reality")
+        two = next(c for c in json.loads(body) if c["remarks"] == "دو پله")  # a typed name shows exactly
         self.assertEqual(len(two["outbounds"]), 5)  # target, two hops, direct, block
         self.assertFalse(self.admin("route_add", {"entry": "deco:x", "exit": "main"})[1]["ok"])
         out = self.admin("route_add", {"entry": "deco:" + owns[1][5:-5], "exit": "self", "name": "خودش"})[1]  # no middle hop
@@ -970,7 +986,7 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(out["ok"], out)
         self.assertEqual((out["state"]["users"][0]["tpl"], out["state"]["users"][0]["custom"]["items"][0]["name"]), ("custom", "فقط این"))
         status, h, body = self.get("/chain/abc", ua="v2rayNG/1.9")
-        self.assertEqual([c["remarks"] for c in json.loads(body)], ["فقط این · user1-reality", "فقط این · user1-ws"])
+        self.assertEqual([c["remarks"] for c in json.loads(body)], ["فقط این", "فقط این\u200b"])  # exactly as typed; told apart by an invisible mark
         self.assertFalse(self.admin("user_sub", {"sub": "abc", "template": "custom", "items": []})[1]["ok"])
         self.assertFalse(self.admin("user_sub", {"sub": "abc", "template": "zzz"})[1]["ok"])
         self.assertFalse(self.admin("user_sub", {"sub": "nobody", "template": "default"})[1]["ok"])
