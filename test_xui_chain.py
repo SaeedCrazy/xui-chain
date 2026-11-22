@@ -2565,6 +2565,20 @@ class ShopTests(BotBase):
             xc.save_config(cfg)
             self.app.reload()
 
+    def test_bottom_keyboard_is_coloured_and_comes_back(self):
+        start = lambda: self.bot.handle("tg", {"chat": {"id": 1801, "type": "private"}, "from": {"id": 1801, "first_name": "K"}, "text": "/start"})
+        BotAPI.sent = []
+        start()
+        kb = [m for m in BotAPI.sent if "keyboard" in (m.get("reply_markup") or {})]
+        self.assertEqual(kb[0]["reply_markup"]["keyboard"][0][0], {"text": "🛒 خرید سرویس", "style": "success"})
+        BotAPI.sent = []
+        start()  # right away: no second copy
+        self.assertFalse([m for m in BotAPI.sent if "keyboard" in (m.get("reply_markup") or {})])
+        self.shop.user("tg:1801")["kb_at"] -= 3600  # later (a cleared chat, a new phone): /start brings it back
+        BotAPI.sent = []
+        start()
+        self.assertTrue([m for m in BotAPI.sent if "keyboard" in (m.get("reply_markup") or {})])
+
     def test_qr_cards_first_and_later(self):
         d = xc.conf_path("brand")
         os.makedirs(d, exist_ok=True)

@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.38.3"
+VERSION = "5.38.4"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -8880,7 +8880,7 @@ class Bot:
                 return self.shop.barakat_preview(net, chat)
             if cmd in ("/start", "/admin", "/panel") and not (cmd == "/start" and arg.startswith(("s_", "r_"))):
                 self.admin.wait.pop(cid, None)
-                self.admin.give_kb(net, chat)
+                self.admin.give_kb(net, chat, force=True)
                 return self.admin.home(net, chat)
 
         code = (arg if cmd == "/start" else text).strip().upper()
@@ -9636,22 +9636,28 @@ class Shop:
             "trial": "trial", "gift": "gift", "ref": "ref", "help": "help", "guide": "guide", "m": "home", "app": "app",
             "pw": "ok", "ok": "ok", "a:ok": "ok", "no": "no", "x": "no", "a:no": "no", "a:home": "admin", "a:cust": "home"}
     QUICK = {"🛒 خرید سرویس": "buy", "📦 سرویس‌های من": "svc", "💰 کیف پول": "wallet", "🎫 پشتیبانی": "tk", "🏠 منوی اصلی": "m"}
-    QUICK_V = 1  # bump when the keyboard changes so everyone gets the new one
+    QUICK_V = 2  # bump when the keyboard changes so everyone gets the new one
 
-    def quick_kb(self):
-        return {"keyboard": [[{"text": "🛒 خرید سرویس"}, {"text": "📦 سرویس‌های من"}],
-                             [{"text": "💰 کیف پول"}, {"text": "🎫 پشتیبانی"}, {"text": "🏠 منوی اصلی"}]],
+    def quick_kb(self, net="tg"):
+        def b(text, style=None):  # Telegram colours reply buttons too (blue / green / red)
+            return dict({"text": text}, **({"style": style} if style and net == "tg" else {}))
+        return {"keyboard": [[b("🛒 خرید سرویس", "success"), b("📦 سرویس‌های من", "primary")],
+                             [b("💰 کیف پول", "primary"), b("🎫 پشتیبانی"), b("🏠 منوی اصلی")]],
                 "resize_keyboard": True, "is_persistent": True, "input_field_placeholder": "از منوی پایین انتخاب کن"}
 
-    def give_quick(self, net, chat, uid, text="⌨️ دکمه‌های اصلی پایین صفحه‌ست؛ هر وقت خواستی از اونجا بزن."):
-        """The main buttons stay at the bottom of the chat (a reply keyboard), sent once per customer."""
+    def give_quick(self, net, chat, uid, text="⌨️ دکمه‌های اصلی پایین صفحه‌ست؛ هر وقت خواستی از اونجا بزن.", force=False):
+        """The main buttons stay at the bottom of the chat (a reply keyboard): sent once per customer, and
+        again on /start (a cleared chat or another app loses it; the ⊞ button next to the text field brings it back)."""
         u = self.user(uid)
-        if u.get("kb") == self.QUICK_V or str(chat).startswith("-"):
+        fresh = u.get("kb") == self.QUICK_V
+        if (fresh and not (force and time.time() - u.get("kb_at", 0) > 600)) or str(chat).startswith("-"):
             return
+        if fresh:
+            text = "⌨️"
         try:
-            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": text, "reply_markup": self.quick_kb()})
+            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": text, "reply_markup": self.quick_kb(net)})
             with self.lock:
-                u["kb"] = self.QUICK_V
+                u["kb"], u["kb_at"] = self.QUICK_V, int(time.time())
             self.save()
         except (ValueError, OSError) as e:
             self.bot.log(net, chat, "shop", str(e)[:160])
@@ -10329,7 +10335,7 @@ class Shop:
             return self.phone_prompt(net, chat, first=True)
         if not self.joined(net, who.get("id")):
             return self.join_prompt(net, chat)
-        self.give_quick(net, chat, uid)
+        self.give_quick(net, chat, uid, force=True)
         self.main_menu(net, chat, uid)
 
     # shop rules, accepted once -------------------------------------------------------
@@ -10383,7 +10389,7 @@ class Shop:
             self.tell(uid, "📱 شماره‌ش رو تأیید کرد: +%s" % num)
         try:
             self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "✅ شماره‌ت ثبت شد. خوش اومدی!\n⌨️ دکمه‌های اصلی پایین صفحه‌ست.",
-                                               "reply_markup": self.quick_kb()})
+                                               "reply_markup": self.quick_kb(net)})
             with self.lock:
                 self.user(uid)["kb"] = self.QUICK_V
             self.save()
@@ -11885,26 +11891,29 @@ class AdminBot:
 
     QUICK = {"🛠 پنل مدیریت": "a:home", "🧾 رسیدها": "a:rcpt", "👥 کاربرها": "a:users:0", "➕ کاربر جدید": "a:new",
              "🧑‍💻 مشتری‌ها": "a:cus:0", "🎫 تیکت‌ها": "a:tks", "🛒 منوی فروشگاه": "m"}
-    QUICK_V = 1  # bump when the keyboard changes
+    QUICK_V = 2  # bump when the keyboard changes
 
-    def quick_kb(self):
-        return {"keyboard": [[{"text": "🛠 پنل مدیریت"}, {"text": "🧾 رسیدها"}],
-                             [{"text": "👥 کاربرها"}, {"text": "➕ کاربر جدید"}],
-                             [{"text": "🧑‍💻 مشتری‌ها"}, {"text": "🎫 تیکت‌ها"}, {"text": "🛒 منوی فروشگاه"}]],
+    def quick_kb(self, net="tg"):
+        def b(text, style=None):
+            return dict({"text": text}, **({"style": style} if style and net == "tg" else {}))
+        return {"keyboard": [[b("🛠 پنل مدیریت", "primary"), b("🧾 رسیدها", "success")],
+                             [b("👥 کاربرها", "primary"), b("➕ کاربر جدید", "success")],
+                             [b("🧑‍💻 مشتری‌ها"), b("🎫 تیکت‌ها"), b("🛒 منوی فروشگاه")]],
                 "resize_keyboard": True, "is_persistent": True, "input_field_placeholder": "مدیریت از دکمه‌های پایین"}
 
-    def give_kb(self, net, chat):
-        """The owner's buttons stay at the bottom of the chat (sent once, and again when they change)."""
+    def give_kb(self, net, chat, force=False):
+        """The owner's buttons stay at the bottom of the chat: sent once, again when they change, and on /start."""
         cid = "%s:%s" % (net, chat)
         a = self.bot.st["admins"].get(cid) or {}
-        if a.get("kb") == self.QUICK_V or str(chat).startswith("-"):
+        if (a.get("kb") == self.QUICK_V and not (force and time.time() - a.get("kb_at", 0) > 600)) or str(chat).startswith("-"):
             return
         try:
-            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "⌨️ دکمه‌های مدیریت پایین صفحه‌ست؛ دیگه لازم نیست برگردی بالا.",
-                                               "reply_markup": self.quick_kb()})
+            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "⌨️" if a.get("kb") == self.QUICK_V else
+                                               "⌨️ دکمه‌های مدیریت پایین صفحه‌ست؛ دیگه لازم نیست برگردی بالا.",
+                                               "reply_markup": self.quick_kb(net)})
             if cid in self.bot.st["admins"]:
                 with self.bot.lock:
-                    self.bot.st["admins"][cid]["kb"] = self.QUICK_V
+                    self.bot.st["admins"][cid]["kb"], self.bot.st["admins"][cid]["kb_at"] = self.QUICK_V, int(time.time())
                 self.bot.save()
         except (ValueError, OSError) as e:
             self.bot.log(net, chat, "admin", str(e)[:160])
