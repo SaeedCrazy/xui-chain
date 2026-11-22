@@ -358,6 +358,12 @@ class NetTests(unittest.TestCase):
         # status, bench, remove
         st = self.net.status_tunnel(t["id"])
         self.assertEqual(st["check"]["entry"]["active"], "active")
+        real = xc.Remote.run
+        xc.Remote.run = lambda self, *a, **k: (_ for _ in ()).throw(xc.SSHError("SSH: Timeout"))
+        try:  # the Iran server not answering SSH is not a tunnel down
+            self.assertEqual(self.net.status_tunnel(t["id"])["status"], "up")
+        finally:
+            xc.Remote.run = real
         clear()
         j = self.job("bench", lambda log: self.net.benchmark(t["id"], log))
         self.assertEqual(j["status"], "done", j)

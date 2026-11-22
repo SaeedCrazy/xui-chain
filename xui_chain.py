@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.40.0"
+VERSION = "5.40.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -4505,6 +4505,12 @@ class Net:
             up = res["entry"].get("active") == "active"
         elif t["engine"] in ("backhaul", "gost", "xray", "wireguard", "gre"):
             up = res["entry"].get("active") == "active" and res["exit"].get("active") == "active"
+        unreachable = any(res[side].get("active") == "unreachable" for side in ("entry", "exit"))
+        if unreachable and not up and t.get("status") == "up":
+            # SSH did not answer (a busy Iran server): that says nothing about the tunnel, so it keeps its state
+            t["check"] = dict(res, at=int(time.time() * 1000), note="ssh")
+            self.save_tunnel(t)
+            return t
         t["status"] = "up" if up else "down"
         t["check"] = dict(res, at=int(time.time() * 1000))
         self.save_tunnel(t)
