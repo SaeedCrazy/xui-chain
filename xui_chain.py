@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.39.1"
+VERSION = "5.39.2"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -10414,12 +10414,34 @@ class Shop:
     def phone_prompt(self, net, chat, first=False):
         title = self.esc(self.app.cfg.get("title") or NAME)
         text = ("%s سلام! به <b>%s</b> خوش اومدی.\n\n" % (self.em("hello", "👋"), title) if first else "") + \
-            "📱 برای شروع، با دکمه‌ی پایین <b>شماره‌ت رو تأیید کن</b>.\nشماره فقط برای پشتیبانی و امنیت حسابته و جایی نمایش داده نمی‌شه."
+            "📱 برای شروع، <b>شماره‌ت رو بفرست</b>:\n\n" \
+            "1️⃣ دکمه‌ی سبز «📱 ارسال شماره‌ی من» پایین صفحه رو بزن\n" \
+            "2️⃣ یا شماره‌ت رو همین‌جا تایپ کن، مثلاً <code>09121234567</code>\n\n" \
+            "🔒 شماره فقط برای پشتیبانی و امنیت حسابته و جایی نمایش داده نمی‌شه."
+        button = dict({"text": "📱 ارسال شماره‌ی من", "request_contact": True}, **({"style": "success"} if net == "tg" else {}))
         try:
             self.bot.call(net, "sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML", "reply_markup": {
-                "keyboard": [[{"text": "📱 ارسال شماره‌ی من", "request_contact": True}]], "resize_keyboard": True, "one_time_keyboard": True}})
+                "keyboard": [[button]], "resize_keyboard": True, "is_persistent": True,
+                "input_field_placeholder": "یا شماره‌ت رو تایپ کن: 09…"}})
+            self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "👇 دکمه رو نمی‌بینی؟ روی ⊞ کنار جای تایپ بزن، یا این دکمه رو:",
+                                               "reply_markup": self.kb([[("📱 دکمه‌ی ارسال شماره رو نشونم بده", "phk", "success")]], net)})
         except (ValueError, OSError) as e:
             self.bot.log(net, chat, "shop", str(e)[:160])
+
+    def typed_phone(self, text):
+        """A phone number typed as text -> digits with the country code («09121234567» -> 989121234567), or ""."""
+        d = re.sub(r"[\s\-()+.]", "", str(text).translate(EN_DIGITS))
+        if not d.isdigit():
+            return ""
+        if d.startswith("00"):
+            d = d[2:]
+        if re.fullmatch(r"09\d{9}", d):
+            d = "98" + d[1:]
+        elif re.fullmatch(r"9\d{9}", d):
+            d = "98" + d
+        if re.fullmatch(r"989\d{9}", d):
+            return d
+        return "" if self.app.cfg.get("shop_phone_ir") or not 8 <= len(d) <= 15 else d
 
     def got_contact(self, net, chat, who, contact):
         uid = "%s:%s" % (net, who.get("id", chat))
@@ -10430,12 +10452,16 @@ class Shop:
         if self.app.cfg.get("shop_phone_ir") and not (num.startswith("98") and len(num) == 12):
             self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "⚠️ فقط شماره‌ی ایران (۹۸+) قبوله."})
             return True
+        return self.phone_saved(net, chat, uid, who, num)
+
+    def phone_saved(self, net, chat, uid, who, num, typed=False):
         with self.lock:
             had = self.user(uid, who).get("phone")
             self.user(uid, who)["phone"] = "+" + num
+            self.user(uid, who)["phone_typed"] = typed  # typed by hand: not confirmed by Telegram
         self.save()
         if not had:
-            self.tell(uid, "📱 شماره‌ش رو تأیید کرد: +%s" % num)
+            self.tell(uid, "📱 شماره‌ش رو %s: +%s" % ("تایپ کرد" if typed else "تأیید کرد", num))
         try:
             self.bot.call(net, "sendMessage", {"chat_id": chat, "text": "✅ شماره‌ت ثبت شد. خوش اومدی!\n⌨️ دکمه‌های اصلی پایین صفحه‌ست.",
                                                "reply_markup": self.quick_kb(net)})
@@ -10464,6 +10490,13 @@ class Shop:
         if msg.get("contact"):
             return self.got_contact(net, chat, who, msg["contact"])
         text = (msg.get("text") or "").strip()
+        if text and not text.startswith("/") and text not in self.QUICK and self.rules_ok(uid) and self.need_phone(uid):
+            num = self.typed_phone(text)  # the number typed instead of the button
+            if num:
+                return self.phone_saved(net, chat, uid, who, num, typed=True)
+            self.show(net, chat, "🔢 شماره رو این‌شکلی بفرست: <code>09121234567</code>\nیا دکمه‌ی سبز «📱 ارسال شماره‌ی من» پایین صفحه رو بزن.",
+                      [[("📱 دکمه‌ی ارسال شماره رو نشونم بده", "phk", "success")]])
+            return True
         if text in self.QUICK:  # the keyboard at the bottom of the chat
             self.wait.pop(cid, None)
             self.tell(uid, "👆 " + text, taps=True)
@@ -12794,6 +12827,22 @@ def _fmt_num(x):
     return str(int(x)) if x == int(x) else ("%.1f" % x)
 
 
+_TG_JS = {"at": 0, "body": ""}
+
+
+def telegram_webapp_js():
+    """telegram-web-app.js fetched by the server once a day; customers in Iran cannot reach telegram.org."""
+    if _TG_JS["body"] and time.time() - _TG_JS["at"] < 86400:
+        return _TG_JS["body"]
+    try:
+        status, hdrs, body = http_get("https://telegram.org/js/telegram-web-app.js", timeout=10)
+        if status == 200 and "Telegram" in body:
+            _TG_JS.update(at=time.time(), body=body)
+    except Exception as e:
+        print("telegram-web-app.js: %s" % e, flush=True)
+    return _TG_JS["body"] or "/* telegram-web-app.js unavailable: the page reads its login from the address */"
+
+
 APP_HEADERS = {
     "Content-Type": "text/html; charset=utf-8",
     "Cache-Control": "no-store",
@@ -12810,7 +12859,7 @@ APP_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <title>فروشگاه</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="tg.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css">
 <style>
 :root{--brandc:var(--brand,var(--tg-theme-button-color,#4f8cff));--bg:var(--tg-theme-bg-color,#0f1420);--sec:var(--tg-theme-secondary-bg-color,#161d2d);--fg:var(--tg-theme-text-color,#eef2fb);--mut:var(--tg-theme-hint-color,#8d99b5);
@@ -12883,6 +12932,9 @@ h2 small{color:var(--mut);font-weight:500;font-size:12.5px}
 <script>
 "use strict";
 const tg=window.Telegram&&Telegram.WebApp;tg&&(tg.ready(),tg.expand());
+/* Telegram also puts the signed login in the address (#tgWebAppData=…): enough even when its script cannot load */
+const INIT=(()=>{let v=(tg&&tg.initData)||new URLSearchParams(location.hash.slice(1)).get("tgWebAppData")||"";
+  try{if(v)sessionStorage.setItem("tg_init",v);else v=sessionStorage.getItem("tg_init")||""}catch(e){}return v})();
 const q=v=>esc(JSON.stringify(String(v??"")));
 const $=s=>document.querySelector(s),esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fa=n=>String(n).replace(/\d/g,d=>"۰۱۲۳۴۵۶۷۸۹"[d]);
@@ -12893,7 +12945,7 @@ const okHap=t=>{try{tg.HapticFeedback.notificationOccurred(t)}catch(e){}};
 function toast(t){const e=$("#toast");e.textContent=t;e.classList.add("show");clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove("show"),2400)}
 let D=null,tab="home",busy=false;
 async function api(action,body={}){
-  const r=await fetch("api",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...body,action,initData:tg?tg.initData:""})});
+  const r=await fetch("api",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...body,action,initData:INIT})});
   const j=await r.json().catch(()=>({ok:false,error:"خطای شبکه"}));
   if(!j.ok&&j.join){sheet(`<h3>📢 عضویت در کانال</h3><p class="mut">برای خرید، اول عضو کانال ما شو.</p><button class="btn block" onclick="tg.openTelegramLink(${q(j.join)})">عضویت در کانال</button><div style="height:8px"></div><button class="btn ghost block" onclick="closeSheet();load()">✅ عضو شدم</button>`)}
   return j;
@@ -13428,6 +13480,9 @@ def make_handler(app):
             u, parts = self.route()
             if parts == ["app"]:
                 return self.send(200, branded(APP_HTML, app.cfg, "app"), APP_HEADERS)
+            if parts == ["app", "tg.js"]:  # Telegram's mini app script, through this server (telegram.org is filtered in Iran)
+                return self.send(200, telegram_webapp_js(), {"Content-Type": "application/javascript; charset=utf-8",
+                                                             "Cache-Control": "public, max-age=86400", "X-Content-Type-Options": "nosniff"})
             if len(parts) == 2 and parts[0] == "sms":
                 return self.sms(parts, u)
             if len(parts) == 2 and parts[0] == "brand" and brand_file(parts[1]):

@@ -826,7 +826,16 @@ class EndToEnd(unittest.TestCase):
     def test_mini_app_routes(self):
         status, h, body = self.get("/app/")
         self.assertEqual(status, 200)
-        self.assertIn("telegram-web-app.js", body)
+        self.assertIn('<script src="tg.js">', body)  # Telegram's script comes through this server
+        self.assertIn("tgWebAppData", body)  # and the login is read from the address when it cannot load
+        real = xc.http_get
+        xc.http_get = lambda *a, **k: (200, {}, "window.Telegram={WebApp:{}}")
+        xc._TG_JS.update(at=0, body="")
+        try:
+            status, h, js = self.get("/app/tg.js")
+            self.assertEqual((status, js), (200, "window.Telegram={WebApp:{}}"))
+        finally:
+            xc.http_get = real
         req = urllib.request.Request(self.base + "/app/api", data=json.dumps({"action": "state", "initData": "x=1&hash=00"}).encode())
         try:
             urllib.request.urlopen(req, timeout=10)
@@ -2726,7 +2735,10 @@ class ShopTests(BotBase):
         BotAPI.outside = True
         BotAPI.sent = []
         self.bot.handle("tg", {"chat": {"id": 995, "type": "private"}, "from": {"id": 995}, "text": "/start"})
-        self.assertTrue(BotAPI.sent[-1]["reply_markup"]["keyboard"][0][0]["request_contact"])
+        kb = next(m for m in BotAPI.sent if "keyboard" in (m.get("reply_markup") or {}))
+        self.assertTrue(kb["reply_markup"]["keyboard"][0][0]["request_contact"])
+        self.assertTrue(kb["reply_markup"]["is_persistent"])  # stays in sight
+        self.assertIn("phk", json.dumps(BotAPI.sent[-1]["reply_markup"]))  # «I can't see the button» brings it back
         self.assertIn("شماره", self.tap(995, "buy") + json.dumps(BotAPI.other, ensure_ascii=False))
         self.bot.handle("tg", {"chat": {"id": 995, "type": "private"}, "from": {"id": 995},
                                "contact": {"user_id": 111, "phone_number": "+989121234567"}})  # someone else's number
@@ -2740,6 +2752,16 @@ class ShopTests(BotBase):
         self.assertEqual(self.shop.user("tg:995")["phone"], "+989121234567")
         self.assertIn("خوش اومدی", BotAPI.sent[-1]["text"])  # channel switch is off: straight to the menu
         self.assertFalse(self.shop.app_api({"id": 996}, "state", {})[0])  # the mini app asks for the phone too
+        # typing the number works too
+        say = lambda text: self.bot.handle("tg", {"chat": {"id": 1995, "type": "private"}, "from": {"id": 1995}, "text": text})
+        say("/start")
+        BotAPI.sent = []
+        say("سلام")  # not a number: asked again, not taken for a subscription link
+        self.assertIn("09121234567", BotAPI.sent[-1]["text"])
+        say("۰۹۱۳ ۸۵۴ ۵۲۶۶")
+        u = self.shop.user("tg:1995")
+        self.assertEqual((u["phone"], u["phone_typed"]), ("+989138545266", True))
+        self.assertEqual(self.shop.typed_phone("+44 7700 900123"), "")  # Iranian numbers only here
 
     def test_server_status_for_customers(self):
         text = self.tap(997, "st")
