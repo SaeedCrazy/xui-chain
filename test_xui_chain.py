@@ -3487,6 +3487,28 @@ class ConfigTests(unittest.TestCase):
                     f.write(keep)
 
 
+class UpstreamChangeTests(unittest.TestCase):
+    def test_a_refresh_tells_what_changed(self):
+        up = xc.Upstreams()
+        url = "https://friend.example/sub"
+        bodies = ["vless://a@1.1.1.1:443#Alpha\nvless://b@1.1.1.2:443#Beta", "vless://a@1.1.1.1:443#Alpha\nvless://c@1.1.1.3:443#Gamma"]
+        real = xc.http_get
+        xc.http_get = lambda *a, **k: (200, {}, bodies.pop(0))
+        try:
+            up._fetch_sub(url)
+            self.assertEqual(up.changed_since(0), {})  # the first copy is the baseline
+            t0 = time.time()
+            with up.lock:
+                up.cache.clear()
+            up._fetch_sub(url)
+            ch = up.changed_since(t0)
+            self.assertEqual((ch[url]["added"], ch[url]["removed"]), (["Gamma"], ["Beta"]))
+            self.assertIn("کانفیگ تازه (Gamma)", up.change_text(ch))
+            self.assertGreater(up.fetched[url], 0)
+        finally:
+            xc.http_get = real
+
+
 class UsageTests(unittest.TestCase):
     def test_lifetime_total_and_change_log(self):
         store = xc.UsageStore(os.path.join(tempfile.mkdtemp(), "u.db"))

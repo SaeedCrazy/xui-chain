@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.38.4"
+VERSION = "5.39.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -1051,7 +1051,7 @@ def deco_groups(cfg, ups):
         g = by.get(src)
         if g is None:
             g = by[src] = {"id": sub_gid(src), "title": UPSTREAMS.titles.get(src) or urllib.parse.urlsplit(src).hostname or src[:40],
-                           "first": i, "last": i, "count": 0}
+                           "first": i, "last": i, "count": 0, "fetched": int(UPSTREAMS.fetched.get(src, 0) * 1000)}
             out.append(g)
         g["last"], g["count"] = i, g["count"] + 1
     for g in out:
@@ -1969,6 +1969,9 @@ class Upstreams:
         self.info = {}
         self.titles = {}  # subscription URL -> its own profile title, when it sends one
         self.hidden = set()  # node keys the admin deleted; left out of every route
+        self.fetched = {}  # subscription URL -> when it was last read
+        self.prev = {}     # subscription URL -> its links last time (kept across a refresh)
+        self.changes = {}  # subscription URL -> {"at", "added": [names], "removed": [names]}
         self.lock = threading.Lock()
 
     def _fetch_sub(self, url):
@@ -1989,6 +1992,13 @@ class Upstreams:
             raise
         with self.lock:
             self.cache[url] = (time.time(), links)
+            self.fetched[url] = time.time()
+            old = self.prev.get(url)
+            if old is not None and set(old) != set(links):
+                name = lambda l: urllib.parse.unquote(l.rsplit("#", 1)[1]).strip() if "#" in l else l[:24]
+                self.changes[url] = {"at": time.time(), "added": [name(l) for l in links if l not in set(old)],
+                                     "removed": [name(l) for l in old if l not in set(links)]}
+            self.prev[url] = links
             info = parse_userinfo(hdrs.get("subscription-userinfo"))
             if info:
                 self.info[url] = info
@@ -2001,6 +2011,24 @@ class Upstreams:
         with self.lock:
             self.cache.clear()
         return self.nodes()
+
+    def changed_since(self, t):
+        """{url: change} for the subscriptions whose configs changed after t."""
+        with self.lock:
+            return {u: c for u, c in self.changes.items() if c["at"] >= t}
+
+    def change_text(self, changes):
+        """«DECOXUI: ۲ کانفیگ تازه (A، B)، ۱ حذف شد» lines, or ""."""
+        out = []
+        for url, c in changes.items():
+            title = self.titles.get(url) or urllib.parse.urlsplit(url).hostname or url[:40]
+            parts = []
+            if c["added"]:
+                parts.append("%s کانفیگ تازه (%s)" % (fa_num(len(c["added"])), "، ".join(c["added"][:4]) + ("…" if len(c["added"]) > 4 else "")))
+            if c["removed"]:
+                parts.append("%s حذف شد" % fa_num(len(c["removed"])))
+            out.append("• %s: %s" % (title, "، ".join(parts) or "کانفیگ‌ها عوض شدن"))
+        return "\n".join(out)
 
     def lines(self, text=None):
         text = load_upstreams_text() if text is None else text
@@ -4643,7 +4671,7 @@ class Net:
         entries = []
         rts = live_routes(self.app, rt, ups)
         for r in apply_view(rts, sub_view(rt, sub)) if sub else rts:
-            if r["skip"] or (sub and not (r["show"] or r["auto"])) or (not sub and r["kind"] != "own"):
+            if (sub and not (r["show"] or r["auto"])) or (not sub and r["kind"] != "own"):
                 continue
             try:
                 items = route_items(r, own, rt)
@@ -4658,7 +4686,7 @@ class Net:
                 entries.append((len(entries), chain, first["server"], first["port"], it["name"], r["key"]))
         if not entries:
             raise PanelError("کانفیگی برای تست نیست")
-        entries = entries[:12]
+        entries = entries[:24]
         log("تست %d مسیر از %s (هر کدام تا ۲۵ ثانیه)…" % (len(entries), srv["name"]))
         script = probe_script([(i, ob, h, p) for i, ob, h, p, _, _ in entries], rt.get("probe_url") or "https://speed.cloudflare.com/__down?bytes=10000000")
         out = Remote(srv).check(script, 60 + 35 * len(entries), "probe")
@@ -5136,11 +5164,12 @@ def net_action(app, action, body, host, done, fail):
             combos = [("direct", ""), ("backhaul", "tcpmux"), ("gost", "tls"), ("xray", "reality"), ("wireguard", ""), ("gre", "")]
         return job("مقایسه‌ی روش‌های تانل", lambda log: net.trial(str(body.get("entry", "")), str(body.get("exit", "")), combos, log))
     if action == "route_test":
-        sub = str(body.get("sub", ""))
+        sub = str(body.get("sub", "")) or test_sub(app)
         return job("تست کانفیگ‌ها از این سرور", lambda log: route_tests(app, sub, log))
 
     if action == "probe":
-        return job("تست از ایران", lambda log: net.probe(str(body.get("server", "")), str(body.get("sub", "")), log))
+        sub = str(body.get("sub", "")) or test_sub(app)
+        return job("تست اتصال از سرور ایران", lambda log: net.probe(str(body.get("server", "")), sub, log))
     if action == "node_from_server":
         return job("ساخت لوکیشن از سرور", lambda log: net.node_from_server(str(body.get("id", "")), str(body.get("name", "")).strip()[:40],
                                                                         body.get("template"), bool(body.get("attach")), log))
@@ -5729,9 +5758,10 @@ def do_action(app, action, body, host):
             return done("اولویت و قیمت ورودی‌ها ذخیره شد")
 
         if action == "decos_refresh":
-            before = len(UPSTREAMS.nodes())
+            t0 = time.time()
             after = len(UPSTREAMS.refresh())
-            return done("کانفیگ‌های واسط به‌روز شد (%d کانفیگ)" % after)
+            ch = UPSTREAMS.changed_since(t0)
+            return done("به‌روز شد (%d کانفیگ)%s" % (after, ("؛ " + UPSTREAMS.change_text(ch).replace("\n", "؛ ").replace("• ", "")) if ch else "؛ تغییری نبود"))
 
         if action == "route_add":
             cfg = load_config()
@@ -6441,7 +6471,7 @@ document.addEventListener("click",e=>{const h=e.target.closest("[data-gtoggle]")
 function groupSummary(gid,rts){
   const g=grpById(gid),d=decoOfGroup(gid),q=d&&d.quota,down=rts.filter(r=>r.down).length;
   const left=q&&q.total?Math.max(0,q.total-(q.upload||0)-(q.download||0)):null;
-  return `${fa(g.count)} کانفیگ، ${fa(rts.length)} مسیر${down?`، <span class="bad">${fa(down)} قطع</span>`:""}${left!=null?`، ${gb(left)} GB مانده`:""}`;
+  return `${fa(g.count)} کانفیگ، ${fa(rts.length)} مسیر${down?`، <span class="bad">${fa(down)} قطع</span>`:""}${left!=null?`، ${gb(left)} GB مانده`:""}${g.fetched?`، آپدیت ${ago(g.fetched)}`:""}`;
 }
 const foldOf=(t,gid)=>((t&&t.collapse)||{})[gid];
 const portsMissing=r=>(r.missing_ports||[]).length>0;
@@ -6563,7 +6593,7 @@ SEGV.routes=()=>{
       return used.map(r=>routeRow(r,null,true)).join("")+(un.length?`<div data-gbox><div class="row btn-row ghead" data-gtoggle="${esc(id)}">${chev(open)}<div class="t"><b class="mut">${fa(un.length)} مسیر استفاده‌نشده</b><small>توی هیچ سابی نیستن</small></div></div><div class="gbody" ${open?"":"hidden"}>${un.map(r=>routeRow(r,null,true)).join("")}</div></div>`:"")};
     return `<div class="list">${withUnused(solo.map(b=>b.items[0]),"unused")||`<div class="empty">${ic("route")}<p>هنوز مسیری نیست.</p></div>`}</div>`+
     bl.filter(b=>b.gid).map(b=>{const g=grpById(b.gid),open=isOpen(b.gid);
-      return `<div class="list" data-gbox><div class="row btn-row ghead" data-gtoggle="${esc(b.gid)}">${chev(open)}<div class="t"><b>${esc(g.title)}</b><small>${groupSummary(b.gid,b.items)}</small></div><div class="r">${foldOf(def,b.gid)?`<span class="tag acc">یکی توی اپ</span>`:""}</div></div>
+      return `<div class="list" data-gbox><div class="row btn-row ghead" data-gtoggle="${esc(b.gid)}">${chev(open)}<div class="t"><b>${esc(g.title)}</b><small>${groupSummary(b.gid,b.items)}</small></div><div class="r">${foldOf(def,b.gid)?`<span class="tag acc">یکی توی اپ</span>`:""}<button type="button" class="abtn" data-act="deco-refresh" title="آپدیت ساب (خودکار هر ساعت)">${ic("refresh")} آپدیت</button></div></div>
       <div class="gbody" ${open?"":"hidden"}>${withUnused(b.items,"u"+b.gid)}</div></div>`}).join("")})()}
   ${probeCard()}`;
 };
@@ -6767,8 +6797,11 @@ function probeCard(){
   const probes=Object.values(S.state.net.probes||{});if(!probes.length)return "";
   const p=probes.sort((a,b)=>b.at-a.at)[0];
   const best=p.rows.filter(r=>r.ok&&r.mbps).sort((a,b)=>b.mbps-a.mbps)[0];
-  return `<div class="sec"><h3>تست از ایران</h3><span class="mut xs">${esc(p.server)}، ${ago(p.at)}${p.sub?"، "+esc((userBy(p.sub)||{}).name||""):""}</span></div><div class="card">
-  <table class="tbl"><tr><th>مسیر</th><th>پینگ</th><th>پاسخ</th><th>دانلود</th></tr>${p.rows.map(r=>`<tr class="${best&&r===best?"best":""} ${r.ok?"":"off"}"><td>${esc(r.name)}${best&&r===best?" ★":""}</td><td class="ltr">${ms_(r.tcp_ms)}</td><td class="ltr">${r.ok?ms_(r.ttfb_ms):"قطع"}</td><td class="ltr">${r.ok?mb(r.mbps):"—"}</td></tr>`).join("")}</table></div>`;
+  const up=p.rows.filter(r=>r.ok).length;
+  return `<div class="sec"><h3>تست اتصال از سرور ایران</h3><span class="mut xs">${esc(p.server)}، ${ago(p.at)}</span></div><div class="card">
+  <div class="kv" style="margin-bottom:6px"><span>${up===p.rows.length?"✅ همه‌ی مسیرها وصلن":up?"⚠️ بعضی مسیرها قطعن":"❌ هیچ مسیری وصل نیست"}</span><b>${fa(up)} از ${fa(p.rows.length)} وصل</b></div>
+  <table class="tbl"><tr><th>مسیر</th><th>وضعیت</th><th>پینگ</th><th>سرعت</th></tr>${p.rows.map(r=>`<tr class="${best&&r===best?"best":""} ${r.ok?"":"off"}"><td>${esc(r.name)}${best&&r===best?" ★":""}</td><td>${r.ok?'<span class="ok">✅ وصل</span>':'<span class="bad">❌ قطع</span>'}</td><td class="ltr">${r.ok?ms_(r.tcp_ms):"—"}</td><td class="ltr">${r.ok?mb(r.mbps):"—"}</td></tr>`).join("")}</table>
+  <div class="hint">از سرور ایران تو، مثل گوشی یه کاربر توی ایران، به هر مسیر وصل شد. ★ = سریع‌ترین.</div></div>`;
 }
 function routeSheet(r){
   const s=S.state.settings,t=r.tunnel,ir=iranPing(r),ping=r.ping;
@@ -6825,13 +6858,11 @@ function autoSheet(){
 }
 function pingSheet(){
   const users=S.state.users.filter(u=>u.sub),irans=S.state.net.servers.filter(s=>s.role==="iran");
-  sheet(`<h3>${ic("wifi")} پینگ کانفیگ‌ها</h3><p class="mut small">همه‌ی کانفیگ‌هایی که توی ساب یه کاربر میاد تست می‌شه: از همین سرور (پینگ و اتصال واقعی با هسته‌ی Xray) و اگه بخوای از سرور ایران (پینگ، زمان پاسخ و سرعت دانلود؛ همون چیزی که کاربر می‌بینه).</p><form id="pf">
-  <label class="f"><span>کانفیگ‌های کدام کاربر</span><select class="in" name="sub">${users.slice(0,80).map(u=>`<option value="${esc(u.sub)}">${esc(u.name)}</option>`).join("")}</select></label>
-  <div class="mut small" style="margin:8px 0 4px">از کجا</div>
-  <label class="check"><input type="checkbox" name="here" checked><span>از این سرور</span></label>
-  ${irans.length?`<label class="check"><input type="checkbox" name="iran" checked><span>از ایران</span></label><select class="in" name="server">${irans.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select>`:`<div class="hint">برای تست از ایران، در «ورودی‌ها» یه سرور ایران اضافه کن.</div>`}
-  <button class="btn block" style="margin-top:12px">${ic("check")} شروع</button></form>`,el=>{
-    const f=$("#pf",el);f.onsubmit=async e=>{e.preventDefault();const sub=f.sub.value;const here=f.here.checked,iran=f.elements.namedItem("iran")&&f.elements.namedItem("iran").checked;
+  sheet(`<h3>${ic("wifi")} تست اتصال</h3><p class="mut small">${irans.length?"از سرور ایران تو، مثل گوشی یه کاربر توی ایران، به همه‌ی مسیرهای ساب وصل می‌شه و می‌گه کدوم وصله، پینگ و سرعتش چقدره.":"برای اینکه ببینی کاربرهای ایران وصل می‌شن یا نه، در «ورودی‌ها» سرور ایرانت رو اضافه کن."}</p><form id="pf">
+  ${irans.length?`<input type="hidden" name="iran_on" value="1">${irans.length>1?`<label class="f"><span>سرور ایران</span><select class="in" name="server">${irans.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select></label>`:`<input type="hidden" name="server" value="${irans[0].id}">`}`:""}
+  <label class="check"><input type="checkbox" name="here" ${irans.length?"":"checked"}><span>از همین سرور خارج هم تست کن</span></label>
+  <button class="btn block" style="margin-top:12px">${ic("check")} شروع تست</button></form>`,el=>{
+    const f=$("#pf",el);f.onsubmit=async e=>{e.preventDefault();const sub="";const here=f.here.checked,iran=!!f.elements.namedItem("iran_on");
       if(!here&&!iran)return;const b=$("button.btn",f);let last=null;
       if(here){const j=await act(b,"net_route_test",{sub});if(j.ok)last=j.job}
       if(iran){const j=await act(b,"net_probe",{server:f.server.value,sub});if(j.ok)last=j.job}
@@ -12961,6 +12992,31 @@ def backup_loop(app):
         time.sleep(600)
 
 
+def upstream_loop(app, every=3600):
+    """Every hour: read the other people's subscriptions again; new or removed configs are told to the admins."""
+    time.sleep(90)
+    UPSTREAMS.nodes()  # a first copy to compare with
+    while True:
+        time.sleep(every)
+        try:
+            t0 = time.time()
+            UPSTREAMS.refresh()
+            ch = UPSTREAMS.changed_since(t0)
+            if ch:
+                app.bot.notify_admins("deco", "🔄 ساب‌های واسط به‌روز شدن:\n" + UPSTREAMS.change_text(ch))
+        except Exception as e:
+            print("upstream refresh error: %s" % e, flush=True)
+
+
+def test_sub(app):
+    """Whose configs a connection test uses when nobody is picked: an active user (the configs, not the
+    person, are what is tested: every user gets the same routes)."""
+    now = time.time() * 1000
+    users = [u for u in group_users(clients_of(app)) if u.get("sub") and u.get("enable", True)]
+    ok = [u for u in users if not (u["expiry"] > 0 and u["expiry"] < now) and not (u["total"] and u["used"] >= u["total"])]
+    return ((ok or users) or [{"sub": ""}])[0]["sub"]
+
+
 def usage_loop(app, every=600):
     time.sleep(20)
     while True:
@@ -13590,6 +13646,7 @@ def serve(app):
     print("panel subscription: %s" % rt["xui_sub_url"], flush=True)
     threading.Thread(target=app.monitor.loop, daemon=True).start()
     threading.Thread(target=usage_loop, args=(app,), daemon=True).start()
+    threading.Thread(target=upstream_loop, args=(app,), daemon=True).start()
     threading.Thread(target=backup_loop, args=(app,), daemon=True).start()
     threading.Thread(target=app.bot.loop, daemon=True).start()
     threading.Thread(target=app.panel.overview, daemon=True).start()  # automatic panel connection
