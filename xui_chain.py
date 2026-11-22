@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.40.1"
+VERSION = "5.40.2"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -3836,7 +3836,8 @@ def tunnel_scripts(t, entry, exit_, tunnel_ip):
     eng, tid = t["engine"], t["id"]
     ports = parse_ports(t.get("ports", ""))
     if t.get("bench"):
-        ports.append((str(BENCH_PORT), str(BENCH_PORT)))
+        bp = str(t.get("bench_port") or BENCH_PORT)
+        ports.append((bp, bp))
     flat = expand_ports(ports)
     cport = int(t.get("cport") or 0)
     token = t.get("token") or secrets.token_hex(12)
@@ -4028,17 +4029,19 @@ def bench_scripts(t, entry, exit_, tunnel_ip):
     else:
         target = "127.0.0.1"
     bind = "" if eng == "direct" else ("-B %s " % (tunnel_ip + ".2") if eng in ("wireguard", "gre") else "-B 127.0.0.1 ")
-    exit_script = BASH_LIB + "pkg iperf3\npkill -f 'iperf3 -s -p %d' 2>/dev/null || true\nnohup iperf3 -s -p %d %s-1 -D >/dev/null 2>&1\nsleep 1\necho EZ_BENCH_SERVER_OK\n" % (BENCH_PORT, BENCH_PORT, bind)
+    # a server for two minutes (not a one-shot -1: the connect check before the test would use it up)
+    bp = int(t.get("bench_port") or BENCH_PORT)
+    exit_script = BASH_LIB + "pkg iperf3\npkill -f 'iperf3 -s -p %d' 2>/dev/null || true\n(setsid timeout 120 iperf3 -s -p %d %s>/dev/null 2>&1 &)\nsleep 1\necho EZ_BENCH_SERVER_OK\n" % (bp, bp, bind)
     entry_script = (BASH_LIB + "pkg iperf3\n"
                     "t0=$(date +%%s%%N); timeout 5 bash -c 'cat < /dev/null > /dev/tcp/%s/%d' 2>/dev/null && echo \"connect_ms=$(( ($(date +%%s%%N)-t0)/1000000 ))\" || echo connect_ms=-1\n"
-                    "iperf3 -c %s -p %d -t 6 -R -J 2>/dev/null | python3 -c 'import sys,json\n"
+                    "sleep 1\niperf3 -c %s -p %d -t 6 -P 4 -R -J 2>/dev/null | python3 -c 'import sys,json\n"
                     "try:\n d=json.load(sys.stdin); e=d[\"end\"]; r=e.get(\"sum_received\") or e.get(\"sum\"); print(\"down_mbps=%%.1f\" %% (r[\"bits_per_second\"]/1e6)); print(\"retrans=%%s\" %% e.get(\"sum_sent\",{}).get(\"retransmits\",\"\"))\n"
-                    "except Exception as ex: print(\"down_mbps=-1\"); print(\"err=%%s\" %% ex)' 2>/dev/null\n"
+                    "except Exception as ex: print(\"down_mbps=-1\"); print(\"err=%%s\" %% (d.get(\"error\") if \"d\" in dir() and isinstance(d, dict) else ex))' 2>/dev/null\n"
                     "sleep 1\n"
-                    "iperf3 -c %s -p %d -t 5 -J 2>/dev/null | python3 -c 'import sys,json\n"
+                    "iperf3 -c %s -p %d -t 5 -P 4 -J 2>/dev/null | python3 -c 'import sys,json\n"
                     "try:\n d=json.load(sys.stdin); r=d[\"end\"].get(\"sum_received\") or d[\"end\"][\"sum\"]; print(\"up_mbps=%%.1f\" %% (r[\"bits_per_second\"]/1e6))\n"
                     "except Exception: print(\"up_mbps=-1\")' 2>/dev/null\n"
-                    "echo EZ_BENCH_OK\n" % (target, BENCH_PORT, target, BENCH_PORT, target, BENCH_PORT))
+                    "echo EZ_BENCH_OK\n" % (target, bp, target, bp, target, bp))
     return entry_script, exit_script
 
 
@@ -4688,7 +4691,7 @@ class Net:
         results = []
         for eng, tr in combos:
             t = {"id": "t" + secrets.token_hex(2), "name": "trial", "entry": entry_id, "exit": exit_id, "engine": eng,
-                 "transport": tr, "ports": "", "cport": random.randint(30000, 60000), "bench": True,
+                 "transport": tr, "ports": "", "cport": random.randint(30000, 60000), "bench": True, "bench_port": BENCH_PORT + 1,
                  "created": int(time.time() * 1000), "status": "setting-up"}
             label = ENGINES[eng][0] + (" · " + tr if tr else "")
             log("▶ %s" % label)
