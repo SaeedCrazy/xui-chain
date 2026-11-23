@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.40.2"
+VERSION = "5.41.0"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -2618,6 +2618,45 @@ def expiry_text(ms):
     return jalali_time(ms / 1000).split(" · ")[0]
 
 
+def new_sub_id():
+    """A fresh subscription token (the 3x-ui client's subId)."""
+    return "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(16))
+
+
+def change_sub_link(app, old):
+    """A new subscription link for the same service: the old link stops working at once; volume, time,
+    configs, its history, its owner in the bot, auto-renew and its own sub settings all stay. -> new token"""
+    if on_nx(app):
+        raise PanelError("روی NX لینک ساب مال خود NX‌ه؛ از اونجا عوضش کن")
+    u = next((x for x in group_users(clients_of(app)) if x.get("sub") == old), None)
+    if not u:
+        raise PanelError("این اشتراک پیدا نشد")
+    new = new_sub_id()
+    app.panel.update_user(old, u["emails"], {"subId": new})
+    cfg = load_config()
+    if old in (cfg.get("user_subs") or {}):
+        cfg["user_subs"] = {(new if k == old else k): v for k, v in cfg["user_subs"].items()}
+        save_config(cfg)
+        app.reload()
+    try:
+        app.usage.rename(old, new)
+    except Exception as e:
+        print("usage rename: %s" % e, flush=True)
+    bot = getattr(app, "bot", None)
+    if bot:
+        with bot.lock:
+            for c in bot.st["customers"].values():
+                if c.get("sub") == old:
+                    c["sub"] = new
+            for k in [k for k in bot.st.get("sent") or {} if k.startswith(old + "|")]:
+                bot.st["sent"][new + k[len(old):]] = bot.st["sent"].pop(k)
+        bot.save()
+        bot.shop.rename_sub(old, new)
+        bot.users_changed()
+    app.usage.event(new, getattr(ACTOR, "who", "") or "سیستم", "لینک ساب عوض شد؛ لینک قبلی دیگه کار نمی‌کنه")
+    return new
+
+
 class LoggedPanel:
     """The users' panel as EZ uses it, writing down every change to a user (who, when, what) and counting
     the traffic a reset is about to zero into that user's lifetime total."""
@@ -2874,7 +2913,7 @@ class PanelAPI:
         chosen = [inbounds[i] for i in inbound_ids if i in inbounds]
         if not chosen:
             raise PanelError("حداقل یک inbound انتخاب کن")
-        sub_id = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(16))
+        sub_id = new_sub_id()
         base = {"email": name, "enable": True, "subId": sub_id, "limitIp": int(devices),
                 "totalGB": int(float(gb) * 1024 ** 3), "comment": clean_note(note) or "EZ-XUI",
                 "expiryTime": 0 if not days else (-int(days) * 86400000 if first_use else
@@ -6009,6 +6048,11 @@ def do_action(app, action, body, host):
             return 200, {"ok": True, "life": max(life, u["used"]), "since": since * 1000,
                          "events": [{"at": ts * 1000, "who": who, "what": what} for ts, who, what in app.usage.events(u["sub"], 100)]}
 
+        if action == "user_newlink":
+            u = find_user(str(body.get("sub", "")))
+            new = change_sub_link(app, u["sub"])
+            return done("لینک تازه ساخته شد؛ قبلی باطل شد", sub=new)
+
         if action == "user_note":
             u = find_user(str(body.get("sub", "")))
             app.panel.update_user(u["sub"], u["emails"], {"comment": clean_note(body.get("note")) or "EZ-XUI"})
@@ -7421,6 +7465,7 @@ function moreSheet(u){
   <button data-act="edit" data-sub="${esc(u.sub)}">${ic("edit")} تمدید و ویرایش</button>
   <button data-act="u-enable" data-sub="${esc(u.sub)}" data-v="${u.enable?0:1}">${ic("power")} ${u.enable?"غیرفعال کردن":"فعال کردن"}</button>
   <button data-act="u-reset" data-sub="${esc(u.sub)}">${ic("refresh")} صفر کردن مصرف</button>
+  <button data-act="u-newlink" data-sub="${esc(u.sub)}">${ic("refresh")} لینک ساب تازه (قبلی باطل)</button>
   <button data-act="u-hist" data-sub="${esc(u.sub)}">${ic("clock")} تاریخچه و مصرف کل <span class="mut small">${gb(u.life||u.used)} GB</span></button>
   <button class="danger" data-act="u-del" data-sub="${esc(u.sub)}">${ic("trash")} حذف کاربر</button></div>`);
 }
@@ -7813,6 +7858,9 @@ const ACTS={
   edit:b=>{const u=userBy(b.dataset.sub);if(u)editSheet(u)},
   umore:b=>{const u=userBy(b.dataset.sub);if(u)moreSheet(u)},
   "u-hist":b=>historySheet(b.dataset.sub),
+  "u-newlink":async b=>{const u=userBy(b.dataset.sub);if(!u)return;
+    if(await confirmSheet("لینک ساب تازه","برای "+esc(u.name)+" یه لینک تازه ساخته می‌شه و لینک قبلی همون لحظه کار نمی‌کنه. حجم و زمان دست نمی‌خوره.","لینک تازه",true)){
+      closeSheet();act(null,"user_newlink",{sub:u.sub},j=>{const n=j.state.users.find(x=>x.sub===j.sub);if(n)setTimeout(()=>shareSheet(n),300)})}},
   copy:b=>copy(b.dataset.text),
   nshare:b=>navigator.share({text:b.dataset.text}).catch(()=>{}),
   "u-enable":b=>{closeSheet();act(null,"user_enable",{sub:b.dataset.sub,enable:b.dataset.v==="1"})},
@@ -8029,6 +8077,17 @@ class UsageStore:
             con = self._con()
             try:
                 con.execute("UPDATE last SET used = 0 WHERE sub = ?", (sub,))
+                con.commit()
+            finally:
+                con.close()
+
+    def rename(self, old, new):
+        """The traffic, lifetime total and change log of a subscription follow it to its new token."""
+        with self.lock:
+            con = self._con()
+            try:
+                for table in ("daily", "last", "life", "events"):
+                    con.execute("UPDATE OR IGNORE %s SET sub = ? WHERE sub = ?" % table, (new, old))
                 con.commit()
             finally:
                 con.close()
@@ -9776,6 +9835,19 @@ class Shop:
         except (ValueError, OSError) as e:
             self.bot.log(net, chat, "shop", str(e)[:160])
 
+    def rename_sub(self, old, new):
+        with self.lock:
+            for u in self.d["users"].values():
+                if old in (u.get("subs") or []):
+                    u["subs"] = [new if s_ == old else s_ for s_ in u["subs"]]
+                for key in ("auto", "auto_last"):
+                    if old in (u.get(key) or {}):
+                        u[key][new] = u[key].pop(old)
+            for o in self.d["orders"]:
+                if o.get("sub") == old:
+                    o["sub"] = new
+        self.save()
+
     def blocked(self, uid):
         return bool((self.d["users"].get(uid) or {}).get("blocked"))
 
@@ -10305,7 +10377,8 @@ class Shop:
         rows.append([("📱 صفحه‌ی اشتراک و آموزش", self.bot.sub_link(sub))])
         if net == "tg":
             rows.append([("📋 کپی لینک اشتراک", "copy:" + self.bot.sub_link(sub))])
-        rows.append([("🔳 QR کد اشتراک", "qr:%s" % sub), ("🙅 درخواست لغو", "cx:%s" % sub)])
+        rows.append([("🔳 QR کد اشتراک", "qr:%s" % sub), ("🔄 لینک تازه", "nl:%s" % sub)])
+        rows.append([("🙅 درخواست لغو", "cx:%s" % sub)])
         rows.append([("🗑 حذف از لیست من", "svd:%s" % sub, "danger")])
         rows.append(self.back("svc"))
         self.show(net, chat, "\n".join(lines), rows, msg)
@@ -11500,6 +11573,23 @@ class Shop:
             return self.svc_menu(net, chat, uid, mid, renew=True)
         if head == "svc":
             return self.svc_menu(net, chat, uid, mid)
+        if head in ("nl", "nly"):
+            x = next((x for sb, x in self.services(uid, cid) if sb == rest and x), None)
+            if not x:
+                return self.svc_menu(net, chat, uid, mid)
+            if head == "nl":
+                return self.show(net, chat, "🔄 <b>لینک تازه برای «%s»</b>\n\nیه لینک اشتراک جدید می‌گیری و <b>لینک قبلی دیگه کار نمی‌کنه</b> "
+                                 "(مثلاً وقتی لینکت دست کس دیگه افتاده). حجم و زمانت دست نمی‌خوره؛ فقط باید لینک تازه رو توی اپ اضافه کنی." % self.esc(x["name"]),
+                                 [[("✅ لینک تازه بده", "nly:%s" % rest, "danger")], [("⬅️ نه", "sv:%s" % rest)]], mid)
+            try:
+                with acting("مشتری (لینک تازه)"):
+                    new = change_sub_link(self.app, rest)
+            except PanelError as e:
+                return self.show(net, chat, "⚠️ نشد: %s" % self.esc(str(e)[:160]), [self.back("sv:%s" % rest)], mid)
+            self.tell(uid, "🔄 لینک اشتراک %s رو عوض کرد" % x["name"])
+            self.send_qr(net, chat, new, "🔄 <b>لینک تازه‌ی «%s»</b>\nلینک قبلی باطل شد. این لینک رو توی اپ اضافه کن (قبلی رو پاک کن):\n\n<code>%s</code>" % (
+                self.esc(x["name"]), self.esc(self.bot.sub_link(new))), [[("📦 سرویس", "sv:%s" % new)]], plain=True)
+            return None
         if head in ("cx", "cxy"):
             x = next((x for sb, x in self.services(uid, cid) if sb == rest and x), None)
             if not x:
@@ -12040,9 +12130,21 @@ class AdminBot:
                 [("⏸ خاموش کن" if on else "▶️ روشن کن", "a:ux:%s:%s" % ("%s", "off" if on else "on"), "danger" if on else "success"),
                  ("🗑 حذف", "a:del:%s")],
                 [("📝 توضیحات", "a:un:%s"), ("🔳 کارت QR", "a:uq:%s"), ("📜 تاریخچه", "a:uh:%s")],
+                [("🔄 لینک ساب تازه (قبلی باطل)", "a:unl:%s")],
                 [("⬅️ کاربرها", "a:users:0"), ("🏠 پنل", "a:home")]]
         rows = [[tuple([b[0], b[1].replace("%s", sub, 1)] + list(b[2:])) for b in row] for row in rows]
         self.card_photo(net, chat, sub, text, rows, msg)
+
+    def new_gb_step(self, net, chat, w, msg=None):
+        rows = [[("%s گیگ" % fa_num(g) if g else "♾ نامحدود", "a:ng:%d" % g) for g in r] for r in ((10, 20, 30), (50, 100, 0))]
+        self.show(net, chat, "👤 <b>%s</b>\nحجم رو انتخاب کن یا «دلخواه» رو بزن:" % self.sh.esc(w["name"]),
+                  rows + [[("✏️ حجم دلخواه", "a:ngx", "primary")], [("✖️ انصراف", "a:home", "danger")]], msg)
+
+    def new_days_step(self, net, chat, w, msg=None):
+        rows = [[("%s روز" % fa_num(d) if d else "♾ بدون محدودیت", "a:nd:%d" % d) for d in r] for r in ((30, 60, 90), (7, 180, 0))]
+        self.show(net, chat, "👤 <b>%s</b> · %s\nمدت رو انتخاب کن یا «دلخواه» رو بزن:" % (
+            self.sh.esc(w["name"]), "%s گیگ" % fa_num(_fmt_num(w["gb"])) if w["gb"] else "نامحدود"),
+            rows + [[("✏️ مدت دلخواه", "a:ndx", "primary")], [("✖️ انصراف", "a:home", "danger")]], msg)
 
     def user_history(self, net, chat, sub, msg):
         """Lifetime traffic and the last changes to one user, newest first."""
@@ -12439,6 +12541,20 @@ class AdminBot:
                     return self.show(net, chat, "⚠️ ذخیره نشد: %s" % self.sh.esc(str(e)[:160]), [[("⬅️ کارت کاربر", "a:u:%s" % w["sub"])]]) or True
             self.user_card(net, chat, w["sub"], None, note="✅ توضیحات ذخیره شد")
             return True
+        if what in ("new_gb", "new_days"):  # a custom volume or duration for the new user, typed
+            t = str(text).translate(EN_DIGITS).replace("٫", ".").replace("/", ".")
+            m = re.search(r"\d+(?:\.\d+)?", t)
+            v = float(m.group(0)) if m else -1
+            if what == "new_gb" and 0 < v <= 100000:
+                w["what"], w["gb"] = "new", int(v) if v == int(v) else round(v, 2)
+                self.new_days_step(net, chat, w)
+            elif what == "new_days" and 0 < v <= 3650 and v == int(v):
+                w["what"], w["days"] = "new", int(v)
+                self.new_confirm(net, chat, w)
+            else:
+                self.show(net, chat, "🔢 فقط عدد بفرست؛ مثلاً %s" % ("<code>15</code> (گیگ)" if what == "new_gb" else "<code>45</code> (روز)"),
+                          [[("✖️ انصراف", "a:home", "danger")]])
+            return True
         if what == "new_note":
             w["what"], w["note"] = "new", clean_note(text)
             self.new_confirm(net, chat, w)
@@ -12456,8 +12572,7 @@ class AdminBot:
                           [[("👤 دیدن همین کاربر", "a:u:%s" % same["sub"])] if same.get("sub") else [], [("✖️ انصراف", "a:home", "danger")]])
                 return True
             self.wait[cid] = {"what": "new", "name": text}
-            rows = [[("%s گیگ" % fa_num(g) if g else "♾ نامحدود", "a:ng:%d" % g) for g in r] for r in ((10, 20, 30), (50, 100, 0))]
-            self.show(net, chat, "👤 <b>%s</b>\nحجم رو انتخاب کن:" % self.sh.esc(text), rows + [[("✖️ انصراف", "a:home", "danger")]])
+            self.new_gb_step(net, chat, self.wait[cid])
         elif what == "cast":
             self.wait[cid] = {"what": "cast_to", "text": text}
             T = [("all", "همه"), ("active", "فعال‌ها"), ("expiring", "رو به پایان"), ("ended", "تموم‌شده‌ها")]
@@ -12498,7 +12613,7 @@ class AdminBot:
             self.bot.st["admins"].setdefault(cid, {"name": who.get("first_name", "owner"), "events": "all", "paused": False, "at": int(time.time())})
         parts = data.split(":")
         head = parts[1] if len(parts) > 1 else "home"
-        if head not in ("ng", "nd", "mk", "cg"):
+        if head not in ("ng", "nd", "mk", "cg", "nn", "ngx", "ndx"):  # the steps of a new user keep its draft
             self.wait.pop(cid, None)
         if head == "home":
             self.home(net, chat, mid)
@@ -12516,6 +12631,25 @@ class AdminBot:
             return "انجام شد"
         elif head == "uh":
             self.user_history(net, chat, parts[2], mid)
+        elif head == "unl":
+            u = self.find(parts[2])
+            self.show(net, chat, "🔄 برای <b>%s</b> لینک ساب تازه بسازم؟\nلینک قبلی همون لحظه باطل می‌شه؛ حجم و زمان دست نمی‌خوره." % self.sh.esc(u["name"] if u else parts[2]),
+                      [[("✅ آره، لینک تازه", "a:unly:%s" % parts[2], "danger"), ("نه", "a:u:%s" % parts[2])]], mid)
+        elif head == "unly":
+            try:
+                new = change_sub_link(self.app, parts[2])
+            except PanelError as e:
+                return self.show(net, chat, "⚠️ نشد: %s" % self.sh.esc(str(e)[:160]), [[("⬅️ کاربرها", "a:users:0")]], mid)
+            u = self.find(new)
+            b = self.sh.buyers().get(new)
+            if b:  # the customer in the bot hears about it
+                try:
+                    self.sh.send_qr(b.get("net") or "tg", b["id"], new, "🔄 <b>لینک اشتراکت عوض شد</b>\nلینک قبلی دیگه کار نمی‌کنه؛ این رو توی اپ اضافه کن:\n\n<code>%s</code>" % self.sh.esc(self.bot.sub_link(new)),
+                                    [[("📦 سرویس", "sv:%s" % new)]], plain=True)
+                except Exception:
+                    pass
+            self.user_card(net, chat, new, None, note="✅ لینک تازه ساخته شد؛ قبلی باطل شد%s" % ("، برای مشتری هم فرستاده شد" if b else ""))
+            return "انجام شد"
         elif head == "del":
             u = self.find(parts[2])
             self.show(net, chat, "🗑 <b>%s</b> برای همیشه حذف بشه؟" % self.sh.esc(u["name"] if u else parts[2]),
@@ -12528,9 +12662,14 @@ class AdminBot:
             if w.get("what") != "new":
                 return "از اول شروع کن"
             w["gb"] = _int(parts[2])
-            rows = [[("%s روز" % fa_num(d) if d else "♾ بدون محدودیت", "a:nd:%d" % d) for d in r] for r in ((30, 60, 90), (7, 180, 0))]
-            self.show(net, chat, "👤 <b>%s</b> · %s\nمدت رو انتخاب کن:" % (self.sh.esc(w["name"]), "%s گیگ" % fa_num(w["gb"]) if w["gb"] else "نامحدود"),
-                      rows + [[("✖️ انصراف", "a:home", "danger")]], mid)
+            self.new_days_step(net, chat, w, mid)
+        elif head in ("ngx", "ndx"):
+            w = self.wait.get(cid) or {}
+            if w.get("what") != "new" or (head == "ndx" and "gb" not in w):
+                return "از اول شروع کن"
+            w["what"] = "new_gb" if head == "ngx" else "new_days"
+            self.show(net, chat, "✏️ %s رو به عدد بفرست؛ مثلاً %s" % (("حجم (گیگ)", "<code>15</code>") if head == "ngx" else ("مدت (روز)", "<code>45</code>")),
+                      [[("✖️ انصراف", "a:home", "danger")]], mid)
         elif head == "nd":
             w = self.wait.get(cid) or {}
             if w.get("what") != "new" or "gb" not in w:

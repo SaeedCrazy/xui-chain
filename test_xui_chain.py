@@ -2603,6 +2603,57 @@ class ShopTests(BotBase):
         say("2,500,000 ریال")
         self.assertEqual(self.shop.d["orders"][-1]["price"], 250000)
 
+    def test_new_user_custom_volume_days_and_note(self):
+        cfg = xc.load_config()
+        cfg["bot_owner"] = "42"
+        xc.save_config(cfg)
+        self.app.reload()
+        try:
+            say = lambda text: self.bot.handle("tg", {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": text})
+            self.admin_tap(42, "a:new")
+            say("azb")
+            self.assertIn("a:ngx", json.dumps(BotAPI.sent[-1]["reply_markup"]))
+            self.admin_tap(42, "a:ngx")
+            say("۱۵")
+            w = self.bot.admin.wait["tg:42"]
+            self.assertEqual((w["what"], w["gb"]), ("new", 15))
+            self.admin_tap(42, "a:ndx")
+            say("45")
+            self.assertEqual(w["days"], 45)
+            m, toast = self.admin_tap(42, "a:nn")  # adding a note keeps the draft
+            self.assertNotEqual(toast, "از اول شروع کن")
+            say("مشتری آقای رضایی")
+            self.assertIn("آقای رضایی", BotAPI.sent[-1]["text"])
+            self.admin_tap(42, "a:mk")
+            self.assertEqual(self.panel.added[-1][:3], ("azb", 15, 45))
+        finally:
+            cfg["bot_owner"] = ""
+            xc.save_config(cfg)
+            self.app.reload()
+
+    def test_new_subscription_link_keeps_everything(self):
+        cfg = xc.load_config()
+        cfg["bot_owner"] = "42"
+        cfg["user_subs"] = {"sarasub12345": {"template": "default"}}
+        xc.save_config(cfg)
+        self.app.reload()
+        try:
+            u = self.shop.user("tg:2001")
+            u["subs"], u["auto"] = ["sarasub12345"], {"sarasub12345": True}
+            self.app.usage.event("sarasub12345", "x", "قبلی")
+            self.admin_tap(42, "a:unly:sarasub12345")
+            sub, emails, ch = self.panel.updated[-1]
+            new = ch["subId"]
+            self.assertEqual((sub, len(new)), ("sarasub12345", 16))
+            self.assertEqual((u["subs"], u["auto"]), ([new], {new: True}))  # the customer keeps the service and its auto-renew
+            self.assertIn(new, xc.load_config()["user_subs"])
+            self.assertIn("قبلی", [w for _, _, w in self.app.usage.events(new)])  # its history follows it
+            self.assertIn("لینک ساب عوض شد", self.app.usage.events(new)[0][2])
+        finally:
+            cfg.update(bot_owner="", user_subs={})
+            xc.save_config(cfg)
+            self.app.reload()
+
     def test_qr_cards_first_and_later(self):
         d = xc.conf_path("brand")
         os.makedirs(d, exist_ok=True)
