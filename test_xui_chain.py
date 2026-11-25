@@ -274,6 +274,11 @@ class ProfileTests(unittest.TestCase):
         self.assertIn("Main · user1-reality", names)
         confs = json.loads(xc.build_xray(own, ups, cfg, "t")[0])
         self.assertEqual(sum(1 for c in confs if c["remarks"].replace("\u200b", "") == name), 2)
+        # one of the route's two configs taken out of it: only the other one stays, under the exact name
+        cfg["routes_cfg"]["tun:t1"]["drop"] = ["vless:8443"]
+        names = [p["name"] for p in yaml.safe_load(xc.build_mihomo(own, ups, cfg)[0])["proxies"]]
+        self.assertEqual([n for n in names if n.replace("\u200b", "") == name], [name])
+        self.assertIn("Main · user1-ws", names)  # other routes keep it
 
     def test_tunnel_routes(self):
         own, ups = self.own[:2], self.ups[:1]

@@ -47,7 +47,7 @@ import zlib
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "5.41.0"
+VERSION = "5.41.1"
 NAME = "EZ-XUI"
 CONF_DIR = os.environ.get("XUI_CHAIN_DIR", "/etc/xui-chain")
 XUI_DB = os.path.join(os.environ.get("XUI_DB_FOLDER", "/etc/x-ui"), "x-ui.db")
@@ -970,7 +970,7 @@ def route_settings(cfg, key, default_name, show=True, auto=True, price=None):
     return {"name": (st.get("name") or "").strip() or default_name, "show": bool(st.get("show", show)),
             "auto": bool(st.get("auto", auto)), "price": st.get("price", price), "unit": st.get("unit") or "month",
             "quota_gb": float(st.get("quota_gb") or 0), "bill_day": int(st.get("bill_day") or 1),
-            "count": st.get("count") or "both", "order": st.get("order")}
+            "count": st.get("count") or "both", "order": st.get("order"), "drop": list(st.get("drop") or [])}
 
 
 ORDER_MODES = ("manual", "price", "entry")
@@ -1186,6 +1186,11 @@ def routes(cfg, ups, usage=None, statuses=None, deco_down=None, nodes=None):
     return out
 
 
+def conf_key(n):
+    """Which inbound a user's config comes from: «shadowsocks:1080», «vless:8443» (as the panel lists inbounds)."""
+    return "%s:%s" % ({"ss": "shadowsocks"}.get(n.get("proto"), n.get("proto")), n.get("port"))
+
+
 def route_items(r, own, cfg):
     """The client-side configs of one route for a user's own configs: [{"name", "target", "hops"}],
     hops ordered from the app outward (the app connects to hops[0] first)."""
@@ -1194,7 +1199,8 @@ def route_items(r, own, cfg):
     if r["kind"] == "custom" and r["exit_id"] == "self":
         target = r["via_node"] or r["node"]
         return [{"name": r["name"], "target": target, "hops": [r["node"]] if r["via_node"] is not None else []}]
-    mine = [n for n in own if exit_of_config(n, cfg) == r["exit_id"]]
+    drop = set(r.get("drop") or [])
+    mine = [n for n in own if exit_of_config(n, cfg) == r["exit_id"] and conf_key(n) not in drop]
     items = []
     for n in mine:
         if r["kind"] == "tunnel":
@@ -1247,7 +1253,7 @@ def routes_public(rts, pings=None):
     """Routes for the admin page (no node or tunnel objects)."""
     keep = ("key", "kind", "idx", "name", "show", "auto", "price", "unit", "quota_gb", "bill_day", "count", "order",
             "used", "remaining", "down", "exhausted", "skip", "cost", "quota_from_sub", "server_id", "exit_id", "note", "group",
-            "auto_name", "default_order", "entry_id", "entry_rank", "price_from_entry", "t_idx")
+            "auto_name", "default_order", "entry_id", "entry_rank", "price_from_entry", "t_idx", "drop")
     out = []
     for r in rts:
         d = {k: r.get(k) for k in keep}
@@ -5492,6 +5498,8 @@ def do_action(app, action, body, host):
                     cur["unit"] = "gb" if e["unit"] == "gb" else "month"
                 if "count" in e:
                     cur["count"] = e["count"] if e["count"] in ("both", "out", "in") else "both"
+                if "drop" in e:  # inbounds whose configs this route leaves out
+                    cur["drop"] = [str(x)[:40] for x in (e["drop"] or []) if re.fullmatch(r"[a-z0-9-]+:\d{1,5}", str(x))][:30]
                 stored[key] = cur
                 if key == "direct>main":
                     cfg["show_main"] = cur.get("show", True)
@@ -6588,6 +6596,15 @@ const lab=()=>S.state.settings.label_deco;
 const decoName=i=>isFa(lab())?lab()+" "+fa(i):lab()+i;
 const decoMono=(i,own)=>(own?"C":isFa(lab())?"V":lab().slice(0,1).toUpperCase())+i;
 const KIND={direct:"⌂",tunnel:"T",custom:"⇄"};
+const ibKey=ib=>ib.protocol+":"+ib.port;
+/* the panel inbounds a route's configs come from (the inbounds on its exit) */
+function exitInbounds(r){if(!r||r.exit_id==="self")return [];
+  const st=S.state,loc=r.exit_id==="main"?null:(st.locations||[]).find(l=>!l.main&&"x:"+l.address===r.exit_id);
+  if(r.exit_id!=="main"&&!loc)return [];
+  return (st.inbounds||[]).filter(ib=>ib.enable!==false&&(loc?ib.node===loc.id:!ib.node))}
+function routeConfs(r){const ibs=exitInbounds(r);if(ibs.length<2)return "";const drop=r.drop||[];
+  return `<div class="sec"><h3>کانفیگ‌های این مسیر</h3><span class="mut xs">تیک‌خورده‌ها توی ساب میان</span></div><div class="card" style="padding:6px 12px">`+
+    ibs.map(ib=>{const k=ibKey(ib);return `<label class="check"><input type="checkbox" data-ibkey="${esc(k)}" ${drop.includes(k)?"":"checked"}><span>${esc(ib.remark||ib.protocol)} <span class="mut small ltr">${esc(ib.protocol)} · ${ib.port}</span></span></label>`}).join("")+`</div>`}
 const routeMono=(r,lg)=>mono(r.kind==="deco"?decoMono(r.idx):r.kind==="own"?decoMono(r.idx,true):r.kind==="tunnel"?"T"+(r.t_idx||""):KIND[r.kind]||"•",r.down||r.exhausted?"bad":r.skip||!(r.show||r.auto)?"":r.kind==="direct"?"on":"",lg);
 function hopName(h){if(!h)return "";if(h.type==="direct")return "مستقیم";if(h.type==="server")return h.name;return h.idx?decoName(h.idx):h.name}
 function chainText(r){
@@ -6926,6 +6943,7 @@ function routeSheet(r){
    <div class="cols2"><label class="f"><span>حجم ماهانه (GB)</span>${inp("quota_gb",r.quota_gb||"",'inputmode="decimal" placeholder="'+(r.quota_from_sub?"از لینک ساب":"خالی = نامحدود")+'"')}</label><label class="f"><span>روز شارژ (شمسی)</span>${inp("bill_day",r.bill_day||1,'inputmode="numeric"')}</label></div>
    ${r.kind==="tunnel"||r.kind==="direct"?`<label class="f"><span>حجم چطور حساب بشه</span><select class="in" name="count"><option value="both" ${r.count!=="out"&&r.count!=="in"?"selected":""}>رفت و برگشت (بیشتر سرورها)</option><option value="out" ${r.count==="out"?"selected":""}>فقط خروجی سرور</option><option value="in" ${r.count==="in"?"selected":""}>فقط ورودی سرور</option></select></label>`:""}
    <div class="hint">برای چیدن «ارزون‌ترین اول». ماهانه بدون حجم = ۵۰۰ GB فرض می‌شه.</div></details>
+  ${routeConfs(r)}
   ${t&&portsMissing(r)?`<div class="warnbox">پورت ${portsText(r.missing_ports)} (inbound${r.missing_ports.length>1?"ها":""}ی ${esc(r.exit.name)}) توی این تانل نیست؛ کانفیگ‌هایی که روی این پورت هستن از این مسیر توی ساب نمیان.
    <button type="button" class="btn sm block" data-act="tun-ports" data-id="${t.id}" data-ports="${esc(t.ports+", "+r.missing_ports.join(", "))}">${ic("plus")} افزودن ${r.missing_ports.length>1?"این پورت‌ها":"این پورت"} به تانل</button></div>`:""}
   ${t?`<details ${portsMissing(r)?"open":""}><summary>تانل، ${esc(t.engine)}${t.transport?" "+esc(t.transport):""}، پورت‌ها <span class="ltr">${esc(t.ports)}</span>، ${t.status==="up"?'<span class="ok">بالا</span>':'<span class="bad">پایین</span>'}${t.bench_result?`، ↓ ${mb(t.bench_result.down_mbps)}`:""}</summary>
@@ -6941,6 +6959,8 @@ function routeSheet(r){
     f.onsubmit=async e=>{e.preventDefault();const g=n=>f.elements.namedItem(n);
       const body={routes:[{key:r.key,name:$("[name=rname]",el).value.trim(),price:g("price").value.trim(),unit:g("unit").value,quota_gb:g("quota_gb").value.trim()||0,bill_day:g("bill_day").value.trim()||1}]};
       if(g("count"))body.routes[0].count=g("count").value;
+      const ibx=$$("[data-ibkey]",el);if(ibx.length){const drop=ibx.filter(x=>!x.checked).map(x=>x.dataset.ibkey);
+        if(drop.length===ibx.length)return toast("حداقل یه کانفیگ باید بمونه","bad");body.routes[0].drop=drop}
       const j=await act($("button.btn:not([type=button])",f),"routes_save",body);if(j.ok)closeSheet()};
   });
 }
